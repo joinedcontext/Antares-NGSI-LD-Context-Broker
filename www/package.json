@@ -25,6 +25,6 @@
     "jsdom": "^26",
     "playwright-core": "^1.55",
     "vite": "^7",
-    "vitest": "^3"
+    "vitest": "^5"
   }
 }
