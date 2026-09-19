@@ -1,0 +1,260 @@
+name: strict
+
+# The scheduled strictness wall — checks too slow (or too nightly-only) for
+# the per-push gate in ci.yml:
+#
+#   DAILY  02:41 UTC : doc warnings + unused deps, fuzz-crash regression
+#                      replay (-runs=0), workspace coverage floor
+#   WEEKLY Sun 03:41 : ThreadSanitizer over the workspace tests, Miri over
+#                      the pure parsing crates
+#
+# workflow_dispatch runs everything. Scheduled workflows only run on the
+# default branch, so this always tests dev.
+on:
+  schedule:
+    - cron: "41 2 * * *" # daily — hygiene + fuzz-regression + coverage
+    - cron: "41 3 * * 0" # weekly Sunday — tsan + miri
+  workflow_dispatch:
+
+# The default for the sanitizer, Miri, fuzz and coverage jobs; the alarm
+# job that files an issue declares its own wider set.
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    # Broken rustdoc links / malformed clause citations fail here instead of
+    # rotting; cargo-machete flags dependencies nothing uses (each one is
+    # advisory surface cargo-deny scans forever).
+    name: Doc warnings + unused deps (daily)
+    if: github.event.schedule != '41 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: dev/spdx-check.sh
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      # False positive (macro-only dep)? Whitelist it via
+      # [package.metadata.cargo-machete] ignored — never delete this step.
+      - run: cargo machete
+
+  fuzz-regression:
+    # Every crash fuzz.yml ever found is committed to
+    # fuzz/regressions/<target>/ alongside its fix; this replays them all
+    # (-runs=0 = execute the corpus, no new fuzzing) so a fixed crash can
+    # never come back between weekly fuzz runs.
+    name: Fuzz-crash regression replay (daily)
+    if: github.event.schedule != '41 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Replay committed crash inputs
+        run: |
+          for t in parse_q scope_q geo_params expand_entity; do
+            cargo +nightly fuzz run "$t" "fuzz/regressions/$t" -- -runs=0
+          done
+
+  coverage:
+    # Coverage floors over the same live-service setup as ci.yml (so the
+    # pg/mqtt/nats integration tests count instead of skipping vacuously),
+    # one floor per test source. dev/etsi-coverage.sh reports the same split
+    # per store, with the ETSI cells as further columns.
+    name: Coverage floor (daily)
+    if: github.event.schedule != '41 3 * * 0'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      ANTARES_TEST_DATABASE_URL: postgresql://antares:antares@localhost:15432/antares
+      CARGO_TERM_COLOR: always
+    services:
+      postgis:
+        image: ghcr.io/baosystems/postgis:17-3.5
+        env:
+          POSTGRES_USER: antares
+          POSTGRES_PASSWORD: antares
+          POSTGRES_DB: antares
+        ports: ["15432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U antares"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Start mosquitto for the MQTT e2e
+        run: |
+          sudo apt-get install -y -qq mosquitto
+          printf 'allow_anonymous true\nlistener 1883\n' | sudo tee /etc/mosquitto/conf.d/antares-e2e.conf
+          sudo systemctl restart mosquitto
+          echo "ANTARES_TEST_MQTT_URL=mqtt://127.0.0.1:1883" >> "$GITHUB_ENV"
+      - name: Start NATS (JetStream) for the bus tests
+        run: |
+          docker run -d --name nats -p 4222:4222 nats:2-alpine -js
+          echo "ANTARES_TEST_NATS_URL=nats://127.0.0.1:4222" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # Coverage is gated per test source, never as one blended number: the
+      # in-crate unit surface and the integration binaries carry their own
+      # line AND function floors, so one of them rising can no longer hide
+      # the other falling. Floors only ratchet UP — after a green run raise
+      # them to just under the measured figure; never lower one to make a red
+      # run pass, and move docs/src/coverage.md in the same commit — the
+      # chapter publishes these four numbers to readers who never open this
+      # file. The numbers below sit a couple of points under a run
+      # measured with a live Postgres but no MQTT or NATS, which this job
+      # has, so they are a floor and not a target.
+      # The summary is captured from the gated run itself. A bare
+      # `llvm-cov report` would total every file in the coverage map,
+      # including targets this step never ran, and print a number that is not
+      # the one being gated.
+      # Two things `--lib --bins` instruments that no in-crate test can
+      # execute, so counting them made the unit floor a number about the
+      # shape of the workspace rather than about its tests. Both are still
+      # measured, by the API step below, which is where their tests live.
+      # `antares-store/src/contract.rs` is the store contract kit: it is
+      # `test-kit`-gated and a store implementation's own integration tests
+      # are the only thing that links it. `antares-sql/src/store/pg/` needs
+      # a live database AND a multi-thread runtime, and an in-crate
+      # `#[tokio::test]` is current-thread — the constraint follows from the
+      # synchronous driver traits, so it is not going away; the drivers are
+      # proven by the integration files that declare
+      # `flavor = "multi_thread"` and by the postgres and timescale ETSI
+      # cells. Nothing else is excluded: a file that in-crate tests COULD
+      # reach and do not is exactly what this floor is for.
+      - name: Unit surface floor (lib + bins)
+        run: |
+          set -eo pipefail
+          rc=0
+          cargo llvm-cov --locked --workspace --lib --bins --summary-only \
+            --ignore-filename-regex 'antares-store/src/contract\.rs|antares-sql/src/store/pg/' \
+            --fail-under-lines 82 --fail-under-functions 79 > unit-cov.txt || rc=$?
+          { echo "### Coverage floor — unit (lib + bins)"; echo '```'
+            cat unit-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --lcov --output-path unit.lcov || true
+          exit $rc
+      # Named packages rather than --workspace: a package with no tests/
+      # directory has no target matching the glob and cargo refuses the whole
+      # invocation.
+      - name: API surface floor (integration binaries)
+        if: always()
+        run: |
+          set -eo pipefail
+          rc=0
+          cargo llvm-cov --locked -p antares-api -p antares-broker \
+            -p antares-bus -p antares-sql --test '*' --summary-only \
+            --fail-under-lines 78 --fail-under-functions 77 > api-cov.txt || rc=$?
+          { echo "### Coverage floor — api (integration binaries)"; echo '```'
+            cat api-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --lcov --output-path api.lcov || true
+          exit $rc
+      # The two lcov files say WHICH lines and functions no test reached, so
+      # the next test can be written against a name instead of a percentage.
+      # They are a map, never the gated number: `report` totals every object
+      # left in the coverage map, so the api file also carries the lib and bin
+      # objects of the step before it, counted with no data. The four gated
+      # figures are the ones in unit-cov.txt and api-cov.txt.
+      - name: Publish the coverage map
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: coverage-map
+          path: |
+            unit-cov.txt
+            api-cov.txt
+            unit.lcov
+            api.lcov
+          if-no-files-found: warn
+          retention-days: 14
+
+  tsan:
+    # ThreadSanitizer over the workspace tests — the machine check for the
+    # logical races rustc cannot see (lock ordering, RMW gaps, racy
+    # channel/map use in notify/federation fan-out). -Zbuild-std so std
+    # itself is instrumented (uninstrumented std = false positives).
+    # --exclude antares-broker: its jemalloc global allocator and TSan's
+    # interceptors do not coexist; the in-process race surface lives in
+    # antares-api/bus/notifier anyway. --tests skips doctests (TSan flags
+    # don't reach rustdoc's test binaries).
+    name: ThreadSanitizer (weekly)
+    if: github.event.schedule != '41 2 * * *'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      RUSTFLAGS: "-Zsanitizer=thread"
+      # tokio's I/O driver synchronizes through epoll, which the sanitizer
+      # cannot see; its readiness atomics report as races on every run
+      TSAN_OPTIONS: "suppressions=${{ github.workspace }}/dev/tsan-suppressions.txt"
+      # the two tests that stage a timing race skip themselves under it
+      ANTARES_TEST_SANITIZER: thread
+      RUST_BACKTRACE: 1
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo +nightly test -Zbuild-std
+          --target aarch64-unknown-linux-gnu
+          --workspace --exclude antares-broker --tests
+
+  miri:
+    # Miri interprets the tests of the pure (no-I/O, no-tokio) parsing crates
+    # and aborts on any undefined behaviour — including in dependency code on
+    # our call paths. -Zmiri-disable-isolation permits clock reads so
+    # time-touching tests run instead of erroring out. Tree borrows: the
+    # @context cache (moka over crossbeam-epoch) is rejected by the stacked
+    # borrows model and accepted by the tree model.
+    name: Miri UB check (weekly)
+    if: github.event.schedule != '41 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+          # ignore-leaks: crossbeam-epoch parks its per-thread handle in a thread-local
+          # that Miri reports as leaked at exit; not a broker leak.
+          # permissive-provenance: crossbeam-epoch (moka) casts integers to
+          # pointers; Miri otherwise prints a backtrace per thread exit, which
+          # is minutes of log and no finding of ours.
+          MIRIFLAGS: "-Zmiri-disable-isolation -Zmiri-tree-borrows -Zmiri-ignore-leaks -Zmiri-permissive-provenance"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri test -p antares-model -p antares-ql -p antares-matcher
+
+  alarm:
+    # A red scheduled wall auto-files a deduped issue (the shared
+    # failure-issue action) — dispatch runs are watched by the dispatcher.
+    name: File an issue on a red scheduled run
+    if: failure() && github.event_name == 'schedule'
+    needs: [hygiene, fuzz-regression, coverage, tsan, miri]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/failure-issue
+        with:
+          title: strict wall failed
+          body: >-
+            A scheduled strict run went red — doc/machete hygiene, the
+            fuzz-regression replay, the coverage floor, TSan or Miri.
+            The run log names the job.

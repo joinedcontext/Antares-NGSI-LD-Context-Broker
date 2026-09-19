@@ -1,0 +1,83 @@
+[package]
+name = "antares-api"
+description = "NGSI-LD HTTP binding (TS 104 176 shape): axum routers. Thin handlers; no business logic."
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tower = { workspace = true, features = ["util"] }
+tower-http = { workspace = true }
+antares-model = { workspace = true }
+antares-store = { workspace = true }
+antares-jsonld = { workspace = true }
+antares-ql = { workspace = true }
+antares-matcher = { workspace = true }
+# Test-only: the built-in memory/file store behind `AppState::new`, and the
+# Postgres-backed integration tests. A consumer composes its drivers itself,
+# so a normal build of this crate names no storage backend.
+antares-sql = { workspace = true, default-features = false, optional = true }
+antares-notifier = { workspace = true, default-features = false }
+sonic-rs = { workspace = true, optional = true }
+# `std` spelled out: guarded()'s catch_unwind lives behind it, and a
+# consumer that builds this crate without the rest of the workspace (the
+# wasm crate) must not lose it to feature resolution.
+futures-util = { workspace = true, features = ["std"] }
+chrono = { workspace = true }
+icu_collator = { workspace = true }
+icu_locale_core = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# The metrics facade only — a no-op unless the broker installs a recorder,
+# so tests and wasm builds cost nothing.
+metrics = { workspace = true }
+
+# The native tokio/reqwest builds carry sockets and rustls; the wasm32 build
+# takes the same crates with the target's own backends. Target sections only —
+# the code above is identical either way.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+axum = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+# uuid v4 randomness on the browser target (crypto.getRandomValues)
+uuid = { workspace = true, features = ["js"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+# default axum minus "http1"+"tokio": the router without the listener.
+axum = { version = "0.8", default-features = false, features = [
+    "form", "json", "matched-path", "original-uri", "query", "tower-log", "tracing",
+] }
+wasm-bindgen-futures = { workspace = true }
+send_wrapper = { workspace = true }
+gloo-timers = { workspace = true }
+web-time = { workspace = true }
+
+[features]
+# Clause 7 MQTT notification binding; on by default — the 058 TPs need it.
+default = ["mqtt"]
+mqtt = ["antares-notifier/mqtt"]
+# Both reachable only through the dev-dependency below: `test-kit` gives
+# the tests `AppState::new` over the built-in store, `postgres` the
+# Postgres-backed integration tests.
+test-kit = ["dep:antares-sql"]
+postgres = ["test-kit", "antares-sql/postgres"]
+# sonic-rs on the batch-ingest hot path (x86_64/aarch64); serde_json is
+# always the compiled fallback.
+sonic = ["dep:sonic-rs"]
+
+[dev-dependencies]
+# the storage seams are object-safe AND asynchronous: a test double
+# implements them through the same boxing macro the drivers use.
+async-trait = { workspace = true }
+antares-api = { workspace = true, features = ["test-kit", "postgres"] }
+http-body-util = { workspace = true }
+# capturing subscriber: the tests that prove a credential is not logged
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

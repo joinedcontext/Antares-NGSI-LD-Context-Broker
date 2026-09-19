@@ -1,0 +1,1748 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! Antares — NGSI-LD context broker (composition root).
+//!
+//! Config: ANTARES_* env vars only for v0 (antares.toml layering can land
+//! later via figment). Unknown ANTARES_* keys are fatal.
+#![cfg_attr(not(test), warn(clippy::expect_used))]
+
+mod shutdown;
+mod telemetry;
+mod wiring;
+
+use antares_api::AppState;
+
+// ANTARES_DATABASE_URL: accepted — the ETSI compose wires one DB per broker —
+// consumed by the postgres/timescale store modes.
+const KNOWN_KEYS: &[&str] = &[
+    "ANTARES_HTTP_PORT",
+    "ANTARES_HOST_ALIAS",
+    // 5.8.1.4 distributed subscriptions: the public base URL other brokers
+    // reach this one at (the reduced-copy notification endpoint); defaults
+    // to http://{host_alias}.
+    "ANTARES_PUBLIC_URL",
+    "ANTARES_ROLES",
+    // The example policy engine's rules document; accepted only in a build
+    // that carries the engine, so a release binary rejects it like any
+    // other key it has no code for.
+    #[cfg(feature = "plugin-example")]
+    antares_plugin_example::RULES_ENV,
+    "ANTARES_DATABASE_URL",
+    "ANTARES_STORE",
+    // Temporal driver: a store mode, or `none` — history off (temporal
+    // reads answer OperationNotSupported, Table 6.3.2-1). Defaults to the
+    // current-state store, so one instance serves both seams.
+    "ANTARES_TEMPORAL",
+    // History gate: `all` (default) records every changed instance;
+    // `observed` records only instances carrying observedAt; `none`
+    // auto-records nothing (temporal API + reads stay on).
+    "ANTARES_TEMPORAL_RECORD",
+    "ANTARES_DATA_DIR",
+    // Egress: private-range destinations are ALLOWED by default (ADR-0010 —
+    // brokers federate inside private networks); a hardened deployment sets
+    // this to false to arm the SSRF wall.
+    "ANTARES_EGRESS_ALLOW_PRIVATE",
+    // Refuse to start when the DB role bypasses RLS (production gate;
+    // default off so the dev/ETSI superuser stack still boots).
+    "ANTARES_REQUIRE_RLS",
+    // Temporal retention horizon in days; absent = keep forever (a
+    // maintenance job must never default to dropping data).
+    "ANTARES_TEMPORAL_RETENTION_DAYS",
+    // 4.22 GC interval (memory/file arm); default 900 s, the ETSI stack runs
+    // at 2 s so the transient TPs (422_01) exercise the sweep itself.
+    "ANTARES_SWEEP_SECS",
+    // Batch entity-count cap; default 1000 — raised where a
+    // trusted producer legitimately batches larger (the spec sets no ceiling).
+    "ANTARES_MAX_BATCH_ITEMS",
+    "ANTARES_MAX_BODY_BYTES",
+    "ANTARES_CORS_ORIGINS",
+    // The policy engine every operation is asked about, and how long it has
+    // to answer before the seam denies (ADR-0020). The built-in allow-all
+    // engine decides nothing and never waits; the header list is what an
+    // engine is given to identify the caller by.
+    "ANTARES_POLICY",
+    "ANTARES_POLICY_SUBJECT_HEADERS",
+    "ANTARES_POLICY_TIMEOUT_MS",
+    // The HTTP surfaces mounted beside the NGSI-LD API root, comma-separated;
+    // default `admin` (/q). An unknown name is fatal and names the shelf.
+    "ANTARES_API_SURFACES",
+    // Drain: the LB notice window, and the ceiling on waiting for
+    // in-flight requests once the listener has closed.
+    "ANTARES_DRAIN_DELAY_MS",
+    "ANTARES_DRAIN_DEADLINE_SECS",
+    // Optional PEM bundle of extra TLS trust anchors (private CAs,
+    // incomplete-chain servers). Never disables verification.
+    "ANTARES_EXTRA_CA_FILE",
+    // The bus seam: local (default, single process, all roles) or
+    // nats (the JetStream spine — requires a postgres/timescale store and
+    // ANTARES_NATS_URL).
+    "ANTARES_BUS",
+    "ANTARES_NATS_URL",
+    // Stream/KV replication factor on a clustered JetStream (3 for
+    // the reference manifests' R3; default 1 for single-node).
+    "ANTARES_NATS_REPLICAS",
+    // OTLP/HTTP span export endpoint (e.g. http://collector:4318/v1/traces);
+    // unset = no OTLP anywhere.
+    "ANTARES_OTLP_ENDPOINT",
+    "ANTARES_TELEMETRY",
+    // Outbox drain on this pod, on (default) | off. `off` is the
+    // crash-drill lever (rows commit but this pod never publishes them —
+    // another pod's drain must) and the knob for a dedicated-drainer split.
+    "ANTARES_OUTBOX_DRAIN",
+    // Notification delivery policy: total attempts (default 1 = 5.8.6 as
+    // written), first-retry backoff, and the age after which no retry
+    // starts. An exhausted policy leaves a dead letter (/q/dead-letters).
+    "ANTARES_NOTIFY_ATTEMPTS",
+    "ANTARES_NOTIFY_BACKOFF_MS",
+    "ANTARES_NOTIFY_MAX_AGE_SECS",
+    // Postgres pool size (max connections); default 20.
+    "ANTARES_PG_POOL",
+    "ANTARES_PG_STATEMENT_TIMEOUT_MS",
+    // bus=local over a shared postgres/timescale store is refused — every
+    // replica would run its own matcher and fire its own copy of each
+    // notification. This opt-in states the deployment runs exactly ONE
+    // broker process against that database.
+    "ANTARES_ALLOW_SHARED_LOCAL",
+    // HTTP/1 header read timeout in ms (default 10000): a connection that
+    // never finishes its request headers is closed instead of holding a
+    // slot forever.
+    "ANTARES_HEADER_READ_TIMEOUT_MS",
+    // Ceiling on concurrently served connections (default 10000);
+    // connections accepted above it are dropped immediately.
+    "ANTARES_MAX_CONNECTIONS",
+    // 5.8.6 delivery concurrency: notifications in flight at once for the
+    // whole broker, and the share of that width one tenant may hold.
+    "ANTARES_DELIVERY_WIDTH",
+    "ANTARES_DELIVERY_WIDTH_PER_TENANT",
+    // 5.7.2.4 fan-out ceiling: how many matching registrations one
+    // distributed operation may contact.
+    "ANTARES_FED_FANOUT",
+    "ANTARES_FED_INFLIGHT",
+    // Ceiling on the body this broker will read back from a forwarded
+    // request.
+    "ANTARES_MAX_FED_RESPONSE_BYTES",
+    // 5.7.5/5.7.6 discovery scan ceiling (types/attributes listing).
+    "ANTARES_DISCOVERY_SCAN_MAX",
+    // Run the DDL on this process; off keeps replicas from racing the
+    // migration on boot.
+    "ANTARES_MIGRATE",
+];
+
+/// Jemalloc with decay-based purging — RSS returns to ~live×1.2 when idle;
+/// tune via MALLOC_CONF (e.g. dirty_decay_ms). Deliberately not glibc
+/// malloc, whose arena fragmentation never gives memory back.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Unknown-config-is-fatal, minus what the platform injects: a Service
+/// named `antares*` makes kubelet write ANTARES_PORT,
+/// ANTARES_PORT_9090_TCP*, ANTARES_SERVICE_* (and the antares-file /
+/// antares-api variants) into every pod, and treating those as typos put the
+/// shipped manifests into 100% CrashLoopBackOff. The manifests also set
+/// enableServiceLinks: false — this check is the belt for clusters that
+/// re-enable links or add their own Services.
+fn unknown_config_key(key: &str) -> bool {
+    if !key.starts_with("ANTARES_") || key.starts_with("ANTARES_TEST_") {
+        return false;
+    }
+    if KNOWN_KEYS.contains(&key) {
+        return false;
+    }
+    // kubelet service-link shapes for the Services OUR manifests ship
+    // (antares, antares-file, antares-api, antares-worker): {NAME}_PORT,
+    // {NAME}_PORT_<n>_<proto>*, {NAME}_SERVICE_*. Only those exact name
+    // infixes are exempt — an arbitrary ANTARES_*-shaped var stays a fatal
+    // typo, and foreign Services are covered by
+    // enableServiceLinks: false in the manifests.
+    let rest = &key["ANTARES_".len()..];
+    let injected = ["", "FILE_", "API_", "WORKER_"].iter().any(|infix| {
+        rest.strip_prefix(infix)
+            .is_some_and(|t| t == "PORT" || t.starts_with("PORT_") || t.starts_with("SERVICE_"))
+    });
+    !injected
+}
+
+/// ANTARES_SWEEP_SECS paces the 4.22 expiry sweep in every store mode. Absent
+/// is the 15 min default; anything that is not a positive integer is fatal,
+/// because a garbage cadence silently becoming the default one is exactly the
+/// misconfiguration the unknown-key policy exists to catch.
+fn parse_sweep_secs(raw: Option<&str>) -> Result<u64, String> {
+    let Some(v) = raw else {
+        return Ok(15 * 60);
+    };
+    match v.parse::<u64>() {
+        Ok(0) | Err(_) => Err(format!(
+            "ANTARES_SWEEP_SECS must be a positive integer number of seconds, got {v:?}"
+        )),
+        Ok(n) => Ok(n),
+    }
+}
+
+/// An explicitly-off switch value, whatever the operator's spelling. Used by
+/// the knobs where the DEFAULT is off, so that only an off value keeps them
+/// off and a typo cannot silently disable a security control.
+fn is_off(v: &str) -> bool {
+    let v = v.trim();
+    v.is_empty()
+        || v == "0"
+        || v.eq_ignore_ascii_case("false")
+        || v.eq_ignore_ascii_case("off")
+        || v.eq_ignore_ascii_case("no")
+}
+
+/// One plain HTTP/1.0 GET of /q/health on the configured port; anything but
+/// a 200 status line is an error, so `HEALTHCHECK` sees exit 1.
+fn health_probe() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    let port = std::env::var("ANTARES_HTTP_PORT").unwrap_or_else(|_| "9090".into());
+    let timeout = std::time::Duration::from_secs(3);
+    let addr = format!("127.0.0.1:{port}").parse::<std::net::SocketAddr>()?;
+    let mut s = std::net::TcpStream::connect_timeout(&addr, timeout)?;
+    s.set_read_timeout(Some(timeout))?;
+    s.write_all(b"GET /q/health HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
+    let mut head = [0u8; 16];
+    s.read_exact(&mut head)?;
+    if head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(format!("health: {}", String::from_utf8_lossy(&head)).into())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --version answers without starting anything (a bare `antares
+    // --version` used to boot a server).
+    // `args()`/`vars()` PANIC on non-UTF-8; the *_os variants do not, and a
+    // stray byte in the environment or argv must not kill the process.
+    if std::env::args_os().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "antares {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            antares_api::GIT_HASH
+        );
+        return Ok(());
+    }
+    if std::env::args_os().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "antares {} — NGSI-LD context broker (ETSI GS CIM 009 V1.9.1)\n\n\
+             Usage: antares [--version | --health | --help]\n\n\
+             Configuration is environment only; every accepted key is listed\n\
+             below and documented with its default in docs/src/configuration.md\n\
+             (an unknown ANTARES_* key is fatal at startup).\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        for key in KNOWN_KEYS {
+            println!("  {key}");
+        }
+        return Ok(());
+    }
+    // --health is the container health probe: the image has no shell or
+    // curl, so the binary asks its own /q/health and exits 0 only on 200.
+    if std::env::args_os().any(|a| a == "--health") {
+        return health_probe();
+    }
+    // reqwest is built provider-less, so the FIRST client anything in this
+    // process builds decides whether it panics — and the OTLP exporter
+    // builds one inside `opentelemetry-http`, before any broker code runs.
+    // Installed here, ahead of telemetry, rather than only in
+    // `client_builder`, which a dependency does not call.
+    antares_jsonld::install_crypto_provider();
+
+    // Tracing (fmt + env-gated OTLP [+ console feature]) and, with the
+    // `telemetry` feature, the Prometheus recorder rendering /q/metrics.
+    let metrics_render = telemetry::init()?;
+
+    // Unknown-config-is-fatal: catch typos before they become Scorpio's
+    // $[quarkus.uuid} class of silent misconfiguration. ANTARES_TEST_* is the
+    // reserved harness namespace (ANTARES_TEST_DATABASE_URL, ANTARES_TEST_MQTT_URL,
+    // …) — CI exports those for the integration tests, and they land in the env of
+    // any broker a test spawns. Reserving the prefix here beats making every
+    // spawn site remember an env_remove allowlist.
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if unknown_config_key(&key) {
+            return Err(format!("unknown config key {key} (known: {KNOWN_KEYS:?})").into());
+        }
+    }
+
+    let port_raw = std::env::var("ANTARES_HTTP_PORT").unwrap_or_else(|_| "9090".into());
+    let port: u16 = port_raw.parse().map_err(|e| {
+        format!("ANTARES_HTTP_PORT must be a port number 0-65535, got {port_raw:?} ({e})")
+    })?;
+    // Every remaining config value is parsed HERE, before the runtime starts,
+    // so a garbage window, cadence or switch fails the process instead of
+    // silently running at its default.
+    let sweep_secs = parse_sweep_secs(std::env::var("ANTARES_SWEEP_SECS").ok().as_deref())?;
+    // Same: validated here, read again where the state is built.
+    antares_api::DeliveryPolicy::from_env()?;
+    let drain_delay = shutdown::drain_delay()?;
+    let drain_deadline = shutdown::drain_deadline()?;
+    // Validated here so a typo fails startup; the value itself is read again
+    // where the drain task is wired, which is the only place it is used.
+    wiring::outbox_drain_enabled()?;
+    let host_alias = std::env::var("ANTARES_HOST_ALIAS").unwrap_or_else(|_| "antares".into());
+    // 6.3.18 sends this as the Via pseudonym — an RFC 7230 token. `~` is
+    // reserved as the tenant separator (federation::alias_for), so allowing
+    // it in the configured alias would let `a~b` in the default tenant
+    // collide with `a` in tenant `b` and cross-detect as a loop. Fatal at
+    // startup, like every other bad config value.
+    if host_alias.is_empty()
+        || !host_alias
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|".contains(&b))
+    {
+        return Err(format!(
+            "ANTARES_HOST_ALIAS {host_alias:?} is not a valid RFC 7230 token \
+             (and may not contain '~', the tenant separator)"
+        )
+        .into());
+    }
+    let roles = std::env::var("ANTARES_ROLES").unwrap_or_else(|_| "all".into());
+    // Unknown store backend is fatal BEFORE the runtime spins up, and the
+    // message names the shelf this binary was built with — never a silent
+    // fallback to memory.
+    let store_name = std::env::var("ANTARES_STORE").unwrap_or_else(|_| "memory".into());
+    if !store_shelf().contains(&store_name.as_str()) {
+        return Err(format!(
+            "unknown ANTARES_STORE {store_name:?}; built with {}",
+            store_shelf().join("|")
+        )
+        .into());
+    }
+    // bus=local wires an in-process matcher into every process, so N
+    // replicas over ONE shared database each fire their own copy of every
+    // notification. Refused here — before any store connection is attempted
+    // — unless the deployment states it runs exactly one broker process.
+    // (Mirror of the nats arm's store check in `run`.)
+    let bus_mode = std::env::var("ANTARES_BUS").unwrap_or_else(|_| "local".into());
+    if bus_mode == "local"
+        && shared_state(&store_name)
+        && !std::env::var("ANTARES_ALLOW_SHARED_LOCAL")
+            .is_ok_and(|v| matches!(v.as_str(), "1" | "true"))
+    {
+        return Err(format!(
+            "ANTARES_BUS=local with ANTARES_STORE={store_name} double-fires notifications when \
+             more than one broker process shares the database (each process runs its own \
+             matcher). Use ANTARES_BUS=nats, or set ANTARES_ALLOW_SHARED_LOCAL=1 for a \
+             strictly single-process deployment"
+        )
+        .into());
+    }
+
+    runtime()?.block_on(async {
+        let drivers = build_drivers(&store_name).await?;
+        run(
+            port,
+            host_alias,
+            roles,
+            drivers.store,
+            drivers.temporal,
+            store_name,
+            drivers.temporal_name,
+            drivers.maintenance,
+            metrics_render,
+            sweep_secs,
+            drain_delay,
+            drain_deadline,
+        )
+        .await
+    })
+}
+
+/// ANTARES_PG_STATEMENT_TIMEOUT_MS → the per-session `statement_timeout`
+/// every pooled connection carries (a runaway query is cancelled, 5.5.2
+/// InternalError); absent = 30 000; not a positive integer = fatal.
+fn parse_pg_statement_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    match raw {
+        None => Ok(std::time::Duration::from_secs(30)),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(std::time::Duration::from_millis(n)),
+            _ => Err(format!(
+                "ANTARES_PG_STATEMENT_TIMEOUT_MS must be a positive integer (got {v:?})"
+            )),
+        },
+    }
+}
+
+/// ANTARES_PG_POOL → pool size: absent defaults to 20; anything that is not
+/// a positive integer is fatal (a misread size must never silently run with
+/// a default, matching the unknown-key policy).
+fn parse_pg_pool(raw: Option<&str>) -> Result<u32, String> {
+    match raw {
+        None => Ok(20),
+        Some(v) => match v.parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "ANTARES_PG_POOL must be a positive integer (got {v:?})"
+            )),
+        },
+    }
+}
+
+/// What ANTARES_TEMPORAL resolved to, before anything is built.
+#[derive(Debug, PartialEq, Eq)]
+enum TemporalChoice {
+    /// The current-state store records and serves history too (default).
+    SameAsStore,
+    /// History off: `NoTemporal`.
+    None,
+    /// A second store instance of this backend, used only through its
+    /// temporal half.
+    Second(String),
+}
+
+/// The current-state backends this binary can build: the built-ins, plus
+/// any driver compiled in from outside this workspace. A list of NAMES and
+/// not an enum, because a plugin's driver is not one of `StoreMode`'s arms
+/// — adding a backend must never mean editing a core crate.
+fn store_shelf() -> Vec<&'static str> {
+    // Backends from outside this workspace, in selection order. Each is
+    // compiled in by its own feature; without one the list is empty and the
+    // shelf is exactly `StoreMode`.
+    const PLUGINS: &[&str] = &[
+        #[cfg(feature = "plugin-example")]
+        antares_plugin_example::NAME,
+    ];
+    antares_sql::StoreMode::ALL
+        .into_iter()
+        .map(|m| m.as_str())
+        .chain(PLUGINS.iter().copied())
+        .collect()
+}
+
+/// Does this backend keep its state where several broker processes can
+/// reach it? The precondition for `ANTARES_BUS=nats`, and the reason
+/// `bus=local` over one shared database double-fires notifications. Only
+/// the database backends qualify: a per-process store — memory, file, or a
+/// driver from outside the workspace — never does.
+fn shared_state(name: &str) -> bool {
+    name.parse::<antares_sql::StoreMode>()
+        .is_ok_and(|m| m.is_pg())
+}
+
+/// The shelf this binary was built with, rendered from the backend list
+/// rather than spelled out: a backend reaches every message that names the
+/// shelf without a second edit, whether it came from `StoreMode` or from a
+/// crate outside this workspace.
+fn built_with() -> String {
+    format!("{} (temporal also: none)", store_shelf().join("|"))
+}
+
+/// ANTARES_TEMPORAL → driver choice. Absent or the store's own mode = one
+/// instance for both seams; `none` = no history; any other backend name =
+/// a second store. An unknown name is fatal and names the shelf.
+fn temporal_choice(store_name: &str, raw: Option<&str>) -> Result<TemporalChoice, String> {
+    match raw {
+        None => Ok(TemporalChoice::SameAsStore),
+        Some(m) if m == store_name => Ok(TemporalChoice::SameAsStore),
+        Some("none") => Ok(TemporalChoice::None),
+        Some(other) if store_shelf().contains(&other) => {
+            Ok(TemporalChoice::Second(other.to_owned()))
+        }
+        Some(other) => Err(format!(
+            "ANTARES_TEMPORAL: unknown backend {other:?}; built with {}",
+            built_with()
+        )),
+    }
+}
+
+/// One entry of the surface shelf: the name a deployment selects it with,
+/// and how to build it.
+type SurfaceCtor = fn() -> Box<dyn antares_api::ApiSurface>;
+
+/// The HTTP surfaces this binary was built with, outside the NGSI-LD API
+/// root. Every one is compiled in, so the shelf is static; a feature-gated
+/// surface would drop out here.
+const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
+    ("admin", || Box::new(antares_api::Admin)),
+    #[cfg(feature = "plugin-example")]
+    ("example", || {
+        Box::new(antares_plugin_example::ExampleSurface)
+    }),
+];
+
+/// ANTARES_API_SURFACES → the surfaces mounted beside the NGSI-LD API,
+/// comma-separated; absent = `admin`. An unknown name is fatal and names
+/// the shelf, and so is a selection that ends up empty: health, readiness
+/// and metrics are the admin surface, and a pod that serves none of them
+/// can never report itself up.
+fn api_surfaces(raw: Option<&str>) -> Result<Vec<(&'static str, SurfaceCtor)>, String> {
+    let mut chosen = Vec::new();
+    for name in raw
+        .unwrap_or("admin")
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        let entry = SURFACE_SHELF
+            .iter()
+            .find(|(n, _)| *n == name)
+            .ok_or_else(|| {
+                let shelf: Vec<&str> = SURFACE_SHELF.iter().map(|(n, _)| *n).collect();
+                format!(
+                    "ANTARES_API_SURFACES: unknown surface {name:?}; built with {}",
+                    shelf.join("|")
+                )
+            })?;
+        chosen.push(*entry);
+    }
+    if chosen.is_empty() {
+        return Err(
+            "ANTARES_API_SURFACES selects no surface; /q (health, readiness, metrics) \
+                    is the admin surface"
+                .into(),
+        );
+    }
+    Ok(chosen)
+}
+
+/// One entry of the policy shelf: the name a deployment selects the engine
+/// with, and how to build it.
+type PolicyCtor = fn() -> std::sync::Arc<dyn antares_api::policy::PolicyEngine>;
+
+/// The policy engines this binary was built with (ADR-0020). `allow-all` is
+/// the one the broker ships and the one conformance is asserted against; an
+/// engine from outside this workspace joins the list behind its own
+/// off-by-default feature, exactly as a store or a surface does, and is
+/// absent from a release build.
+const POLICY_SHELF: &[(&str, PolicyCtor)] = &[
+    ("allow-all", || {
+        std::sync::Arc::new(antares_api::policy::AllowAll)
+    }),
+    #[cfg(feature = "plugin-example")]
+    (antares_plugin_example::POLICY_NAME, || {
+        std::sync::Arc::new(antares_plugin_example::ExamplePolicy::from_env())
+    }),
+];
+
+/// ANTARES_POLICY → the engine every operation is asked about; absent =
+/// `allow-all`. An unknown name is fatal and names the shelf: a deployment
+/// that meant to run its engine and got a typo would otherwise serve every
+/// request wide open and never know.
+fn policy_engine(raw: Option<&str>) -> Result<(&'static str, PolicyCtor), String> {
+    let name = raw
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("allow-all");
+    POLICY_SHELF
+        .iter()
+        .find(|(n, _)| *n == name)
+        .copied()
+        .ok_or_else(|| {
+            let shelf: Vec<&str> = POLICY_SHELF.iter().map(|(n, _)| *n).collect();
+            format!(
+                "ANTARES_POLICY: unknown policy engine {name:?}; built with {}",
+                shelf.join("|")
+            )
+        })
+}
+
+/// The backend registry: the two driver seams from their configured names.
+/// Every backend is one arm of `build_store`; the temporal driver is by
+/// default the same instance (history recorded and served by the
+/// current-state store), `none` turns history off (temporal reads answer
+/// OperationNotSupported 422, Table 6.3.2-1; the recorder produces
+/// nothing), and a different backend name builds a second store used only
+/// through its temporal half.
+async fn build_drivers(store_name: &str) -> Result<Drivers, Box<dyn std::error::Error>> {
+    let built = build_store(store_name, false).await?;
+    // Every pg half gets the maintenance job: partitions, retention and the
+    // 4.22 reap belong to whichever database holds the history.
+    let mut maintenance = Vec::from_iter(built.maintenance);
+    let raw = std::env::var("ANTARES_TEMPORAL").ok();
+    let (temporal, temporal_name) = match temporal_choice(store_name, raw.as_deref())? {
+        TemporalChoice::SameAsStore => {
+            let name = built.temporal.supported().then(|| store_name.to_owned());
+            (built.temporal.clone(), name)
+        }
+        TemporalChoice::None => (
+            std::sync::Arc::new(antares_store::NoTemporal)
+                as std::sync::Arc<dyn antares_store::TemporalDriver>,
+            None,
+        ),
+        TemporalChoice::Second(name) => {
+            let second = build_store(&name, true).await?;
+            maintenance.extend(second.maintenance);
+            (second.temporal, Some(name))
+        }
+    };
+    Ok(Drivers {
+        store: built.store,
+        temporal,
+        maintenance,
+        temporal_name,
+    })
+}
+
+/// The two storage seams a running broker holds, and what the maintenance
+/// job and `/q/health` need to know about them.
+struct Drivers {
+    store: std::sync::Arc<dyn antares_store::CurrentStateDriver>,
+    temporal: std::sync::Arc<dyn antares_store::TemporalDriver>,
+    maintenance: Vec<(
+        antares_sql::sqlx::PgPool,
+        antares_sql::store::pg::maintenance::TemporalBackend,
+    )>,
+    /// What `/q/health` calls the history backend; `None` = history off.
+    temporal_name: Option<String>,
+}
+
+/// One built backend: the two driver seams of a single store instance, and
+/// the Postgres handles its maintenance job needs.
+struct Built {
+    store: std::sync::Arc<dyn antares_store::CurrentStateDriver>,
+    temporal: std::sync::Arc<dyn antares_store::TemporalDriver>,
+    maintenance: Option<(
+        antares_sql::sqlx::PgPool,
+        antares_sql::store::pg::maintenance::TemporalBackend,
+    )>,
+}
+
+/// One backend by name. `temporal_only` builds an instance whose
+/// current-state half is never served — the second store of a split
+/// `ANTARES_TEMPORAL`. An unknown name is an error naming the shelf.
+async fn build_store(name: &str, temporal_only: bool) -> Result<Built, Box<dyn std::error::Error>> {
+    #[cfg(feature = "plugin-example")]
+    if name == antares_plugin_example::NAME {
+        // A driver from outside `crates/` mounts through exactly the two
+        // trait objects a built-in does; nothing downstream can tell them
+        // apart, and its history half is its own — no `temporal_only` flag
+        // to set, because the current-state half is simply never asked.
+        let store = std::sync::Arc::new(antares_plugin_example::ExampleStore::new());
+        return Ok(Built {
+            store: store.clone(),
+            temporal: store,
+            maintenance: None,
+        });
+    }
+    let mode: antares_sql::StoreMode = name.parse().map_err(|_| {
+        format!(
+            "unknown store backend {name:?}; built with {}",
+            store_shelf().join("|")
+        )
+    })?;
+    let (store, backend) = build_builtin(mode).await?;
+    let store = if temporal_only {
+        store.temporal_only()
+    } else {
+        store
+    };
+    let maintenance = match (&store, backend) {
+        (antares_sql::store::any::AnyStore::Pg(p), Some(backend)) => {
+            Some((p.docs.pool().clone(), backend))
+        }
+        _ => None,
+    };
+    let store = std::sync::Arc::new(store);
+    Ok(Built {
+        store: store.clone(),
+        temporal: store,
+        maintenance,
+    })
+}
+
+/// ANTARES_STORE → store construction: `file` requires ANTARES_DATA_DIR
+/// (never a default inside the image); postgres and timescale require
+/// ANTARES_DATABASE_URL, connect ONE shared pool, run the embedded
+/// migrations at start and serve from the Pg backend.
+async fn build_builtin(
+    mode: antares_sql::StoreMode,
+) -> Result<
+    (
+        antares_sql::store::any::AnyStore,
+        Option<antares_sql::store::pg::maintenance::TemporalBackend>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use antares_sql::store::any::{AnyStore, PgBackend};
+    use antares_sql::store::pg::maintenance::TemporalBackend;
+    use antares_sql::store::Store;
+    use antares_sql::StoreMode;
+    match mode {
+        StoreMode::Memory => Ok((AnyStore::Mem(Store::default()), None)),
+        StoreMode::File => {
+            let dir = std::env::var("ANTARES_DATA_DIR").map_err(|_| {
+                "ANTARES_STORE=file requires ANTARES_DATA_DIR (a mounted volume — data \
+                 must never live inside the image)"
+            })?;
+            let dir = std::path::PathBuf::from(dir);
+            warn_if_not_mount_point(&dir);
+            Ok((AnyStore::Mem(Store::open_file(&dir)?), None))
+        }
+        StoreMode::Postgres | StoreMode::Timescale => {
+            let url = std::env::var("ANTARES_DATABASE_URL")
+                .map_err(|_| format!("ANTARES_STORE={mode} requires ANTARES_DATABASE_URL"))?;
+            let pool_size = parse_pg_pool(std::env::var("ANTARES_PG_POOL").ok().as_deref())?;
+            let statement_timeout = parse_pg_statement_timeout(
+                std::env::var("ANTARES_PG_STATEMENT_TIMEOUT_MS")
+                    .ok()
+                    .as_deref(),
+            )?;
+            // The DB container may still be booting — bounded retry, then die.
+            let mut last = String::new();
+            for _ in 0..30 {
+                match antares_sql::store::pg::connect_with(&url, pool_size, statement_timeout).await
+                {
+                    Ok(pool) => {
+                        // The temporal backend is what the migrations actually
+                        // BUILT, detected once from the catalog and pinned —
+                        // the maintenance branch can never disagree with the
+                        // DDL on disk, whatever happened to the extension since.
+                        let backend =
+                            antares_sql::store::pg::maintenance::detect_temporal_backend(&pool)
+                                .await
+                                .map_err(|e| format!("ANTARES_STORE={mode}: {e}"))?;
+                        // Never silently fall back — timescale mode whose
+                        // database is not hypertable-shaped is a config error,
+                        // not a downgrade (extension missing at first boot, or
+                        // installed only after the migrations ran).
+                        if mode == StoreMode::Timescale && backend != TemporalBackend::Hypertable {
+                            return Err(format!(
+                                "timescale requested (ANTARES_STORE or ANTARES_TEMPORAL) but \
+                                 attr_instances is {backend:?} — the timescaledb extension was \
+                                 not CREATEd when the migrations first ran. Install it in a fresh \
+                                 database (CREATE EXTENSION timescaledb before first boot) or use \
+                                 postgres"
+                            )
+                            .into());
+                        }
+                        if mode == StoreMode::Postgres && backend == TemporalBackend::Hypertable {
+                            tracing::info!(
+                                "attr_instances is a hypertable (migrations ran with \
+                                 the timescaledb extension present); the plain-mode partition \
+                                 job stands down, retention runs via drop_chunks"
+                            );
+                        }
+                        // RLS is a belt only when the role wears it —
+                        // superuser/BYPASSRLS makes every policy inert. Warn
+                        // always; in production set ANTARES_REQUIRE_RLS=1 to turn
+                        // the warning into a hard refusal so a superuser DSN can
+                        // never silently ship (dev/ETSI stacks leave it unset).
+                        if antares_sql::store::pg::role_bypasses_rls(&pool).await {
+                            // A gate that only understands two spellings
+                            // fails OPEN on `TRUE`/`yes`/`on`: the operator
+                            // believes RLS is enforced and the broker serves
+                            // with a BYPASSRLS role. Anything but an explicit
+                            // off value turns it on.
+                            let strict =
+                                std::env::var("ANTARES_REQUIRE_RLS").is_ok_and(|v| !is_off(&v));
+                            if strict {
+                                return Err(
+                                    "ANTARES_REQUIRE_RLS=1 but the database role bypasses \
+                                     row-level security (superuser or BYPASSRLS) — connect as a \
+                                     non-superuser, non-BYPASSRLS role so the RLS tenant-isolation \
+                                     backstop is enforced"
+                                        .into(),
+                                );
+                            }
+                            tracing::warn!(
+                                "database role bypasses row-level security (superuser or \
+                                 BYPASSRLS) — tenant isolation rests on the explicit \
+                                 predicates only; use a non-superuser role in production \
+                                 (set ANTARES_REQUIRE_RLS=1 to enforce)"
+                            );
+                        }
+                        tracing::info!(
+                            "ANTARES_STORE={mode}: pool up, migrations applied, serving \
+                             from postgres (temporal backend: {backend:?})"
+                        );
+                        // Read once, here: /q/health is polled, so what it
+                        // says about the server is captured at startup and
+                        // never queried on the request.
+                        let version = antares_sql::store::pg::version_info(&pool).await;
+                        return Ok((
+                            AnyStore::Pg(PgBackend::new(pool).with_version(version)),
+                            Some(backend),
+                        ));
+                    }
+                    Err(e) if antares_sql::store::pg::is_schema_mismatch(&e) => {
+                        // Waiting cannot make this database match: its
+                        // migration history was written by a different
+                        // release. Retried, the boot ends 30 s later blaming
+                        // the network for a schema that will never fit.
+                        return Err(format!(
+                            "ANTARES_STORE={mode}: {e} — the database was migrated by a \
+                             different release of the broker, so this binary cannot serve \
+                             it. Point it at a database migrated by this release, or start \
+                             from an empty one"
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        last = e.to_string();
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            Err(format!("ANTARES_STORE={mode}: database not reachable after 30 s: {last}").into())
+        }
+    }
+}
+
+/// Warn when the data dir shares a device with its parent — i.e. it is
+/// not a mount point, so the redb file dies with the container.
+#[cfg(unix)]
+fn warn_if_not_mount_point(dir: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    let _ = std::fs::create_dir_all(dir);
+    if let (Ok(md), Some(Ok(parent_md))) =
+        (std::fs::metadata(dir), dir.parent().map(std::fs::metadata))
+    {
+        if md.dev() == parent_md.dev() {
+            eprintln!(
+                "WARN: ANTARES_DATA_DIR {} is not a mount point — data will be lost when \
+                 the container is removed",
+                dir.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_not_mount_point(_dir: &std::path::Path) {}
+
+// Every parameter is one config value `main` parsed fatally before the
+// runtime started; a struct would only rename the same ten values.
+#[allow(clippy::too_many_arguments)]
+async fn run(
+    port: u16,
+    host_alias: String,
+    roles: String,
+    store: std::sync::Arc<dyn antares_store::CurrentStateDriver>,
+    temporal: std::sync::Arc<dyn antares_store::TemporalDriver>,
+    store_name: String,
+    temporal_name: Option<String>,
+    maintenance: Vec<(
+        antares_sql::sqlx::PgPool,
+        antares_sql::store::pg::maintenance::TemporalBackend,
+    )>,
+    metrics_render: Option<telemetry::MetricsRender>,
+    sweep_secs: u64,
+    drain_delay: std::time::Duration,
+    drain_deadline: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let roles = wiring::Roles::parse(&roles).map_err(|e| format!("ANTARES_ROLES: {e}"))?;
+    // Bus seam: local (default) or nats. An unknown value is fatal.
+    let bus_mode = std::env::var("ANTARES_BUS").unwrap_or_else(|_| "local".into());
+    match bus_mode.as_str() {
+        "local" => {
+            // bus=local means ONE process running every role — a role
+            // split without a shared bus would silently drop whole concerns.
+            if !roles.all() {
+                return Err(
+                    "ANTARES_BUS=local requires all roles in one process (ANTARES_ROLES=all); \
+                     role splits need ANTARES_BUS=nats"
+                        .into(),
+                );
+            }
+        }
+        "nats" => {
+            if !shared_state(&store_name) {
+                return Err(format!(
+                    "ANTARES_BUS=nats requires a shared store (ANTARES_STORE=postgres|timescale); \
+                     {store_name} state is per-process and cannot back multiple instances"
+                )
+                .into());
+            }
+        }
+        other => return Err(format!("unknown ANTARES_BUS={other} (local|nats)").into()),
+    }
+    tracing::info!(port, store = %store_name, %bus_mode, ?roles, "starting antares");
+
+    // Trailing-slash tolerance: Table 6.2-1 spells collection resources with a
+    // trailing '/'; normalize before routing.
+    let mut state = AppState::with_drivers(host_alias, store, temporal, &store_name);
+    state.temporal_name = temporal_name;
+    state.delivery = antares_api::DeliveryPolicy::from_env().unwrap_or_default();
+    state.temporal_record = std::env::var("ANTARES_TEMPORAL_RECORD")
+        .as_deref()
+        .unwrap_or("all")
+        .parse()?;
+    // The surfaces mounted beside the NGSI-LD API root, from configuration
+    // rather than from a hard-wired list: the selection replaces what the
+    // default mounting put there, before the state is shared.
+    let selected = api_surfaces(std::env::var("ANTARES_API_SURFACES").ok().as_deref())?;
+    state = state.with_surfaces(selected.iter().map(|(_, build)| build()).collect())?;
+    // The policy engine, from configuration and from the shelf this binary
+    // was built with. Without one the broker asks `allow-all` and behaves
+    // exactly as it did before the seam existed.
+    let (policy_name, build_policy) =
+        policy_engine(std::env::var("ANTARES_POLICY").ok().as_deref())?;
+    tracing::info!("policy engine: {policy_name}");
+    // The built-in engine is attached as no engine at all: it decides
+    // nothing, and a gate with nothing to ask skips the whole apparatus
+    // rather than boxing a future that always answers allow.
+    if policy_name != antares_api::policy::BUILT_IN_NAME {
+        state = state.with_policy(build_policy());
+    }
+    // A notification binding compiled in from outside the workspace mounts
+    // exactly like the two shipped ones: one registration, no core-crate
+    // edit. It is not in a release build — the feature is off by default,
+    // so the shipped binary serves network schemes only.
+    #[cfg(feature = "plugin-example")]
+    let mut state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    // /q/metrics renders through this closure (None without the
+    // `telemetry` feature — the endpoint answers 404); the sampler feeds
+    // the process-level gauges the whole run.
+    state.metrics_render = metrics_render;
+    // Heap stats on /q/health (allocated/resident bytes via jemalloc-ctl)
+    state.mem_stats = Some(std::sync::Arc::new(|| {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        let _ = epoch::advance();
+        serde_json::json!({
+            "allocatedBytes": stats::allocated::read().unwrap_or(0),
+            "residentBytes": stats::resident::read().unwrap_or(0),
+        })
+    }));
+    // 5.8.1.4 consumer half, whichever bus carries the delivery. A
+    // distributed Subscription is served by an internal Context Source
+    // Registration Subscription that notifies to `urn:antares:distsub:…`,
+    // and the delivery path drops that notification unless this handler is
+    // installed — the Subscription is accepted and no copy is ever
+    // forwarded. `antares_api::wire` installs it with the in-process
+    // matcher; the role-split fleet wires its matcher through `wire_nats`
+    // and needs it installed here.
+    antares_api::install_csource_notification(&mut state);
+    if bus_mode == "nats" {
+        // Outbox producer + drain, KV/registry mirrors, durable
+        // consumers per role, topology asserted before traffic.
+        let url = std::env::var("ANTARES_NATS_URL")
+            .map_err(|_| "ANTARES_BUS=nats requires ANTARES_NATS_URL")?;
+        wiring::wire_nats(&mut state, &url, roles).await?;
+    } else {
+        antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
+    }
+    telemetry::spawn_sampler(state.clone());
+
+    // Boot preload — Cached rows persisted by the AppState write-through
+    // re-seed the parsed-context cache on start, so expansion doesn't refetch
+    // what a previous life already downloaded. (The writer itself is wired in
+    // AppState::with_store — rows are the 5.13 source of truth.)
+    {
+        // Metadata first, then ONE body at a time. Reading every row whole
+        // put up to MAX_CONTEXT_BYTES per row in memory at once, capped only
+        // for Cached rows and not at all for the rest — a boot that a client
+        // could make impossible by storing large @contexts.
+        // No Tenant: the store then hands back the rows that belong to none
+        // (ADR-0021), which is exactly the `Cached` set this warm wants.
+        for row in state
+            .store
+            .context_list_meta(None)
+            .await
+            .unwrap_or_default()
+        {
+            if row.get("kind").and_then(|v| v.as_str()) != Some("Cached") {
+                continue;
+            }
+            let (Some(url), Some(id), Some(created)) = (
+                row.get("url").and_then(|v| v.as_str()),
+                row.get("localId").and_then(|v| v.as_str()),
+                row.get("createdAt").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let Some(full) = state.store.context_get(None, id).await.ok().flatten() else {
+                continue;
+            };
+            if let Some(v) = full.pointer("/body/@context") {
+                state.loader.seed_cached(url, id, created, v.clone()).await;
+            }
+        }
+    }
+
+    // 4.22 GC on the memory/file arm: reads already refuse expired entities;
+    // this reaps them (spec-sanctioned lag). The Pg arm's sweep runs inside
+    // the maintenance job below — one job per backend, mode-switched.
+    // ANTARES_SWEEP_SECS paces 4.22 GC identically across ALL backends —
+    // this loop and the Pg/Timescale maintenance job below both tick on it
+    // (the ETSI stack runs at 2 s so transient TPs observe GC, not just the
+    // read filter); parsed at startup, default 15 min. The loop runs for
+    // every driver and asks it what it reaped: a backend whose GC lives
+    // elsewhere — the Pg arm's is inside the maintenance job — answers 0.
+    let sweeper = state.store.clone();
+    let doc_sweeper = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+        loop {
+            tick.tick().await;
+            let n = sweeper.sweep_expired().await;
+            if n > 0 {
+                tracing::debug!("4.22 sweep reaped {n} expired entities");
+            }
+            // Registrations, Snapshots and EntityMaps carry their own
+            // expiry, and every read already refuses one that has passed;
+            // this is what frees the row behind it.
+            let n = antares_api::sweep_expired_docs(&doc_sweeper).await;
+            if n > 0 {
+                tracing::debug!("expiry sweep reaped {n} expired documents");
+            }
+        }
+    });
+    // Temporal maintenance — plain-mode partition pre-creation and the
+    // (opt-in) retention horizon, single-winner via SKIP LOCKED.
+    // One job per pg half (current state and/or history), PINNED to the
+    // backend detected at startup; memory and file halves get none.
+    if !maintenance.is_empty() {
+        let retention: Option<i64> = std::env::var("ANTARES_TEMPORAL_RETENTION_DAYS")
+            .ok()
+            .map(|v| {
+                v.parse::<i64>()
+                    .map_err(|_| "ANTARES_TEMPORAL_RETENTION_DAYS must be an integer")
+                    // A zero/negative horizon inverts `now() - make_interval(days)`
+                    // and would reap all current + future history — a data-loss
+                    // footgun. Retention is opt-in; a bad value must not silently
+                    // delete. Cap at i32 too (bound as $1::int downstream).
+                    .and_then(|d| {
+                        (d > 0 && d <= i64::from(i32::MAX)).then_some(d).ok_or(
+                            "ANTARES_TEMPORAL_RETENTION_DAYS must be between 1 and 2147483647",
+                        )
+                    })
+            })
+            .transpose()?;
+        for (pool, backend) in maintenance {
+            tokio::spawn(async move {
+                // Same ANTARES_SWEEP_SECS cadence as the Mem arm — the job's 4.22
+                // reap is the sweep here; the partition/retention steps riding on
+                // the same tick are idempotent and SKIP LOCKED single-winner.
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+                loop {
+                    tick.tick().await; // first tick is immediate: partitions at boot
+                    match antares_sql::store::pg::maintenance::temporal_maintenance(
+                        &pool, backend, retention,
+                    )
+                    .await
+                    {
+                        Ok(msg) => tracing::debug!("temporal maintenance: {msg}"),
+                        Err(e) => tracing::warn!("temporal maintenance failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
+    // Handles the drain needs, taken before `state` is consumed by the
+    // router — the flag the health endpoint reads, and the store whose pools
+    // close last.
+    let draining = state.draining.clone();
+    let store_for_drain = state.store.clone();
+    // The temporal seam may be a second store with its own pool; the drain
+    // closes both.
+    let temporal_for_drain = state.temporal.clone();
+    let pending_for_drain = state.pending_changes.clone();
+    // Only the api role serves the NGSI-LD surface — a worker pod
+    // exposes health/ready/metrics and nothing else (a subscription created
+    // on a worker would bypass the roles.api KV sync and never notify).
+    let routed = if roles.api {
+        antares_api::router(state)
+    } else {
+        antares_api::ops_router(state)
+    };
+    let app = tower::Layer::layer(
+        &tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash(),
+        routed,
+    );
+
+    // A connection that never finishes its request headers must not hold a
+    // slot forever; hyper closes it after this timeout.
+    let header_read_timeout = std::env::var("ANTARES_HEADER_READ_TIMEOUT_MS")
+        .ok()
+        .map(|v| {
+            v.parse::<u64>().map_err(|_| {
+                format!("ANTARES_HEADER_READ_TIMEOUT_MS must be an integer (got {v:?})")
+            })
+        })
+        .transpose()?
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(10));
+    // Ceiling on concurrently served connections: accepted streams beyond
+    // it are dropped at once — refusing cheaply beats queueing work the box
+    // cannot serve (each served connection is a spawned task).
+    let max_connections = max_connections()?;
+    let conn_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!("listening on http://0.0.0.0:{port}");
+    // Count open connections so the drain can wait for them. Incremented
+    // before the task is spawned — incrementing inside the task would race the
+    // drain's first check and let a just-accepted connection be missed.
+    // This counts CONNECTIONS, not requests, and stays that way on purpose:
+    // hyper's graceful_shutdown below draws the distinction already (an idle
+    // keep-alive closes at once, an active request finishes first), so a
+    // request-layer counter would add a middleware without changing what the
+    // drain waits for.
+    let inflight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The drain signal each connection listens for. On drain,
+    // hyper's graceful_shutdown closes IDLE keep-alive connections immediately
+    // (the LB holds one per backend — counting them as in-flight made every
+    // api roll burn the full deadline) while an active request still finishes.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    // The signal future is created ONCE and polled by reference. Written
+    // inline in the select, it would be dropped and re-created on every
+    // accepted connection — and a SIGTERM landing in that drop-to-recreate
+    // window is lost for good (tokio signal streams do not replay events from
+    // before their creation). Under health-check polling that window is hit
+    // constantly, which is exactly how the drain test caught it.
+    let mut sigterm = std::pin::pin!(shutdown::signal());
+    // A pod whose drain is switched off publishes nothing, so waiting for the
+    // outbox to empty there would only burn the deadline.
+    let flush_outbox = wiring::outbox_drain_enabled()?;
+    // Manual serve loop: the ETSI suite reads response headers case-sensitively
+    // ("Location"), so HTTP/1 responses are written with title-case headers.
+    loop {
+        let stream = tokio::select! {
+            s = accept(&listener) => s,
+            _ = &mut sigterm => {
+                // 1+2: unhealthy FIRST, then keep serving for the LB's notice
+                // window — still inside this select, so connections arriving
+                // during it are accepted normally.
+                shutdown::begin(&draining, drain_delay);
+                let until = tokio::time::Instant::now() + drain_delay;
+                loop {
+                    tokio::select! {
+                        stream = accept(&listener) => {
+                            serve(stream, app.clone(), inflight.clone(), drain_rx.clone(),
+                                  conn_permits.clone(), header_read_timeout);
+                        }
+                        _ = tokio::time::sleep_until(until) => break,
+                    }
+                }
+                // 3–6: listener dropped, idle conns told to close (active
+                // requests finish), in-flight drained, pools closed.
+                drop(listener);
+                let _ = drain_tx.send(true);
+                shutdown::drain(
+                    &inflight,
+                    &pending_for_drain,
+                    &*store_for_drain,
+                    &*temporal_for_drain,
+                    drain_deadline,
+                    flush_outbox,
+                )
+                .await;
+                tracing::info!("shutting down");
+                return Ok(());
+            }
+        };
+        serve(
+            stream,
+            app.clone(),
+            inflight.clone(),
+            drain_rx.clone(),
+            conn_permits.clone(),
+            header_read_timeout,
+        );
+    }
+}
+
+/// ANTARES_MAX_CONNECTIONS: the ceiling on concurrently served connections
+/// (default 10 000).
+fn max_connections() -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(std::env::var("ANTARES_MAX_CONNECTIONS")
+        .ok()
+        .map(|v| {
+            v.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                format!("ANTARES_MAX_CONNECTIONS must be a positive integer (got {v:?})")
+            })
+        })
+        .transpose()?
+        .unwrap_or(10_000))
+}
+
+/// The request runtime. Store calls are futures the workers poll, so a
+/// waiting caller holds no thread and the blocking pool carries only what
+/// is genuinely blocking — the `file` mode's per-commit fsync, which redb
+/// serializes behind its single writer. Tokio's own bounds hold.
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+}
+
+/// Accept the next connection. There is no failure value: `accept()`
+/// propagates every non-`WouldBlock` errno from the syscall, and an
+/// `ECONNABORTED` (a client resetting between SYN and accept), `EMFILE`/
+/// `ENFILE` (the fd ceiling — the connection cap defaults above many
+/// containers' `nofile`) or `ENOBUFS` must never take the broker down.
+async fn accept(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                // Nagle held every multi-segment response for the peer's
+                // delayed ACK: a fixed ~40 ms on any body over one segment,
+                // 25 req/s per connection whatever the core count.
+                let _ = stream.set_nodelay(true);
+                return stream;
+            }
+            Err(e) => {
+                tracing::warn!("accept failed, retrying: {e}");
+                if accept_backoff(&e) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+}
+
+/// Whether an `accept()` error warrants a pause before the next attempt.
+/// The per-connection failures retry at once (the next connection is
+/// unaffected); a resource exhaustion would otherwise spin the loop at full
+/// speed until the pressure clears. Neither is fatal.
+fn accept_backoff(e: &std::io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
+/// The served app: the router under trailing-slash normalization.
+type App = tower_http::normalize_path::NormalizePath<axum::Router>;
+
+/// One accepted connection. Split out of the accept loop so the drain's
+/// notice window serves connections with identical behaviour, and so the
+/// in-flight counter is incremented in exactly one place.
+fn serve(
+    stream: tokio::net::TcpStream,
+    app: App,
+    inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mut drain_rx: tokio::sync::watch::Receiver<bool>,
+    conn_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    header_read_timeout: std::time::Duration,
+) {
+    // Over the connection cap: drop the accepted stream immediately. The
+    // permit rides in the connection task, so the slot frees exactly when
+    // the connection ends — and never enters the inflight drain accounting.
+    let Ok(permit) = conn_permits.try_acquire_owned() else {
+        return;
+    };
+    inflight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let mut app = app.clone();
+            async move { tower::Service::call(&mut app, req.map(axum::body::Body::new)).await }
+        });
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(header_read_timeout)
+            .title_case_headers(true);
+        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), svc);
+        let mut conn = std::pin::pin!(conn);
+        // On drain, close an IDLE keep-alive connection immediately —
+        // hyper finishes any active request first, then closes. Without this
+        // the LB's idle keep-alives count as in-flight and every roll waits
+        // out the entire drain deadline.
+        tokio::select! {
+            r = conn.as_mut() => { let _ = r; }
+            _ = wait_drain(&mut drain_rx) => {
+                conn.as_mut().graceful_shutdown();
+                let _ = conn.as_mut().await;
+            }
+        }
+        inflight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// Resolves when the drain signal fires; pends forever once the sender is
+/// gone (the connection future then completes on its own in the select).
+async fn wait_drain(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_key_tests {
+    use super::unknown_config_key;
+
+    /// Kubelet-injected service links must never be fatal; real typos
+    /// must stay fatal.
+    #[test]
+    fn kubelet_service_links_are_not_typos() {
+        for k in [
+            "ANTARES_PORT",
+            "ANTARES_PORT_9090_TCP",
+            "ANTARES_PORT_9090_TCP_ADDR",
+            "ANTARES_SERVICE_HOST",
+            "ANTARES_SERVICE_PORT",
+            "ANTARES_API_SERVICE_HOST",
+            "ANTARES_FILE_PORT_9090_TCP_PROTO",
+        ] {
+            assert!(!unknown_config_key(k), "{k} is platform-injected");
+        }
+        for k in [
+            "ANTARES_HTTP_PORT",
+            "ANTARES_STORE",
+            "ANTARES_TEST_ANYTHING",
+            "ANTARES_PG_POOL",
+            "ANTARES_ALLOW_SHARED_LOCAL",
+            "ANTARES_HEADER_READ_TIMEOUT_MS",
+            "ANTARES_MAX_CONNECTIONS",
+        ] {
+            assert!(!unknown_config_key(k), "{k} is known/reserved");
+        }
+        assert!(
+            unknown_config_key("ANTARES_STROE"),
+            "a real typo stays fatal"
+        );
+        assert!(
+            unknown_config_key("ANTARES_HTPT_PORT"),
+            "a typo'd *_PORT var is NOT a service link"
+        );
+        assert!(unknown_config_key("ANTARES_BOGUS_FLAG"));
+    }
+
+    /// The exemption is narrow on purpose: only the exact kubelet shapes for
+    /// the Services this repo ships. Near-misses stay fatal, and a non-ANTARES
+    /// variable is never our business.
+    #[test]
+    fn the_service_link_exemption_does_not_over_reach() {
+        for k in [
+            "ANTARES_",
+            "ANTARES_PORTAL",
+            "ANTARES_SERVICEHOST",
+            "ANTARES_DB_PORT",
+            "ANTARES_WORKER_PROT",
+        ] {
+            assert!(unknown_config_key(k), "{k} must stay a fatal typo");
+        }
+        for k in ["PATH", "HOME", "antares_store", "ANTARE_STORE", ""] {
+            assert!(!unknown_config_key(k), "{k} is not broker config");
+        }
+    }
+
+    /// Unknown keys are FATAL, so every ANTARES_* variable the workspace
+    /// actually reads has to be accepted — otherwise setting a documented
+    /// deployment knob is a CrashLoopBackOff and the knob cannot be used at
+    /// all. Scans the sources rather than restating the list, so the check
+    /// keeps holding as crates add knobs.
+    #[test]
+    fn known_keys_cover_every_variable_the_workspace_reads() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .to_path_buf();
+        let needles = [
+            concat!("var(", "\"ANTARES_"),
+            concat!("var_os(", "\"ANTARES_"),
+        ];
+        let mut missing: Vec<String> = Vec::new();
+        let mut stack = vec![crates];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                for needle in needles {
+                    for (i, _) in src.match_indices(needle) {
+                        let rest = &src[i + needle.len() - "\"ANTARES_".len() + 1..];
+                        let Some(end) = rest.find('"') else { continue };
+                        let key = &rest[..end];
+                        if unknown_config_key(key) {
+                            missing.push(format!("{key} (read in {})", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "KNOWN_KEYS is missing variables the workspace reads: {missing:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::{accept, accept_backoff};
+
+    /// An accept() error must never end the serve loop: tokio propagates
+    /// every non-WouldBlock errno straight from the syscall, so ECONNABORTED
+    /// (a client resetting between SYN and accept), EMFILE/ENFILE (the fd
+    /// ceiling) and ENOBUFS all used to take the whole broker down. `accept`
+    /// has no failure value at all — the only decision left is whether to
+    /// pause before retrying.
+    #[test]
+    fn no_accept_error_is_fatal_and_resource_errors_back_off() {
+        use std::io::ErrorKind::*;
+        for kind in [ConnectionAborted, ConnectionReset, Interrupted] {
+            assert!(
+                !accept_backoff(&std::io::Error::new(kind, "x")),
+                "{kind:?} is per-connection — the next accept must run at once"
+            );
+        }
+        for kind in [
+            Other,
+            OutOfMemory,
+            PermissionDenied,
+            InvalidInput,
+            NotConnected,
+        ] {
+            assert!(
+                accept_backoff(&std::io::Error::new(kind, "x")),
+                "{kind:?} would spin the loop without a pause"
+            );
+        }
+    }
+
+    /// …and the healthy path still hands the loop its connection.
+    #[tokio::test]
+    async fn accept_yields_the_next_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await });
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&listener))
+            .await
+            .expect("a connection is accepted");
+        assert!(stream.peer_addr().is_ok());
+        let _ = client.await;
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::is_off;
+
+    /// The knobs whose default is OFF (ANTARES_REQUIRE_RLS, ANTARES_TELEMETRY)
+    /// must fail SAFE on a spelling they do not know: recognizing only
+    /// `1|true` turned the RLS gate off on `TRUE`/`yes`/`on` while the
+    /// operator believed it was enforced.
+    #[test]
+    fn only_an_explicit_off_value_reads_as_off() {
+        for off in [
+            "0", "false", "FALSE", "False", "off", "OFF", "no", "", " ", " 0\t",
+        ] {
+            assert!(is_off(off), "{off:?} must read as off");
+        }
+        for on in [
+            "1", "true", "TRUE", "True", "on", "On", "yes", "YES", " 1 ", "enabled",
+        ] {
+            assert!(!is_off(on), "{on:?} must NOT read as off");
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_secs_tests {
+    use super::parse_sweep_secs;
+
+    /// ANTARES_SWEEP_SECS paces the 4.22 GC in every store mode: absent is
+    /// the 15 min default, and a value that is not a positive integer is
+    /// fatal — a garbage cadence must never silently become the default one.
+    #[test]
+    fn sweep_secs_defaults_and_rejects() {
+        assert_eq!(parse_sweep_secs(None).expect("default"), 900);
+        assert_eq!(parse_sweep_secs(Some("2")).expect("explicit"), 2);
+        for bad in ["0", "-1", "", "2s", "abc", "1.5", "99999999999999999999999"] {
+            let err =
+                parse_sweep_secs(Some(bad)).expect_err(&format!("SWEEP_SECS={bad:?} is fatal"));
+            assert!(err.contains("ANTARES_SWEEP_SECS"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod driver_registry_tests {
+    use super::{built_with, shared_state, store_shelf, temporal_choice, TemporalChoice};
+    use antares_sql::StoreMode;
+
+    /// The shelf in the message is rendered from the backend list, so a
+    /// backend added to `StoreMode` — or compiled in from outside this
+    /// workspace — cannot go missing from what the broker claims to have
+    /// been built with.
+    #[test]
+    fn the_shelf_names_every_store_mode() {
+        let shelf = built_with();
+        for m in StoreMode::ALL {
+            assert!(shelf.contains(m.as_str()), "{shelf} omits {m}");
+        }
+        assert!(
+            shelf.contains("none"),
+            "temporal `none` is part of the shelf: {shelf}"
+        );
+        for name in store_shelf() {
+            assert!(shelf.contains(name), "{shelf} omits {name}");
+        }
+    }
+
+    /// Absent, or the store's own name, means one instance serves both
+    /// seams — no second store is ever built for the default.
+    #[test]
+    fn absent_or_same_name_shares_the_store() {
+        assert_eq!(
+            temporal_choice("postgres", None).expect("ok"),
+            TemporalChoice::SameAsStore
+        );
+        assert_eq!(
+            temporal_choice("postgres", Some("postgres")).expect("ok"),
+            TemporalChoice::SameAsStore
+        );
+    }
+
+    #[test]
+    fn none_turns_history_off_and_other_names_build_a_second_store() {
+        assert_eq!(
+            temporal_choice("memory", Some("none")).expect("ok"),
+            TemporalChoice::None
+        );
+        assert_eq!(
+            temporal_choice("memory", Some("timescale")).expect("ok"),
+            TemporalChoice::Second("timescale".to_owned())
+        );
+    }
+
+    /// An unknown backend is fatal at startup and the message names the
+    /// shelf this binary was built with — never a silent default.
+    #[test]
+    fn unknown_backend_is_fatal_and_lists_the_shelf() {
+        let err = temporal_choice("memory", Some("mongo")).expect_err("must fail");
+        assert!(err.contains("mongo"), "{err}");
+        assert!(err.contains(&built_with()), "{err}");
+        assert!(
+            temporal_choice("memory", Some("")).is_err(),
+            "an empty name is not a default"
+        );
+    }
+
+    /// Shared state is what `ANTARES_BUS=nats` needs and what `bus=local`
+    /// refuses: a per-process backend — the built-in memory and file arms,
+    /// and any driver from outside the workspace — is never shared.
+    #[test]
+    fn only_the_database_backends_hold_shared_state() {
+        assert!(shared_state("postgres"));
+        assert!(shared_state("timescale"));
+        assert!(!shared_state("memory"));
+        assert!(!shared_state("file"));
+        assert!(
+            !shared_state("mongo"),
+            "an unknown name is not shared state"
+        );
+    }
+
+    /// A driver compiled in from outside `crates/` is selected by name
+    /// exactly like a built-in, and serves both storage seams.
+    #[cfg(feature = "plugin-example")]
+    #[tokio::test]
+    async fn a_plugin_backend_is_on_the_shelf_and_builds_both_seams() {
+        let name = antares_plugin_example::NAME;
+        assert!(
+            store_shelf().contains(&name),
+            "the shelf omits the compiled-in plugin: {:?}",
+            store_shelf()
+        );
+        assert_eq!(
+            temporal_choice(name, None).expect("ok"),
+            TemporalChoice::SameAsStore
+        );
+        let drivers = super::build_drivers(name)
+            .await
+            .expect("the plugin driver builds");
+        assert_eq!(drivers.temporal_name.as_deref(), Some(name));
+        assert!(
+            drivers.maintenance.is_empty(),
+            "a plugin backend brings no Postgres maintenance job"
+        );
+        let tenant = antares_model::TenantId::default();
+        drivers
+            .store
+            .create(
+                &tenant,
+                antares_store::Kind::Entity,
+                "urn:ngsi-ld:Probe:1",
+                serde_json::json!({"id": "urn:ngsi-ld:Probe:1"}),
+            )
+            .await
+            .expect("create through the plugin driver");
+        assert_eq!(
+            drivers
+                .store
+                .list(&tenant, antares_store::Kind::Entity)
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod api_surface_tests {
+    use super::{api_surfaces, SURFACE_SHELF};
+
+    fn names(raw: Option<&str>) -> Vec<&'static str> {
+        api_surfaces(raw)
+            .expect("selection")
+            .iter()
+            .map(|(n, _)| *n)
+            .collect()
+    }
+
+    /// Absent means the operational surface, and nothing else: a pod that
+    /// was never configured still answers its probes.
+    #[test]
+    fn absent_selects_admin() {
+        assert_eq!(names(None), vec!["admin"]);
+        assert_eq!(names(Some("admin")), vec!["admin"]);
+        assert_eq!(
+            names(Some(" admin , ")),
+            vec!["admin"],
+            "spacing is not a name"
+        );
+    }
+
+    /// An unknown name is fatal at startup and the message names the shelf
+    /// this binary was built with — never a silently ignored surface.
+    #[test]
+    fn an_unknown_surface_is_fatal_and_lists_the_shelf() {
+        let err = api_surfaces(Some("admin,dashboard")).expect_err("must fail");
+        assert!(err.contains("dashboard"), "{err}");
+        for (name, _) in SURFACE_SHELF {
+            assert!(err.contains(name), "the message lists {name}: {err}");
+        }
+    }
+
+    /// A surface compiled in from outside `crates/` is selected by name
+    /// beside the operational one, and claims its own prefix under `/x`.
+    #[cfg(feature = "plugin-example")]
+    #[test]
+    fn a_plugin_surface_mounts_beside_admin() {
+        assert_eq!(names(Some("admin,example")), vec!["admin", "example"]);
+        let built: Vec<Box<dyn antares_api::ApiSurface>> = api_surfaces(Some("admin,example"))
+            .expect("selection")
+            .iter()
+            .map(|(_, build)| build())
+            .collect();
+        let example = built
+            .iter()
+            .find(|s| s.name() == "example")
+            .expect("the plugin surface is built");
+        assert!(
+            example.prefix().starts_with("/x/"),
+            "a plugin surface lives under /x, never under the NGSI-LD root: {}",
+            example.prefix()
+        );
+    }
+
+    /// An empty selection is fatal too: readiness, health and metrics are
+    /// the admin surface, so a pod without one can never report itself up.
+    #[test]
+    fn an_empty_selection_is_fatal() {
+        for raw in ["", " ", ",", " , "] {
+            let err = api_surfaces(Some(raw)).expect_err(&format!("{raw:?} selects nothing"));
+            assert!(err.contains("ANTARES_API_SURFACES"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_shelf_tests {
+    use super::*;
+
+    fn shelf() -> Vec<&'static str> {
+        POLICY_SHELF.iter().map(|(n, _)| *n).collect()
+    }
+
+    /// ADR-0020: the broker ships one engine, and conformance is asserted
+    /// against it. A release build carries no other — an engine reaches the
+    /// shelf only through an off-by-default feature, so this assertion is
+    /// what "no addon in the shipped build" means for the policy seam.
+    #[cfg(not(feature = "plugin-example"))]
+    #[test]
+    fn the_shipped_build_carries_only_the_built_in_engine() {
+        assert_eq!(shelf(), vec!["allow-all"]);
+    }
+
+    /// No selection is the built-in engine, which is the only default that
+    /// keeps a broker without a policy behaving like a broker.
+    #[test]
+    fn no_selection_is_the_built_in_engine() {
+        for raw in [None, Some(""), Some("  ")] {
+            assert_eq!(policy_engine(raw).expect("default").0, "allow-all");
+        }
+    }
+
+    /// A typo must not serve every request wide open, so it is fatal and
+    /// the message names what this binary was built with.
+    #[test]
+    fn an_unknown_engine_is_fatal_and_names_the_shelf() {
+        let err = policy_engine(Some("opa")).expect_err("unknown engine");
+        assert!(err.contains("ANTARES_POLICY"), "{err}");
+        for name in shelf() {
+            assert!(err.contains(name), "the message lists {name}: {err}");
+        }
+    }
+
+    /// An engine compiled in from outside `crates/` is selected by name
+    /// exactly like the built-in one — and, given no rules to enforce,
+    /// refuses every operation rather than allowing it (ADR-0020: a broken
+    /// engine costs service, never access rules).
+    #[cfg(feature = "plugin-example")]
+    #[test]
+    fn a_plugin_engine_is_on_the_shelf_and_fails_closed() {
+        let name = antares_plugin_example::POLICY_NAME;
+        assert!(shelf().contains(&name), "the shelf omits it: {:?}", shelf());
+        let (selected, build) = policy_engine(Some(name)).expect("selection");
+        assert_eq!(selected, name);
+        assert_eq!(build().name(), name);
+        assert!(
+            std::env::var(antares_plugin_example::RULES_ENV).is_err(),
+            "this test reads the engine built with no rules document"
+        );
+        assert!(
+            antares_plugin_example::ExamplePolicy::from_env()
+                .broken()
+                .is_some(),
+            "an engine selected without rules would otherwise allow everything"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_pool_tests {
+    use super::{parse_pg_pool, parse_pg_statement_timeout};
+
+    /// ANTARES_PG_POOL: absent defaults to 20; a value that is not a
+    /// positive integer is fatal — misconfiguration must never silently
+    /// run with a default.
+    #[test]
+    fn pg_pool_parse_defaults_and_rejects() {
+        assert_eq!(
+            parse_pg_statement_timeout(None).expect("default"),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            parse_pg_statement_timeout(Some("1500")).expect("explicit"),
+            std::time::Duration::from_millis(1500)
+        );
+        assert!(parse_pg_statement_timeout(Some("0")).is_err());
+        assert!(parse_pg_statement_timeout(Some("30s")).is_err());
+        assert_eq!(parse_pg_pool(None).expect("default"), 20);
+        assert_eq!(parse_pg_pool(Some("7")).expect("explicit"), 7);
+        assert!(
+            parse_pg_pool(Some("abc")).is_err(),
+            "non-numeric ANTARES_PG_POOL must be fatal"
+        );
+        assert!(
+            parse_pg_pool(Some("0")).is_err(),
+            "a zero-sized pool must be fatal"
+        );
+        assert!(parse_pg_pool(Some("-3")).is_err());
+    }
+}

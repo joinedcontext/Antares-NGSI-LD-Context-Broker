@@ -1,0 +1,166 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/antares-model",
+    "crates/antares-store",
+    "crates/antares-jsonld",
+    "crates/antares-ql",
+    "crates/antares-sql",
+    "crates/antares-bus",
+    "crates/antares-api",
+    "crates/antares-matcher",
+    "crates/antares-notifier",
+    "crates/antares-broker",
+    "crates/antares-wasm",
+    # The reference plugin: built and tested with the workspace so the
+    # driver, routing and notification seams cannot drift from it.
+    "examples/plugin-example",
+]
+# Fuzz harness: own lockfile/profile, built only by cargo-fuzz on
+# nightly (.github/workflows/fuzz.yml) — never part of the normal build.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "EUPL-1.2"
+repository = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker"
+rust-version = "1.97"
+
+[workspace.dependencies]
+antares-model = { path = "crates/antares-model" }
+antares-store = { path = "crates/antares-store" }
+antares-jsonld = { path = "crates/antares-jsonld" }
+antares-ql = { path = "crates/antares-ql" }
+antares-sql = { path = "crates/antares-sql", default-features = false }
+antares-bus = { path = "crates/antares-bus" }
+antares-api = { path = "crates/antares-api", default-features = false }
+antares-matcher = { path = "crates/antares-matcher" }
+antares-notifier = { path = "crates/antares-notifier", default-features = false }
+antares-plugin-example = { path = "examples/plugin-example" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+# The storage driver seams are object-safe AND asynchronous, which no
+# stable language feature gives at once: `async fn` in a trait is not
+# dyn-compatible, so every method returns a boxed future. The macro writes
+# that boxing; the alternative is `Box::pin(async move { … })` by hand
+# around two hundred method bodies.
+async-trait = "0.1"
+# One HTTP client major in the build: `opentelemetry-otlp` takes 0.13, so the
+# broker does too. `rustls-no-provider` rather than `rustls`, which would
+# pull aws-lc-rs beside ring — the provider is installed once in
+# `antares_jsonld::client_builder`, and trust anchors come from the
+# platform store (the image carries one) widened by ANTARES_EXTRA_CA_FILE.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "query"] }
+chrono = { version = "0.4", features = ["serde"] }
+# 4.23.3 EXAMPLES 6/7: orderBy collation — ICU4X collator, compiled data
+icu_collator = "2"
+icu_locale_core = "2"
+uuid = { version = "1", features = ["v4", "v5"] }
+regex = "1"
+axum = "0.8"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["normalize-path", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+redb = "4.1"
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
+# The crypto provider for mqtts. rumqttc is built provider-less
+# (use-rustls-no-provider) so the workspace stays on ONE rustls stack with
+# ring only — aws-lc-sys (C + cmake) never enters the build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Geoquery evaluator (4.10): DE-9IM relate + GeoJSON conversion
+# no rayon: the geo operations here run per request on the runtime, and
+# rayon's pool (crossbeam-epoch) is what Miri rejects
+geo = { version = "0.33", default-features = false }
+geo-types = "0.7"
+geojson = "0.24"
+# @context parsed-LRU, sonic ingest fast path, allocator
+moka = { version = "0.12", features = ["sync"] }
+sonic-rs = "0.5"
+tikv-jemallocator = "0.7"
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "json", "chrono", "uuid", "migrate", "macros"] }
+# The JetStream change spine — official client, KV + streams in core
+# (0.50; pre-1.0 pin — upgrade in dedicated PRs)
+async-nats = "0.50"
+futures-util = { version = "0.3", default-features = false }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+# Observability: antares_ Prometheus metrics, env-gated OTLP traces
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "logs",
+    "http-proto",
+    "reqwest-blocking-client",
+] }
+opentelemetry-appender-tracing = "0.32"
+tracing-opentelemetry = "0.33"
+console-subscriber = "0.5"
+
+# dev
+http-body-util = "0.1"
+
+# Browser build (antares-wasm + the wasm32 target sections of core crates)
+http = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = "0.3"
+console_error_panic_hook = "0.1"
+# std::time re-export natively; performance.now()-backed on wasm32 —
+# std::time::Instant::now() PANICS on wasm32-unknown-unknown.
+web-time = "1"
+gloo-timers = { version = "0.3", features = ["futures"] }
+# Sound single-thread Send/Sync bridge (runtime-checked) — reqwest's wasm
+# client/futures are !Send but axum demands Send everywhere.
+send_wrapper = { version = "0.6", features = ["futures"] }
+
+# Debug and test builds carry line tables instead of full DWARF. The
+# workspace's test binaries are linked once per feature configuration, and
+# full debuginfo makes those copies the largest thing on the disk they
+# share; a panic still reports the file and line it came from.
+[profile.dev]
+debug = "line-tables-only"
+
+# `test` inherits from `dev`, and states the same value so a profile
+# override on one of them cannot leave the other on full DWARF.
+[profile.test]
+debug = "line-tables-only"
+
+# The browser artifact optimizes for size (opt-level z + fat LTO); the
+# native release profile stays throughput-tuned and untouched.
+[profile.release]
+# Resident code is the largest idle-RSS consumer (measured 10.9 MiB
+# of a 37.5 MB unstripped binary). Symbols stripped (cargo-auditable's
+# .dep-v0 section survives), thin LTO for smaller + slightly faster code.
+strip = "symbols"
+lto = "thin"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+# tokio_unstable is tokio's own out-of-band cfg (RUSTFLAGS="--cfg
+# tokio_unstable"); declare it so the console-feature guard doesn't trip
+# the unexpected-cfg lint.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+# clippy 1.98.0 runs this lint into >14 GB on the antares-api test target
+# (the CI runner dies with a bare SIGTERM); every other style lint stays on.
+needless_borrows_for_generic_args = "allow"

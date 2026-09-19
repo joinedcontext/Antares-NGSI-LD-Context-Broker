@@ -1,0 +1,51 @@
+# cargo-deny: licenses, advisories, bans, sources. TSL-licensed code must
+# NEVER be linked (TimescaleDB is talked to over SQL only).
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "EUPL-1.2",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # webpki-roots: Mozilla CA-bundle DATA under the permissive CDLA — no code
+    # licensing implications (pulled via reqwest/hyper-rustls and async-nats).
+    "CDLA-Permissive-2.0",
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # paste: unmaintained proc-macro, build-time only, via tikv-jemalloc-ctl.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time proc-macro via tikv-jemalloc-ctl; no runtime code" },
+    # rustls-pemfile: unmaintained; pinned by every rumqttc version incl.
+    # upstream main. Drops only when upstream migrates off it.
+    { id = "RUSTSEC-2025-0134", reason = "via rumqttc (all versions incl. upstream main); no fixed release exists" },
+    # rustls-webpki 0.102.x (no fixed 0.102 exists): rumqttc pins ^0.102.8
+    # DIRECTLY on every release and on upstream main. The 0.25 bump is DONE
+    # (use-rustls-no-provider + an explicit ring provider in antares-notifier,
+    # so the workspace runs ONE rustls 0.23 stack and aws-lc-sys never enters
+    # the build) — but the webpki pin survives it. Scope: mqtts notification
+    # egress server-cert checks only; the CRL-parsing panic needs CRLs
+    # configured (rumqttc configures none) and the name-constraint bypasses
+    # need constrained CAs. Exit: upstream bumps to webpki 0.103, or the
+    # MQTT client is swapped. Re-review at each rumqttc release.
+    { id = "RUSTSEC-2026-0049", reason = "rumqttc pins webpki 0.102 on all versions; mqtts egress only — see comment" },
+    { id = "RUSTSEC-2026-0098", reason = "rumqttc pins webpki 0.102 on all versions; mqtts egress only — see comment" },
+    { id = "RUSTSEC-2026-0099", reason = "rumqttc pins webpki 0.102 on all versions; mqtts egress only — see comment" },
+    { id = "RUSTSEC-2026-0104", reason = "rumqttc pins webpki 0.102 on all versions; mqtts egress only — see comment" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# internal path dependencies carry no version by design; the wildcard wall
+# is for registry deps, where a `*` really is unpinned drift
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

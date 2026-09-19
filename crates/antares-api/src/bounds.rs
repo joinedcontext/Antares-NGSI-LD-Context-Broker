@@ -1,0 +1,718 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! Input bounds wall: every request-shaped resource has
+//! a configured cap, rejected with the spec-shaped error. One middleware
+//! enforces the transport-level caps (URI length 414, body size 413, JSON
+//! nesting 400) — size and depth are checked BEFORE any parse. The
+//! per-feature caps (batch count, joinLevel, @context fetch
+//! count, q= complexity, result ceiling) live at their parse points.
+//! Rejections are counted and exported via /q/health.
+
+use axum::body::{Body, Bytes};
+use axum::http::{Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Hard caps (v1: compile-time constants — a config file is a later knob;
+/// every value is spec-shaped on rejection).
+/// → bare 413 (6.3.4). Deployment knob (ANTARES_MAX_BODY_BYTES): the spec
+/// names no ceiling; 4 MiB is the DoS bound, raised where a trusted
+/// producer legitimately sends bigger batches. Read once at first use.
+pub static MAX_BODY_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4 * 1024 * 1024)
+});
+pub const MAX_URI_BYTES: usize = 8 * 1024; // → bare 414
+pub const MAX_JSON_DEPTH: usize = 64; // → 400 BadRequestData
+/// → 400 BadRequestData. Maximum coordinate positions in a QUERY geometry
+/// (4.10 geoQ, 4.23 ordering reference). The spec sets no ceiling, and the
+/// geometry is not bounded by the URI length on the POST query path — the
+/// body carries it. Every position is an edge the DE-9IM relate walks once
+/// per candidate entity, so the work a single request can buy is capped
+/// here: 1024 positions describe an administrative boundary at street
+/// resolution, and are already more than the 8 KiB URI ceiling can carry.
+pub use antares_ql::geo::MAX_GEO_VERTICES;
+/// → 400 BadRequestData. Deployment knob (ANTARES_MAX_BATCH_ITEMS): the
+/// spec sets no batch ceiling — 1000 is this broker's DoS-bounds default,
+/// raised where a trusted producer legitimately batches larger (e.g. a
+/// full-fleet upsert). Read once at first use.
+pub static MAX_BATCH_ITEMS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_MAX_BATCH_ITEMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000)
+});
+// Deployment knob (ANTARES_MAX_FED_RESPONSE_BYTES): ceiling on one forwarded
+// (4.3.6) response body. The spec sets no ceiling; an over-cap peer part
+// fails like an unparseable payload (Table 6.3.17-1, warning 111) instead of
+// ballooning broker memory — one misbehaving peer must not break the
+// 500 MB RSS budget. Read once at first use.
+pub static MAX_FED_RESPONSE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_MAX_FED_RESPONSE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(16 * 1024 * 1024)
+});
+// Deployment knob (ANTARES_FED_INFLIGHT): forwarded requests in flight for
+// the whole process. Per-request fan-out is bounded below; across requests
+// nothing was, and 6 000 open federated queries × 34 sources each held
+// 7.7 GB of buffers and connections. Callers over the cap wait their turn.
+pub static MAX_FED_INFLIGHT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_FED_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(256)
+});
+pub static FED_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*MAX_FED_INFLIGHT));
+// Deployment knob (ANTARES_FED_FANOUT): concurrent forwards per distributed
+// read. 4.3.6.1 orders the MERGE (4.5.5), never the requests, so forwards
+// run concurrently; this bounds how many at once per request.
+pub static MAX_FED_FANOUT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_FED_FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8)
+});
+/// 6.3.17: `NGSILD-Warning` values relayed from ONE Context Source. The
+/// clause makes a peer's warnings part of this broker's answer (4.3.6.4 puts
+/// a deeper hop's abnormality on the response that survived it), so the list
+/// is written by the peer but sent by this broker to a client that never
+/// addressed it. Table 6.3.17-1 defines four codes and a cascade adds a few
+/// per hop, so eight carries a real cascade; past it a source would make the
+/// response grow faster than the fan-out does, and would crowd out the
+/// warnings the clause obliges this broker to raise about the other sources.
+pub const MAX_PEER_WARNINGS: usize = 8;
+
+/// → 500 InternalError. How many [`crate::AppState::call`] frames one
+/// request may be inside. The in-process handle is the façade seam, and a
+/// façade legitimately calls the broker while another façade legitimately
+/// calls it, so the ceiling is a depth rather than a refusal of the second
+/// call. Without one a `/x/` route that translates into a request its own
+/// surface serves recurses until the stack ends, and each frame builds a
+/// router of its own. Eight carries a façade over a façade over the broker
+/// several times and still ends the loop in milliseconds, an order of
+/// magnitude below what ends the process: with the guard removed, a route
+/// asking for thirty-two hops overflows a 2 MiB thread stack in a debug
+/// build. The count is per task — work a handler spawns starts a new chain,
+/// which is right, since a notification is not inside the request that
+/// caused it.
+pub const MAX_IN_PROCESS_CALL_DEPTH: usize = 8;
+
+pub const MAX_JOIN_LEVEL: usize = 10; // → 400 BadRequestData
+/// → 400 BadRequestData. Documents one @context resolution may fetch, owned
+/// by the loader that enforces it (`antares_jsonld`), and the ceiling on how
+/// many DISTINCT @contexts one batch may name — without the second, the item
+/// count multiplies the first.
+pub use antares_jsonld::MAX_CONTEXT_URLS as MAX_CONTEXT_FETCHES;
+/// Linked-entity lookup budget per `q=`, owned by the shared evaluator.
+pub use antares_ql::eval::MAX_Q_LINK_LOOKUPS;
+/// Regex compile ceiling and retention caps, owned by the shared cache
+/// (`antares_ql::regex`).
+pub use antares_ql::regex::{MAX_REGEX_CACHE, MAX_REGEX_CACHE_BYTES, MAX_REGEX_PROGRAM_BYTES};
+/// → 403 TooComplexQuery. The AST size cap, owned by the parser that
+/// enforces it (`antares_ql::parse_q`).
+pub use antares_ql::MAX_Q_NODES;
+
+/// → 403 TooManyResults (5.5.6). Deployment knob
+/// (ANTARES_DISCOVERY_SCAN_MAX): documents ONE unpaginated whole-tenant fold
+/// may read or hold. The folds that carry it are the ones the spec gives no
+/// window to push into the store: `/types` and `/attributes` (5.7.5-5.7.10
+/// define no pagination) and the registration query (5.10.2.4 filters first
+/// and pages second, so the page cannot be pushed down). Without it one
+/// request over a tenant at the 100 000-registration target holds every match
+/// at once. Read once at first use.
+pub static MAX_FOLD_DOCS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_DISCOVERY_SCAN_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100_000)
+});
+
+/// The ceilings on the notification pipeline. Not input bounds: no request
+/// names them and none is rejected against them. They are published beside
+/// the input caps for the same reason the regex-cache caps above are — an
+/// operator reading `/q/health` has to be able to tell a ceiling from a
+/// coincidence, and reaching one of these is what a dropped change or a
+/// stalled fan-out looks like from outside.
+///
+/// Depth of the change→matcher ring, the same size the local bus uses. A
+/// full ring drops the batch and counts it
+/// (`antares_notification_changes_dropped_total`), so this number is the
+/// back-pressure a deployment has before delivery loss starts.
+pub const CHANGE_QUEUE: usize = 1024;
+/// Notifications in flight at once per drain: one serial POST at a time
+/// capped a 9-subscription fan-out at ~600 POST/s and overflowed the ring.
+/// Deployment knob (ANTARES_DELIVERY_WIDTH): what a width is worth is a
+/// property of the subscribers, not of this broker — a slot is held for as
+/// long as the endpoint takes to answer, so a fleet of local sinks and a
+/// fleet of remote endpoints sitting at their 30 s timeout (Table 5.2.15-1)
+/// are served by different numbers, and the one that fits is measured
+/// against a deployment rather than compiled in. Read once at first use.
+pub static DELIVERY_WIDTH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_DELIVERY_WIDTH").ok().as_deref(),
+        64,
+        usize::MAX,
+    )
+});
+/// Of that width, what one tenant may hold. A Subscription belongs to one
+/// tenant (5.2.12), and a delivery to an endpoint that accepts and never
+/// answers holds its slot for the endpoint's whole timeout — up to 30 s
+/// (Table 5.2.15-1). Sharing the width with no per-tenant bound, a single
+/// tenant with enough dead endpoints holds every slot and nothing leaves the
+/// broker for anyone else. The share is a fraction of the width and not a
+/// fair split of it: a tenant delivering alone still gets several slots, and
+/// eight of them is what a full width of 64 divides into before the
+/// per-tenant queue becomes the bottleneck for an ordinary fan-out.
+/// Deployment knob (ANTARES_DELIVERY_WIDTH_PER_TENANT), ceilinged at the
+/// width above: a share larger than the width is not a share, and
+/// publishing one would name a ceiling that can never fire. Read once at
+/// first use.
+pub static DELIVERY_WIDTH_PER_TENANT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_DELIVERY_WIDTH_PER_TENANT")
+            .ok()
+            .as_deref(),
+        8,
+        *DELIVERY_WIDTH,
+    )
+});
+
+/// One configured count: the default stands in for anything unset,
+/// unparseable or zero — a zero would mint a semaphore that admits nobody
+/// and stop delivery altogether — and the ceiling bounds what a deployment
+/// can ask for where a larger number would be meaningless.
+fn count_from(raw: Option<&str>, default: usize, ceiling: usize) -> usize {
+    raw.and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+        .min(ceiling)
+}
+/// Destinations and registrations the egress breaker tracks. Both maps are
+/// keyed by client-supplied strings, so they need a bound: at the ceiling the
+/// least recently recorded entry is dropped, which costs at most a forgotten
+/// failure count for a destination nobody has touched in a while.
+pub const MAX_TRACKED_DESTINATIONS: usize = 4096;
+
+/// Rejection counters, exported by /q/health.
+#[derive(Default)]
+pub struct LimitStats {
+    pub uri_too_long: AtomicU64,
+    pub body_too_large: AtomicU64,
+    pub body_too_deep: AtomicU64,
+}
+
+impl LimitStats {
+    pub fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "maxBodyBytes": *MAX_BODY_BYTES,
+            "maxUriBytes": MAX_URI_BYTES,
+            "maxJsonDepth": MAX_JSON_DEPTH,
+            "maxGeoVertices": MAX_GEO_VERTICES,
+            "maxBatchItems": *MAX_BATCH_ITEMS,
+            "maxFoldDocs": *MAX_FOLD_DOCS,
+            "maxFedResponseBytes": *MAX_FED_RESPONSE_BYTES,
+            "maxFedFanout": *MAX_FED_FANOUT,
+            "maxFedInflight": *MAX_FED_INFLIGHT,
+            "maxJoinLevel": MAX_JOIN_LEVEL,
+            "maxInProcessCallDepth": MAX_IN_PROCESS_CALL_DEPTH,
+            "maxPeerWarnings": MAX_PEER_WARNINGS,
+            "maxContextFetches": MAX_CONTEXT_FETCHES,
+            "maxQNodes": MAX_Q_NODES,
+            "maxQLinkLookups": MAX_Q_LINK_LOOKUPS,
+            "maxRegexCache": MAX_REGEX_CACHE,
+            "maxRegexCacheBytes": MAX_REGEX_CACHE_BYTES,
+            "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
+            "changeQueue": CHANGE_QUEUE,
+            "deliveryWidth": *DELIVERY_WIDTH,
+            "deliveryWidthPerTenant": *DELIVERY_WIDTH_PER_TENANT,
+            "maxTrackedDestinations": MAX_TRACKED_DESTINATIONS,
+            "rejectedUriTooLong": self.uri_too_long.load(Ordering::Relaxed),
+            "rejectedBodyTooLarge": self.body_too_large.load(Ordering::Relaxed),
+            "rejectedBodyTooDeep": self.body_too_deep.load(Ordering::Relaxed),
+        })
+    }
+}
+
+/// Maximum brace/bracket nesting of a JSON byte stream, string-aware.
+/// A scan, not a parse — depth is checked before serde ever runs.
+pub(crate) fn json_depth(bytes: &[u8]) -> usize {
+    let (mut depth, mut max, mut in_str, mut esc) = (0usize, 0usize, false, false);
+    for &b in bytes {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+pub(crate) async fn bounds_layer(
+    axum::extract::State(st): axum::extract::State<crate::AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if req.uri().to_string().len() > MAX_URI_BYTES {
+        st.limits.uri_too_long.fetch_add(1, Ordering::Relaxed);
+        return StatusCode::URI_TOO_LONG.into_response(); // bare, like 6.3.4
+    }
+    // 6.3.4: "For HTTP POST, PATCH and PUT HTTP requests implementations shall
+    // check … Content-Length header shall include the length of the request
+    // payload body", and its absence "shall result in just a 411 HTTP status
+    // code (without any payload body)" — restated in 6.3.2. Scoped to HTTP/1.x:
+    // HTTP/2 and later carry length in the framing layer and legitimately omit
+    // the header, so demanding it there would reject conformant clients.
+    // The clause grants NO exemption for `Transfer-Encoding: chunked` — a
+    // chunked POST without Content-Length is exactly the case 411 covers, so it
+    // is deliberately not carved out here.
+    //
+    // The ONE deviation, made explicit rather than implied: the check is scoped
+    // to HTTP/1.x. 6.3.4 is written against RFC 7230/7231 and predates any h2
+    // consideration; HTTP/2 carries length in its framing and conformant h2
+    // clients routinely omit the header, so applying it there would reject
+    // requests the spec never meant to describe. Recorded in docs/ics.yaml.
+    if matches!(req.method().as_str(), "POST" | "PATCH" | "PUT")
+        && req.version() <= axum::http::Version::HTTP_11
+        && !req
+            .headers()
+            .contains_key(axum::http::header::CONTENT_LENGTH)
+    {
+        return StatusCode::LENGTH_REQUIRED.into_response(); // bare 411
+    }
+    let has_body = matches!(req.method().as_str(), "POST" | "PATCH" | "PUT" | "DELETE");
+    if !has_body {
+        return next.run(req).await;
+    }
+    let (parts, body) = req.into_parts();
+    // What the client says it is sending. The read below still decides — a
+    // declared length is a claim, and answering on the claim alone would cut
+    // the client off mid-body, where the RST that follows can take the
+    // response with it.
+    let fits_its_claim = parts
+        .headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n <= *MAX_BODY_BYTES);
+    let bytes: Bytes = match axum::body::to_bytes(body, *MAX_BODY_BYTES).await {
+        Ok(b) => b,
+        // `to_bytes` reports the length limit and any transport failure the
+        // same way. A body whose declared length fits the cap cannot have
+        // exceeded it, so what failed was the delivery: that is a bad request
+        // and NOT a size rejection — counting it as one would make
+        // `rejectedBodyTooLarge` read client aborts as clients hitting the
+        // cap. A body that declared more than the cap, or declared nothing
+        // (chunked), can only have hit the cap.
+        Err(_) if fits_its_claim => {
+            return crate::negotiate::ApiError::from(antares_model::NgsiError::InvalidRequest(
+                "request body was not delivered completely".into(),
+            ))
+            .into_response();
+        }
+        Err(_) => {
+            st.limits.body_too_large.fetch_add(1, Ordering::Relaxed);
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response(); // bare 413
+        }
+    };
+    // An absent (or unreadable) Content-Type is parsed as JSON downstream —
+    // 6.3.4 mandates Content-Length, not Content-Type — so it is scanned
+    // here too, or the nesting cap has a hole exactly where the parser has
+    // none. A header that names another media type keeps its 415.
+    let is_json = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_none_or(|v| match v.to_str() {
+            Ok(ct) => ct.contains("json"),
+            // A header the parser cannot read is not a header naming another
+            // media type: `negotiate::content_type` reports it as the empty
+            // string, which every route that tolerates an absent
+            // Content-Type reads as absent and parses. Scanning it is what
+            // keeps the cap ahead of the parser on those routes.
+            Err(_) => true,
+        });
+    if is_json && json_depth(&bytes) > MAX_JSON_DEPTH {
+        st.limits.body_too_deep.fetch_add(1, Ordering::Relaxed);
+        return crate::negotiate::ApiError::from(antares_model::NgsiError::BadRequestData(
+            format!("JSON nesting exceeds the {MAX_JSON_DEPTH}-level limit"),
+        ))
+        .into_response();
+    }
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scan is a bound, not a parser: unbalanced closers must not
+    /// underflow, and the value it reports is the one the middleware compares
+    /// against MAX_JSON_DEPTH, so the accept/reject boundary is exact.
+    #[test]
+    fn depth_scan_survives_unbalanced_and_boundary_input() {
+        assert_eq!(json_depth(b"]]]]"), 0, "stray closers must not underflow");
+        assert_eq!(json_depth(b"}}}{"), 1);
+        assert_eq!(json_depth(b""), 0);
+        assert_eq!(
+            json_depth(br#""{{{{""#),
+            0,
+            "a bare string carries no depth"
+        );
+        assert_eq!(
+            json_depth(br#"{"a": "\\"}"#),
+            1,
+            "an escaped backslash ends the escape"
+        );
+        let at_cap = "[".repeat(MAX_JSON_DEPTH) + &"]".repeat(MAX_JSON_DEPTH);
+        assert_eq!(json_depth(at_cap.as_bytes()), MAX_JSON_DEPTH);
+        assert!(
+            json_depth(at_cap.as_bytes()) <= MAX_JSON_DEPTH,
+            "exactly at the cap is accepted"
+        );
+        let over = "[".repeat(MAX_JSON_DEPTH + 1) + &"]".repeat(MAX_JSON_DEPTH + 1);
+        assert!(
+            json_depth(over.as_bytes()) > MAX_JSON_DEPTH,
+            "one over is rejected"
+        );
+    }
+
+    /// A cap `/q/health` publishes is the cap that fires: an OR chain of
+    /// `MAX_Q_NODES - 1` terms (the chain node plus its terms) parses, one
+    /// term more is 5.5.6 TooComplexQuery.
+    #[test]
+    fn the_published_q_node_cap_is_the_enforced_one() {
+        let chain = |k: usize| vec!["a==1"; k].join("|");
+        assert!(antares_ql::parse_q(&chain(MAX_Q_NODES - 1)).is_ok());
+        assert!(matches!(
+            antares_ql::parse_q(&chain(MAX_Q_NODES)),
+            Err(antares_model::NgsiError::TooComplexQuery(_))
+        ));
+    }
+
+    /// Every cap belongs in `/q/health` AND in the operator's chapter: the
+    /// admin-API chapter prints the whole `limits` object as the answer a
+    /// memory-store broker gives, and an operator reads a bound from there.
+    /// The test above pins the key set in code; nothing pinned the chapter,
+    /// and `maxFedInflight` was published for a release without ever being
+    /// written down. A cap added here now fails until the chapter has it.
+    #[test]
+    fn the_documented_health_limits_are_the_published_ones() {
+        let book = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/src/admin-api.md"
+        ))
+        .expect("the admin API chapter");
+        let block = book
+            .split_once("\"limits\": {")
+            .expect("the limits object in the sample response")
+            .1;
+        let block = block.split_once('}').expect("the end of the object").0;
+        let mut documented: Vec<&str> = block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"'))
+            .filter_map(|l| l.split_once('"'))
+            .map(|(k, _)| k)
+            .collect();
+        documented.sort_unstable();
+        let snap = LimitStats::default().snapshot();
+        let mut published: Vec<&str> = snap
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        published.sort_unstable();
+        assert_eq!(
+            documented, published,
+            "the admin API chapter's limits object is not the one /q/health answers"
+        );
+    }
+
+    /// /q/health publishes the caps and the rejection counters — and nothing
+    /// else: no configuration paths, no environment variable values, no
+    /// internal error text.
+    #[test]
+    fn health_snapshot_reports_the_caps_and_nothing_internal() {
+        let stats = LimitStats::default();
+        stats.uri_too_long.fetch_add(3, Ordering::Relaxed);
+        let snap = stats.snapshot();
+        let obj = snap.as_object().expect("object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "changeQueue",
+                "deliveryWidth",
+                "deliveryWidthPerTenant",
+                "maxBatchItems",
+                "maxBodyBytes",
+                "maxContextFetches",
+                "maxFedFanout",
+                "maxFedInflight",
+                "maxFedResponseBytes",
+                "maxFoldDocs",
+                "maxGeoVertices",
+                "maxInProcessCallDepth",
+                "maxJoinLevel",
+                "maxJsonDepth",
+                "maxPeerWarnings",
+                "maxQLinkLookups",
+                "maxQNodes",
+                "maxRegexCache",
+                "maxRegexCacheBytes",
+                "maxRegexProgramBytes",
+                "maxTrackedDestinations",
+                "maxUriBytes",
+                "rejectedBodyTooDeep",
+                "rejectedBodyTooLarge",
+                "rejectedUriTooLong",
+            ],
+            "no member beyond the caps, the pipeline ceilings and the counters"
+        );
+        assert_eq!(snap["rejectedUriTooLong"], 3);
+        assert!(
+            obj.values().all(|v| v.is_number()),
+            "every member is a number — no strings to leak paths through"
+        );
+    }
+
+    /// The nesting cap is checked BEFORE any parse — including on the path
+    /// that carries no Content-Type header at all, which the body parser
+    /// accepts and parses as JSON (6.3.4 only mandates Content-Length).
+    /// An unparseable Content-Type follows the same rule.
+    #[tokio::test]
+    async fn over_depth_body_without_content_type_is_still_rejected() {
+        use tower::ServiceExt;
+        let st = crate::AppState::new("http://localhost:0".into());
+        let app = axum::Router::new()
+            .route(
+                "/x",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(axum::middleware::from_fn_with_state(st, bounds_layer));
+        let deep = "[".repeat(MAX_JSON_DEPTH + 5) + &"]".repeat(MAX_JSON_DEPTH + 5);
+        // The third case is the one a header map can hold and `to_str`
+        // cannot read: a Content-Type carrying a byte outside UTF-8. Every
+        // route reads it as an absent Content-Type, so the scan must too.
+        let unreadable = axum::http::HeaderValue::from_bytes(b"application/\xffjson")
+            .expect("header value from raw bytes");
+        assert!(
+            unreadable.to_str().is_err(),
+            "the case under test is a header value that cannot be read as text"
+        );
+        for ct in [
+            None,
+            Some(axum::http::HeaderValue::from_static("application/json")),
+            Some(unreadable),
+        ] {
+            let mut req = Request::post("/x")
+                .header(axum::http::header::CONTENT_LENGTH, deep.len().to_string());
+            if let Some(ct) = ct.clone() {
+                req = req.header(axum::http::header::CONTENT_TYPE, ct);
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(Body::from(deep.clone())).expect("req"))
+                .await
+                .expect("resp");
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "an over-deep body must not reach the handler (content-type {ct:?})"
+            );
+        }
+    }
+
+    /// 6.3.4's 413 is about size, and `/q/health` publishes how often it
+    /// fired. A body the client abandoned mid-flight is a different event: it
+    /// is not over the cap, it must not be counted as one, and a declared
+    /// length over the cap must be refused before the broker buffers a byte
+    /// of it.
+    #[tokio::test]
+    async fn a_broken_body_is_not_an_over_cap_body() {
+        use tower::ServiceExt;
+        let st = crate::AppState::new("http://localhost:0".into());
+        let app = axum::Router::new()
+            .route(
+                "/x",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                bounds_layer,
+            ));
+
+        // the transport gave up: a declared length the body never delivers
+        let broken = Body::from_stream(futures_util::stream::once(async {
+            Err::<axum::body::Bytes, std::io::Error>(std::io::Error::other("reset"))
+        }));
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/x")
+                    .header(axum::http::header::CONTENT_LENGTH, "100")
+                    .body(broken)
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            st.limits.body_too_large.load(Ordering::Relaxed),
+            0,
+            "a client abort is not a size rejection"
+        );
+
+        // over the cap for real: 6.3.4's 413, counted
+        let over = vec![b'x'; *MAX_BODY_BYTES + 1];
+        let resp = app
+            .oneshot(
+                Request::post("/x")
+                    .header(axum::http::header::CONTENT_LENGTH, over.len().to_string())
+                    .body(Body::from(over))
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(st.limits.body_too_large.load(Ordering::Relaxed), 1);
+    }
+
+    /// Every cap this module declares is in the payload `/q/health` serves.
+    /// A cap an operator cannot read is one they cannot tell from a
+    /// coincidence when a request is refused or a change is dropped, so the
+    /// list is read out of this file's own source rather than kept by hand:
+    /// a cap added below without a member above fails here.
+    #[test]
+    fn every_declared_cap_is_published() {
+        let src = include_str!("bounds.rs");
+        let published = LimitStats::default().snapshot();
+        let published = published.as_object().expect("an object");
+        let mut missing = Vec::new();
+        for line in src.lines() {
+            let line = line.trim_start();
+            // `pub use` re-exports name their cap in another crate; the
+            // declarations here are the ones this file owns.
+            for kw in ["pub const ", "pub static "] {
+                let Some(rest) = line.strip_prefix(kw) else {
+                    continue;
+                };
+                let Some((name, ty)) = rest.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim();
+                // A cap is a count; the semaphore built from one is not a
+                // second cap and has nothing of its own to publish.
+                if !ty.contains("usize") {
+                    continue;
+                }
+                // MAX_URI_BYTES → maxUriBytes
+                let mut camel = String::new();
+                for (i, word) in name.split('_').enumerate() {
+                    let lower = word.to_lowercase();
+                    if i == 0 {
+                        camel.push_str(&lower);
+                    } else {
+                        let mut c = lower.chars();
+                        if let Some(f) = c.next() {
+                            camel.extend(f.to_uppercase());
+                            camel.push_str(c.as_str());
+                        }
+                    }
+                }
+                if !published.contains_key(&camel) {
+                    missing.push(format!("{name} (expected {camel:?})"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "caps declared here and absent from /q/health: {missing:?}"
+        );
+    }
+
+    /// A configured count is read once and never re-read, so a value that
+    /// would stop delivery has no second chance to be corrected: zero mints
+    /// a semaphore that admits nobody, and a per-tenant share above the
+    /// width names a ceiling that can never fire. Both fall back rather
+    /// than take the number as given.
+    #[test]
+    fn a_configured_count_falls_back_rather_than_disabling_delivery() {
+        assert_eq!(count_from(None, 64, usize::MAX), 64, "unset is the default");
+        assert_eq!(count_from(Some("weeks"), 64, usize::MAX), 64);
+        assert_eq!(count_from(Some(""), 64, usize::MAX), 64);
+        assert_eq!(
+            count_from(Some("0"), 64, usize::MAX),
+            64,
+            "zero would admit nobody"
+        );
+        assert_eq!(count_from(Some("-8"), 64, usize::MAX), 64);
+        assert_eq!(count_from(Some("256"), 64, usize::MAX), 256);
+        assert_eq!(
+            count_from(Some("512"), 8, 64),
+            64,
+            "a share over the width is the width"
+        );
+        assert_eq!(
+            count_from(None, 8, 4),
+            4,
+            "the ceiling binds the default too"
+        );
+    }
+
+    /// A guard on the compiled defaults rather than on the clamp: both
+    /// counts are read once per process, so a test cannot set one without
+    /// racing every other test in the binary for the read. What it holds is
+    /// that the two numbers shipped stay a share and a total, and that
+    /// neither default is ever lowered to zero — which would admit nobody.
+    #[test]
+    fn the_published_tenant_share_fits_inside_the_published_width() {
+        let snap = LimitStats::default().snapshot();
+        let width = snap["deliveryWidth"].as_u64().expect("a number");
+        let share = snap["deliveryWidthPerTenant"].as_u64().expect("a number");
+        assert!(share <= width, "share {share} exceeds width {width}");
+        assert!(width > 0 && share > 0, "neither may be zero");
+    }
+
+    #[test]
+    fn depth_scan_is_string_aware() {
+        assert_eq!(json_depth(br#"{"a": [1, {"b": 2}]}"#), 3);
+        assert_eq!(
+            json_depth(br#"{"a": "}]}]}]{[{["}"#),
+            1,
+            "braces in strings don't count"
+        );
+        assert_eq!(
+            json_depth(br#"{"a": "\"}"}"#),
+            1,
+            "escaped quotes stay in-string"
+        );
+        let deep = "[".repeat(100) + &"]".repeat(100);
+        assert_eq!(json_depth(deep.as_bytes()), 100);
+    }
+}

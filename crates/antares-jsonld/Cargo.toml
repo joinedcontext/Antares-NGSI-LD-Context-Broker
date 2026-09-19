@@ -1,0 +1,40 @@
+[package]
+name = "antares-jsonld"
+description = "JSON-LD layer: caching Loader, pinned core contexts, NGSI-LD expansion/compaction + structural validation."
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+antares-model = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true
+
+# Same crates, target-appropriate backends (sockets + rustls natively, the
+# browser's own fetch/timers on wasm32). Target sections only — no logic
+# differs between them.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# reqwest is built provider-less so the workspace stays on ONE rustls stack
+# with ring; the provider is installed here, once, before the first client.
+rustls = { workspace = true }
+# moka's clock panics on wasm32 — the browser build uses src/minicache.rs
+moka = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+web-time = { workspace = true }
+send_wrapper = { workspace = true }
+# Real fetch deadlines — the browser fetch has no client-level timeout
+# and a hung upstream would hold a resolve permit forever (global stall).
+gloo-timers = { workspace = true }
+futures-util = { workspace = true }
+
