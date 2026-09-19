@@ -52,7 +52,7 @@ jobs:
         run: ./dev/check-no-addon.sh
 
       - name: Build antares-local:${{ env.TAG }} (dep layer cached across runs)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           tags: antares-local:${{ env.TAG }}
