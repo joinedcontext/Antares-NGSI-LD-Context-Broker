@@ -22,8 +22,10 @@ name: perf-weekly
 # PAT for the runner registration token).
 
 on:
-  schedule:
-    - cron: "17 3 * * 6"
+  # Schedule off — the run rents a Hetzner box. Dispatch it by hand
+  # instead; restore by uncommenting.
+  # schedule:
+  #   - cron: "17 3 * * 6"
   workflow_dispatch:
     inputs:
       repeats:
