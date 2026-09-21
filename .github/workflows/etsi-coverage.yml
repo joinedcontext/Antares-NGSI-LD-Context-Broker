@@ -177,7 +177,7 @@ jobs:
       - name: Coverage ratchet — fail on a >1pt drop vs the published run
         run: |
           new=$(lcov --summary merged.info --ignore-errors inconsistent 2>/dev/null                 | awk '/lines/ {gsub("%","",$2); print $2}')
-          old=$(curl -sf https://antares-ngsi-ld-demo.marek-mraz.com/reports/coverage-badge.json                 | python3 -c 'import json,sys,re; m=re.search(r"[0-9.]+", json.load(sys.stdin)["message"]); print(m.group(0) if m else "")' || true)
+          old=$(curl -sf https://antaresbroker.joinedcontext.com/reports/coverage-badge.json                 | python3 -c 'import json,sys,re; m=re.search(r"[0-9.]+", json.load(sys.stdin)["message"]); print(m.group(0) if m else "")' || true)
           echo "merged lines: ${new}% (published baseline: ${old:-none}%)"
           # The baseline lives off-tree, on the published report. When it
           # cannot be read the ratchet has nothing to compare against — say

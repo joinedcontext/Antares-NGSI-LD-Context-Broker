@@ -58,7 +58,7 @@ decisions with identical semantics.
 | add a backend or a hook | [Extending Antares](extending.md) |
 | compare with other brokers | [Ecosystem & positioning](ecosystem.md) |
 
-Links: [live conformance report](https://antares-ngsi-ld-demo.marek-mraz.com/reports/latest/),
-[browser playground](https://antares-ngsi-ld-demo.marek-mraz.com/),
+Links: [live conformance report](https://antaresbroker.joinedcontext.com/reports/latest/),
+[browser playground](https://antaresbroker.joinedcontext.com/demo/),
 [source](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker),
 [ADRs](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/tree/main/docs/adr).

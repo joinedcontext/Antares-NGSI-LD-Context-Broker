@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PAGES_DOMAIN: antares-ngsi-ld-demo.marek-mraz.com
+  PAGES_DOMAIN: antaresbroker.joinedcontext.com
 
 jobs:
   publish:
@@ -58,51 +58,64 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Reuse the newest playground bundle (antares-www)
+      # The book IS the site root, and mdbook CLEANS its output directory —
+      # so it has to run before anything else is folded into site/.
+      - name: Build the docs book into the site root
+        run: |
+          curl -sL "https://github.com/rust-lang/mdBook/releases/download/v0.4.44/mdbook-v0.4.44-$(uname -m)-unknown-linux-musl.tar.gz" | tar xz
+          ./mdbook build -d site
+          # custom domain: the CNAME file travels with every deploy
+          echo "$PAGES_DOMAIN" > site/CNAME
+
+      # The vendored ETSI OpenAPI and the broker's own operational API,
+      # each rendered with ReDoc (the CIM 047 Annex B recommendation) as a
+      # standalone page under /openapi/. Their own directory on purpose: the
+      # book already emits api.html and admin-api.html from its chapters of
+      # those names, and a render at the site root would overwrite them.
+      - name: Render the API specs with ReDoc
+        # fail-soft: a renderer hiccup must not take the whole report deploy
+        # down with it — the page then says so instead of 404ing
+        run: |
+          mkdir -p site/openapi
+          for pair in "ngsi-ld-api:ngsi-ld:NGSI-LD API" "antares-admin:admin:Antares operational API"; do
+            IFS=: read -r src page title <<< "$pair"
+            npx --yes @redocly/cli@2.49.0 build-docs "docs/openapi/$src.yaml" -o "site/openapi/$page.html" \
+              || echo "<!doctype html><title>$title</title><p>ReDoc render failed this deploy — see docs/openapi/$src.yaml in the repo." > "site/openapi/$page.html"
+          done
+
+      - name: Reuse the newest playground bundle (antares-www) at /demo/
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          mkdir -p site
+          mkdir -p site/demo
           art=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=antares-www&per_page=1" \
                -q '.artifacts[0] | "\(.id) \(.workflow_run.head_sha) \(.created_at)"' 2>/dev/null || true)
           id=${art%% *}
           if [ -n "$id" ] && [ "$id" != "null" ]; then
             gh api "repos/${{ github.repository }}/actions/artifacts/$id/zip" > www.zip
-            unzip -q www.zip -d site
+            unzip -q www.zip -d bundle
+            # the artifact is a whole site: take its playground half only.
+            # A bundle built before the /demo/ move still carries the
+            # playground at its root, hence the fallback + the strip below.
+            src=bundle; [ -d bundle/demo ] && src=bundle/demo
+            cp -r "$src/." site/demo/
+            rm -f site/demo/CNAME
+            rm -rf site/demo/reports site/demo/api site/demo/app
             # The bundle is the newest one in retention, which is not
             # necessarily this deploy's commit: the wasm build is dispatched,
             # not run per deploy. Say which commit it IS, so a visitor can
             # tell the playground apart from the docs beside it.
             set -- $art
-            printf '{"commit":"%s","built":"%s"}\n' "$2" "$3" > site/playground-source.json
+            printf '{"commit":"%s","built":"%s"}\n' "$2" "$3" > site/demo/playground-source.json
           else
-            # no playground bundle in retention: reports still deploy; the
-            # playground appears after the next wasm.yml dispatch
-            echo '<!doctype html><title>Antares</title><p>Playground pending a wasm.yml run — <a href="reports/latest/">ETSI conformance report</a>.' \
-              > site/index.html
+            # no playground bundle in retention: docs and reports still
+            # deploy; /demo/ appears after the next wasm.yml dispatch
+            echo '<!doctype html><title>Antares playground</title><p>Playground pending a wasm.yml run — <a href="../">the docs</a>, <a href="../reports/latest/">the ETSI conformance report</a>.' \
+              > site/demo/index.html
           fi
-          echo "$PAGES_DOMAIN" > site/CNAME
 
-      - name: Build the docs book into the site
-        run: |
-          curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.44/mdbook-v0.4.44-x86_64-unknown-linux-musl.tar.gz | tar xz
-          ./mdbook build -d site/docs
-
-      # The vendored ETSI OpenAPI and the broker's own operational API,
-      # each rendered with ReDoc (the CIM 047 Annex B recommendation) as a
-      # standalone page next to the book.
-      - name: Render the API specs with ReDoc
-        # fail-soft: a renderer hiccup must not take the whole report deploy
-        # down with it — the page then says so instead of 404ing
-        run: |
-          for pair in "ngsi-ld-api:api:NGSI-LD API" "antares-admin:admin-api:Antares operational API"; do
-            IFS=: read -r src page title <<< "$pair"
-            npx --yes @redocly/cli@2.49.0 build-docs "docs/openapi/$src.yaml" -o "site/docs/$page.html" \
-              || echo "<!doctype html><title>$title</title><p>ReDoc render failed this deploy — see docs/openapi/$src.yaml in the repo." > "site/docs/$page.html"
-          done
-
-      # API reference beside the book: book at /docs, rustdoc at /api.
+      # API reference beside the book: book at /, rustdoc at /api/.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

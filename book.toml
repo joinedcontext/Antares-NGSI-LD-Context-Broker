@@ -1,6 +1,6 @@
 [book]
 title = "Antares — NGSI-LD Context Broker"
-authors = ["Marek Mráz"]
+authors = ["joinedcontext"]
 language = "en"
 src = "docs/src"
 
@@ -9,5 +9,5 @@ build-dir = "book"
 
 [output.html]
 git-repository-url = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker"
-edit-url-template = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/edit/main/{path}"
-site-url = "/docs/"
+edit-url-template = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/edit/dev/{path}"
+site-url = "/"

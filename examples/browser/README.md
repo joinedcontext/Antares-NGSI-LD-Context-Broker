@@ -9,7 +9,7 @@ The broker as a web page — no server process at all.
 The page installs a Service Worker that answers `/ngsi-ld/v1/*` for the
 origin; the playground UI creates entities, subscribes, and shows
 notifications arriving in-tab. Hosted copy:
-<https://antares-ngsi-ld-demo.marek-mraz.com/>.
+<https://antaresbroker.joinedcontext.com/demo/>.
 
 Want the same artifact behind a real TCP port (curl-able, e.g. for an
 edge box)? That is the Node shim:

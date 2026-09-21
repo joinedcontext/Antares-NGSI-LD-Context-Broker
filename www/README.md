@@ -102,8 +102,9 @@ client knows nothing about React; the vanilla `www/` page could adopt it.
 - **Same-origin note**: served on its own port, this app owns its own
   origin ⇒ its own OPFS file and localStorage ⇒ its own broker instance.
   It does NOT share state with `www/` unless served from the same origin
-  (the intended deployment: `/Antares-NGSI-LD-Context-Broker/` = www, `/Antares-NGSI-LD-Context-Broker/app/`
-  = this build — then they share the board AND the OPFS store).
+  (on the Pages site this build is the published playground at `/demo/`;
+  the vanilla `www/` page is not deployed any more, so nothing shares that
+  origin with it).
 - **History**: temporal queries hit the broker's real `/temporal/entities`
   (the store records history automatically). The chart is a hand-rolled
   SVG polyline — a charting dependency is not justified for one sparkline;
@@ -147,5 +148,5 @@ npm run e2e          # build + headless-chromium smoke against dist/
 - Scenario presets → additional `DEMO`-shaped configs in `model.js`; the
   runner already takes the topology as data.
 - TS migration: `broker/`, `model.js` first; components last.
-- Deploy: `wasm.yml` gains a second artifact (this `dist/` under `/app/`)
-  once the app stabilizes — same manual dispatch gate as the main page.
+- Deploy: done — `wasm.yml` bundles this `dist/` as the site's `/demo/`,
+  behind the same manual dispatch gate.

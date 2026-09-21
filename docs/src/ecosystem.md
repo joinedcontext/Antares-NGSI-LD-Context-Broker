@@ -12,7 +12,7 @@ tradition, and federates with them over the standard distributed-
 operations API. A deployment can mix brokers per site and migrate
 between them by replaying declarative state; conformance is the
 contract, and Antares publishes its evidence continuously on the
-[ETSI conformance report page](https://antares-ngsi-ld-demo.marek-mraz.com/reports/latest/).
+[ETSI conformance report page](https://antaresbroker.joinedcontext.com/reports/latest/).
 
 ## Where Antares fits best
 

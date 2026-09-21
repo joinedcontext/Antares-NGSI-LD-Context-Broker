@@ -5,7 +5,7 @@ project publishes; nothing in this chapter is typed in by hand. Both rent
 a dedicated-vCPU machine at Hetzner for the run, register it as an
 ephemeral GitHub runner, and delete it afterwards (`perf-janitor` sweeps a
 leaked server or volume by its expiry label). Results land under
-[`/reports/perf/latest/`](https://antares-ngsi-ld-demo.marek-mraz.com/reports/perf/latest/)
+[`/reports/perf/latest/`](https://antaresbroker.joinedcontext.com/reports/perf/latest/)
 with the raw CSVs next to the tables.
 
 | run | box | what it measures | cadence |
