@@ -772,7 +772,7 @@ enum AggrPeriod {
     Months(u32, i64),
 }
 
-fn parse_iso_duration(s: &str) -> Option<AggrPeriod> {
+fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
     let d = antares_model::parse_iso_duration(s)?;
     // saturating: an absurd magnitude must not panic (debug) or wrap
     // (release) — f64→int `as` casts already saturate, guard the ops.
@@ -918,7 +918,7 @@ fn parse_trepr(params: &HashMap<String, String>, ctx: &Context) -> Result<TRepr,
         ));
     }
     if let Some(d) = params.get("aggrPeriodDuration") {
-        let p = parse_iso_duration(d).ok_or_else(|| {
+        let p = parse_aggr_period(d).ok_or_else(|| {
             NgsiError::BadRequestData(format!("invalid aggrPeriodDuration {d:?}"))
         })?;
         // 4.11: the value space ends where duration arithmetic does —
@@ -3726,30 +3726,27 @@ mod clause_4_5_19 {
     fn a_mixed_date_and_time_duration_is_a_valid_period() {
         const DAY: i64 = 86_400;
         assert_eq!(
-            parse_iso_duration("P3Y6M4DT12H30M5S"),
+            parse_aggr_period("P3Y6M4DT12H30M5S"),
             Some(AggrPeriod::Months(42, 4 * DAY + 12 * 3600 + 30 * 60 + 5))
         );
         assert_eq!(
-            parse_iso_duration("P1Y1D"),
+            parse_aggr_period("P1Y1D"),
             Some(AggrPeriod::Months(12, DAY))
         );
         assert_eq!(
-            parse_iso_duration("P1MT1H"),
+            parse_aggr_period("P1MT1H"),
             Some(AggrPeriod::Months(1, 3600))
         );
         // the pure forms are unchanged
-        assert_eq!(parse_iso_duration("PT0S"), Some(AggrPeriod::Whole));
-        assert_eq!(parse_iso_duration("P0D"), Some(AggrPeriod::Whole));
-        assert_eq!(parse_iso_duration("P1M"), Some(AggrPeriod::Months(1, 0)));
-        assert_eq!(parse_iso_duration("PT90M"), Some(AggrPeriod::Seconds(5400)));
-        assert_eq!(
-            parse_iso_duration("P1W"),
-            Some(AggrPeriod::Seconds(7 * DAY))
-        );
+        assert_eq!(parse_aggr_period("PT0S"), Some(AggrPeriod::Whole));
+        assert_eq!(parse_aggr_period("P0D"), Some(AggrPeriod::Whole));
+        assert_eq!(parse_aggr_period("P1M"), Some(AggrPeriod::Months(1, 0)));
+        assert_eq!(parse_aggr_period("PT90M"), Some(AggrPeriod::Seconds(5400)));
+        assert_eq!(parse_aggr_period("P1W"), Some(AggrPeriod::Seconds(7 * DAY)));
         // and the grammar still rejects what is not a duration
-        assert_eq!(parse_iso_duration("P1X"), None);
-        assert_eq!(parse_iso_duration("1Y"), None);
-        assert_eq!(parse_iso_duration("P1"), None);
+        assert_eq!(parse_aggr_period("P1X"), None);
+        assert_eq!(parse_aggr_period("1Y"), None);
+        assert_eq!(parse_aggr_period("P1"), None);
     }
 
     fn windowed(times: &[&str]) -> Windowed {
@@ -3772,7 +3769,7 @@ mod clause_4_5_19 {
         TRepr {
             aggregated: true,
             aggr_methods: vec!["totalCount".to_owned()],
-            aggr_period: parse_iso_duration(duration).expect("duration"),
+            aggr_period: parse_aggr_period(duration).expect("duration"),
             ..Default::default()
         }
     }
