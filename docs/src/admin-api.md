@@ -12,7 +12,7 @@ same problem-details shape as the NGSI-LD API.
 
 The same routes as an OpenAPI document, with every status code and response
 schema: `docs/openapi/antares-admin.yaml`, rendered at
-<https://antares-ngsi-ld-demo.marek-mraz.com/docs/admin-api.html> (see the
+<https://antaresbroker.joinedcontext.com/openapi/admin.html> (see the
 [API reference](api.md)).
 
 | Route | Purpose |

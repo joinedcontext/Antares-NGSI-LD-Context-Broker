@@ -33,7 +33,7 @@ gh_api() { # method path [json]
 # 0. what the repository page and GitHub search show
 gh_api PATCH "" '{
   "description": "NGSI-LD Context Broker in Rust. ETSI CIM 009 V1.9.1 conformant, one small native binary, PostgreSQL/TimescaleDB storage, NATS JetStream scale-out, and a WebAssembly build that runs the same broker in the browser. Contributions go to the dev branch.",
-  "homepage": "https://antares-ngsi-ld-demo.marek-mraz.com/" }' >/dev/null
+  "homepage": "https://antaresbroker.joinedcontext.com/" }' >/dev/null
 gh_api PUT /topics '{ "names": [
   "ngsi-ld", "context-broker", "etsi", "etsi-cim", "fiware", "rust",
   "smart-cities", "digital-twin", "iot", "linked-data", "json-ld",

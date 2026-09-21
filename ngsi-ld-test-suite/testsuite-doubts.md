@@ -156,7 +156,7 @@ predicate just needs a wider net.
 ## 5. Compound `@context` fetched from forge.etsi.org over the internet
 
 **Hit:** Tests Link-header-reference
-`https://raw.githubusercontent.com/marek-mraz/ngsi-ld-test-suite/main/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld`
+`https://raw.githubusercontent.com/joinedcontext/Antares-NGSI-LD-Context-Broker/dev/ngsi-ld-test-suite/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld`
 and expect the broker to fetch + cache it.
 
 **Where:** `resources/variables.py:3` defines `ngsild_test_suite_context`

@@ -63,7 +63,7 @@ e.g., http://localhost:8080/ngsi-ld/v1).
 - `temporal_api_url` : This is the url of the GET temporal operation API, in case that a Context Broker splits 
 this portion of the API (e.g., http://localhost:8080/ngsi-ld/v1).
 - `ngsild_test_suite_context` : This is the url of the default context used in the ETSI NGSI-LD requests 
-(e.g. 'https://raw.githubusercontent.com/marek-mraz/ngsi-ld-test-suite/main/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld').
+(e.g. 'https://raw.githubusercontent.com/joinedcontext/Antares-NGSI-LD-Context-Broker/dev/ngsi-ld-test-suite/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld').
 - `notification_server_host` and `notification_server_port` : This is the address and port used to create the local 
 server to listen to notifications (the address must be accessible by the context broker). 
 - `mqtt_broker_host` : This is the address used to contact the MQTT broker where notifications are sent. 

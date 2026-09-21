@@ -6,8 +6,8 @@ WebAssembly build that runs the same broker inside a web page.
 
 [![ci](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml)
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
-[![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantares-ngsi-ld-demo.marek-mraz.com%2Freports%2Fbadge.json)](https://antares-ngsi-ld-demo.marek-mraz.com/reports/latest/)
-[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantares-ngsi-ld-demo.marek-mraz.com%2Freports%2Fcoverage-badge.json)](https://antares-ngsi-ld-demo.marek-mraz.com/reports/coverage/)
+[![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fcoverage-badge.json)](https://antaresbroker.joinedcontext.com/reports/coverage/)
 [![license: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
 [![release](https://img.shields.io/github/v/release/joinedcontext/Antares-NGSI-LD-Context-Broker?include_prereleases)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/releases)
 
@@ -19,7 +19,7 @@ WebAssembly build that runs the same broker inside a web page.
 - **Conformant.** 1822/1822 ETSI CIM 009 V1.9.1 test cases green in every
   native store mode, and 1810/1810 in the browser build, where the MQTT
   cases have no socket to run against
-  ([per-store report with Robot drill-down](https://antares-ngsi-ld-demo.marek-mraz.com/reports/latest/)).
+  ([per-store report with Robot drill-down](https://antaresbroker.joinedcontext.com/reports/latest/)).
   The ledger covers the whole spec text, one file per clause, in `docs/spec/`.
 - **Runs anywhere.** Zero infrastructure by default, PostgreSQL for
   production, NATS JetStream for scale-out, and a 4 MB wasm artifact that
@@ -129,7 +129,7 @@ How to read the matrix and the ledger: [Conformance](docs/src/conformance.md).
 
 ## Documentation
 
-The book is published at <https://antares-ngsi-ld-demo.marek-mraz.com/docs/>
+The book is published at <https://antaresbroker.joinedcontext.com/>
 and built from `docs/src`. Maintainers start at
 [ARCHITECTURE.md](ARCHITECTURE.md).
 

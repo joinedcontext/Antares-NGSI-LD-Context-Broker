@@ -4,15 +4,19 @@ name: wasm
 # full.yml's wasm job (dev/wasm-build.sh size budget, dev/wasm-test.sh Node
 # tier + headless-Chromium tier incl. the cross-tenant federation check)
 # without dragging the ETSI matrix along, PLUS the React playground
-# (www: vitest + vite build, served at /; the old /app/ path redirects
-# to /). Publishes the
+# (www: vitest + vite build, served at /demo/). Publishes the
 # ready-to-serve bundle as an artifact; `deploy_pages: true` additionally
 # deploys it to GitHub Pages (requires Pages enabled with "GitHub Actions"
 # source) under the custom domain below.
 #
+# A Pages deployment replaces the WHOLE site, so this workflow builds the
+# book into the site root too — otherwise a playground deploy would leave
+# the documented root 404ing until the next pages.yml run. (rustdoc at
+# /api/ is pages.yml's alone; a wasm deploy does drop it.)
+#
 # Custom domain (PAGES_DOMAIN): the CNAME file in the artifact pins it per
 # deploy. One-time setup outside this file: a DNS CNAME record
-#   antares-ngsi-ld-demo  →  joinedcontext.github.io
+#   antaresbroker  →  joinedcontext.github.io
 # and repo Settings → Pages → Custom domain + Enforce HTTPS.
 
 on:
@@ -35,7 +39,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PAGES_DOMAIN: antares-ngsi-ld-demo.marek-mraz.com
+  PAGES_DOMAIN: antaresbroker.joinedcontext.com
 
 jobs:
   build-test:
@@ -72,20 +76,14 @@ jobs:
           npm run build
       - name: Node tier + browser tier (incl. cross-tenant federation)
         run: ./dev/wasm-test.sh
-      - name: Bundle the site (React app at /; vanilla page no longer deployed)
+      - name: Bundle the site (book at /, React playground at /demo/)
         run: |
-          mkdir -p site
-          cp -r www/dist/* site/
-          # returning visitors of the old vanilla page still have its broker
-          # service worker registered at root scope — replace it with a
-          # self-destructing one so it unregisters on their next visit
-          cat > site/sw.js <<'EOF'
-          self.addEventListener("install", () => self.skipWaiting());
-          self.addEventListener("activate", (e) => e.waitUntil(self.registration.unregister()));
-          EOF
-          # old /app/ links redirect to the root
-          mkdir -p site/app
-          echo '<!doctype html><meta http-equiv="refresh" content="0; url=../"><a href="../">moved to /</a>' > site/app/index.html
+          # the book is the site root and mdbook CLEANS its output directory,
+          # so it goes first; the playground and /reports/ fold in after it
+          curl -sL "https://github.com/rust-lang/mdBook/releases/download/v0.4.44/mdbook-v0.4.44-$(uname -m)-unknown-linux-musl.tar.gz" | tar xz
+          ./mdbook build -d site
+          mkdir -p site/demo
+          cp -r www/dist/* site/demo/
           # custom domain: the CNAME file travels with every deploy
           echo "$PAGES_DOMAIN" > site/CNAME
       - name: Fold the latest ETSI conformance report into the site
