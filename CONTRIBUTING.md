@@ -72,14 +72,20 @@ lives on a topic branch and comes in by pull request like a fork's.
 1. Set the workspace version in `Cargo.toml` on `dev`
    (`release: v0.MINOR.PATCH` as the commit subject), then open a pull
    request `dev` → `main` with the same title.
-2. `full` runs on it. Red means the fix goes to `dev` and the same pull
-   request picks it up.
+2. `full` runs when the pull request opens, reopens or leaves draft. A
+   later push to `dev` moves the pull request's head without rerunning
+   the grid. Red means the fix goes to `dev`; then run `full` once on the
+   final head (Actions → full → Run workflow on `dev`, or flip the pull
+   request to draft and back). The required checks hang on the head
+   commit, so the merge stays blocked until that run is green.
 3. Merge with a merge commit. Squash or rebase here would give `main`
    commits `dev` does not have, and the next promotion would conflict
    with itself.
-4. Tag the merge commit on `main` and push the tag:
-   `git fetch && git tag -s v0.MINOR.PATCH origin/main && git push origin v0.MINOR.PATCH`.
-   The tag run is the release gate, and a tag is final: a bad release
+4. Tag the merge commit on `main` and push the tag: `dev/release-tag.sh`
+   (`--dry-run` shows the tag and the commit first). It reads the version
+   from `origin/main`, refuses a commit that is not the promotion's merge
+   or a tag that already exists, signs when git has a signing key and
+   annotates otherwise, and pushes on a typed `yes`. The tag run is the release gate, and a tag is final: a bad release
    is fixed by the next PATCH, not by moving the tag.
 
 **Dependency updates.** Dependabot (`.github/dependabot.yml`) opens
