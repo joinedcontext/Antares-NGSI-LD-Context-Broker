@@ -1,6 +1,6 @@
 url = 'http://scorpio1:9090/ngsi-ld/v1'
 temporal_api_url = 'http://scorpio1:9090/ngsi-ld/v1'
-ngsild_test_suite_context = 'https://raw.githubusercontent.com/marek-mraz/ngsi-ld-test-suite/main/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld'
+ngsild_test_suite_context = 'https://raw.githubusercontent.com/joinedcontext/Antares-NGSI-LD-Context-Broker/dev/ngsi-ld-test-suite/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld'
 notification_server_host = '172.28.0.18'
 notification_server_port = 8085
 mqtt_broker_host = 'ngsi-ld-test-suite-mosquitto-container'
