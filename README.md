@@ -29,8 +29,7 @@ WebAssembly build that runs the same broker inside a web page.
   isolated by `tenant_id` and Row-Level Security, and exists from the
   first request that names it. Nothing in the broker caps the count, so
   one deployment can hand every employee, department and use case a
-  tenant of its own, 100,000 of them on one Postgres cluster. The weekly
-  scale run measures 10,000 ([Performance](docs/src/performance.md)).
+  tenant of its own, 100,000 of them on one Postgres cluster.
 
 ## Quickstart
 
@@ -41,9 +40,12 @@ docker run --rm -p 9090:9090 ghcr.io/joinedcontext/antares-broker:latest
 ```bash
 curl -i -X POST localhost:9090/ngsi-ld/v1/entities \
   -H 'Content-Type: application/ld+json' \
-  -d '{"id":"urn:ngsi-ld:TemperatureSensor:001","type":"TemperatureSensor",
-       "temperature":{"type":"Property","value":21.5,"unitCode":"CEL"},
-       "@context":"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"}'
+  -d '{
+    "id": "urn:ngsi-ld:TemperatureSensor:001",
+    "type": "TemperatureSensor",
+    "temperature": {"type": "Property", "value": 21.5, "unitCode": "CEL"},
+    "@context": "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+  }'
 # HTTP/1.1 201 Created
 
 curl -s 'localhost:9090/ngsi-ld/v1/entities?type=TemperatureSensor'
