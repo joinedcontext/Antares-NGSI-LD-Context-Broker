@@ -80,7 +80,8 @@ docker compose -f compose-files/docker-compose-ha.yml up    # two replicas + hap
 ```
 
 Image tags: `:dev` is the latest green `dev`, `:dev-<run>` one CI run,
-`:latest` the latest release. Images are multi-arch (amd64, arm64). The
+`:0.1.1` one release, `:0.1` the newest patch of a minor, `:latest` the
+latest release. Images are multi-arch (amd64, arm64). The
 role-split fleet (`--roles api,matcher,notifier,temporal,registry`) and
 the Kubernetes manifests are in [Deployment](docs/src/deployment.md).
 
