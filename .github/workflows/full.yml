@@ -1,7 +1,7 @@
 name: full
 
-# The EVERYTHING pipeline — twice a week on schedule, on every v* tag, on
-# every PR into main (the promotion of dev, which cannot merge without
+# The EVERYTHING pipeline — twice a week on schedule, on every v* tag, when
+# a PR into main opens or leaves draft (the promotion of dev, which cannot merge without
 # the whole grid green; ci.yml's quick preset gates dev itself), and on
 # manual dispatch: workspace tests, the
 # browser/wasm artifact proven in both runtimes, the wasm Node tier, and
@@ -31,6 +31,12 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main] # the promotion gate; PRs into dev run ci.yml
+    # No `synchronize`: while the promotion PR is open, a push to dev moves
+    # its head and would rerun the whole grid per commit. The grid runs when
+    # the PR opens, reopens or leaves draft. The required checks hang on the
+    # head commit, so after later pushes prove the final head once: dispatch
+    # this workflow on dev, or flip the PR to draft and back.
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
 
 # The default for every job here; the ones that publish an image, cut a
@@ -351,6 +357,14 @@ jobs:
       - name: No addon in the shipped build
         run: ./dev/check-no-addon.sh
       - name: Build + package
+        env:
+          # musl-tools' aarch64-linux-musl-gcc wraps the glibc gcc, whose
+          # default -moutline-atomics links libgcc's lse-init.o, and that
+          # needs glibc's __getauxval. Every atomics probe of jemalloc's
+          # configure then fails to link and the build stops at "Don't have
+          # atomics implemented on this platform". Inline atomics need no
+          # helper. The variable names the target, so the x86_64 leg ignores it.
+          CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
         run: |
           # --locked: the released binary and the released image must be built
           # from the same dependency set (the Dockerfile builds locked too).
