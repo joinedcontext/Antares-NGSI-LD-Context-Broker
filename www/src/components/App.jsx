@@ -111,17 +111,6 @@ export default function App() {
           tab owning antares.redb and reload
         </div>
       )}
-      <footer
-        style={{
-          textAlign: "center",
-          padding: ".5rem",
-          fontSize: "1rem",
-          fontWeight: 700,
-          opacity: 0.85,
-        }}
-      >
-        Author: Marek Mráz
-      </footer>
     </div>
   );
 }

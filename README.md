@@ -4,6 +4,10 @@
 binary, about 35 MiB of memory under the full conformance suite, and a
 WebAssembly build that runs the same broker inside a web page.
 
+📖 **Docs:** <https://antaresbroker.joinedcontext.com/> ·
+🚀 **Demo:** <https://antaresbroker.joinedcontext.com/demo/> — the context
+broker running in your browser, nothing to install 🙂
+
 [![ci](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml)
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
 [![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
