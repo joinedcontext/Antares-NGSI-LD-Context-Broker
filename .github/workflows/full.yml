@@ -430,7 +430,12 @@ jobs:
       - name: Release notes from the commit log
         run: |
           VER="${GITHUB_REF#refs/tags/}"
-          git fetch -q --tags --unshallow 2>/dev/null || git fetch -q --tags
+          # --force, or the fetch dies silently: checkout pins the tag by
+          # sha (+<sha>:refs/tags/<tag>), leaving a lightweight local tag
+          # where the remote has an annotated object, and git rejects the
+          # update as "would clobber existing tag" — exit 1, no output,
+          # since -q swallows the rejection.
+          git fetch -q --tags --force --unshallow 2>/dev/null || git fetch -q --tags --force
           PREV=$(git describe --tags --abbrev=0 "$VER^" 2>/dev/null || true)
           git log --no-merges --format='- %s' ${PREV:+$PREV..}"$VER" > notes.md
           [ -s notes.md ] || echo "Antares $VER." > notes.md
