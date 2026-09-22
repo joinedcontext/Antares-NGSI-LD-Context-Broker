@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Vale on the diff
-        uses: errata-ai/vale-action@v2
+        uses: errata-ai/vale-action@v3
         with:
           # only the lines this PR adds — never relitigate the whole repo
           filter_mode: added
