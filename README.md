@@ -28,7 +28,7 @@ WebAssembly build that runs the same broker inside a web page.
 ## Quickstart
 
 ```bash
-docker run --rm -p 9090:9090 ghcr.io/joinedcontext/antares-broker:dev
+docker run --rm -p 9090:9090 ghcr.io/joinedcontext/antares-broker:latest
 ```
 
 ```bash
@@ -67,12 +67,12 @@ subscription endpoint. Details, measured costs and backup procedures:
 ```bash
 # durable single node, no Postgres
 docker run --rm -p 9090:9090 -e ANTARES_STORE=file -e ANTARES_DATA_DIR=/data \
-  -v antares-data:/data ghcr.io/joinedcontext/antares-broker:dev
+  -v antares-data:/data ghcr.io/joinedcontext/antares-broker:latest
 
 # postgres / timescale
 docker run --rm -p 9090:9090 -e ANTARES_STORE=postgres \
   -e ANTARES_DATABASE_URL=postgresql://antares:antares@db:5432/antares \
-  ghcr.io/joinedcontext/antares-broker:dev
+  ghcr.io/joinedcontext/antares-broker:latest
 
 # local stacks: broker + PostGIS + NATS + mosquitto
 docker compose -f compose-files/docker-compose.yml up       # one broker
