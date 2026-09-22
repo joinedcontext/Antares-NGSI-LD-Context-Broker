@@ -7,7 +7,7 @@ WebAssembly build that runs the same broker inside a web page.
 📖 **Docs:** <https://antaresbroker.joinedcontext.com/>
 
 🚀 **Demo:** <https://antaresbroker.joinedcontext.com/demo/> — the context
-broker running in your browser 😅
+broker running in your browser, yes in the browser 😅
 
 [![ci](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml)
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
