@@ -39,7 +39,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
 
       - uses: dtolnay/rust-toolchain@stable
@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v7
         with:
           pattern: etsi-coverage-*
@@ -227,7 +227,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/failure-issue
         with:
           title: ETSI coverage run failed
