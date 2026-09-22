@@ -8,6 +8,7 @@ WebAssembly build that runs the same broker inside a web page.
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
 [![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fcoverage-badge.json)](https://antaresbroker.joinedcontext.com/reports/coverage/)
+[![docs](https://img.shields.io/badge/docs-antaresbroker.joinedcontext.com-blue)](https://antaresbroker.joinedcontext.com/)
 [![license: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
 [![release](https://img.shields.io/github/v/release/joinedcontext/Antares-NGSI-LD-Context-Broker?include_prereleases)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/releases)
 
@@ -24,6 +25,12 @@ WebAssembly build that runs the same broker inside a web page.
 - **Runs anywhere.** Zero infrastructure by default, PostgreSQL for
   production, NATS JetStream for scale-out, and a 4 MB wasm artifact that
   serves `/ngsi-ld/v1/*` from a Service Worker with nothing installed.
+- **Tenants without a ceiling.** A tenant is a row in one shared schema,
+  isolated by `tenant_id` and Row-Level Security, and exists from the
+  first request that names it. Nothing in the broker caps the count, so
+  one deployment can hand every employee, department and use case a
+  tenant of its own, 100,000 of them on one Postgres cluster. The weekly
+  scale run measures 10,000 ([Performance](docs/src/performance.md)).
 
 ## Quickstart
 
