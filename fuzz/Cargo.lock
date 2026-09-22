@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "antares-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "antares-jsonld",
  "antares-matcher",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "antares-jsonld"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "antares-model",
  "chrono",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "antares-matcher"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "antares-model"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "antares-notifier"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ql"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "antares-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "antares-model",
  "antares-ql",

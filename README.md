@@ -4,10 +4,16 @@
 binary, about 35 MiB of memory under the full conformance suite, and a
 WebAssembly build that runs the same broker inside a web page.
 
+📖 **Docs:** <https://antaresbroker.joinedcontext.com/>
+
+🚀 **Demo:** <https://antaresbroker.joinedcontext.com/demo/> — the context
+broker running in your browser, yes in the browser 😅
+
 [![ci](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml)
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
 [![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fcoverage-badge.json)](https://antaresbroker.joinedcontext.com/reports/coverage/)
+[![docs](https://img.shields.io/badge/docs-antaresbroker.joinedcontext.com-blue)](https://antaresbroker.joinedcontext.com/)
 [![license: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
 [![release](https://img.shields.io/github/v/release/joinedcontext/Antares-NGSI-LD-Context-Broker?include_prereleases)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/releases)
 
@@ -24,19 +30,27 @@ WebAssembly build that runs the same broker inside a web page.
 - **Runs anywhere.** Zero infrastructure by default, PostgreSQL for
   production, NATS JetStream for scale-out, and a 4 MB wasm artifact that
   serves `/ngsi-ld/v1/*` from a Service Worker with nothing installed.
+- **Tenants without a ceiling.** A tenant is a row in one shared schema,
+  isolated by `tenant_id` and Row-Level Security, and exists from the
+  first request that names it. Nothing in the broker caps the count, so
+  one deployment can hand every employee, department and use case a
+  tenant of its own, 100,000 of them on one Postgres cluster.
 
 ## Quickstart
 
 ```bash
-docker run --rm -p 9090:9090 ghcr.io/joinedcontext/antares-broker:dev
+docker run --rm -p 9090:9090 ghcr.io/joinedcontext/antares-broker:latest
 ```
 
 ```bash
 curl -i -X POST localhost:9090/ngsi-ld/v1/entities \
   -H 'Content-Type: application/ld+json' \
-  -d '{"id":"urn:ngsi-ld:TemperatureSensor:001","type":"TemperatureSensor",
-       "temperature":{"type":"Property","value":21.5,"unitCode":"CEL"},
-       "@context":"https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"}'
+  -d '{
+    "id": "urn:ngsi-ld:TemperatureSensor:001",
+    "type": "TemperatureSensor",
+    "temperature": {"type": "Property", "value": 21.5, "unitCode": "CEL"},
+    "@context": "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+  }'
 # HTTP/1.1 201 Created
 
 curl -s 'localhost:9090/ngsi-ld/v1/entities?type=TemperatureSensor'
@@ -67,12 +81,12 @@ subscription endpoint. Details, measured costs and backup procedures:
 ```bash
 # durable single node, no Postgres
 docker run --rm -p 9090:9090 -e ANTARES_STORE=file -e ANTARES_DATA_DIR=/data \
-  -v antares-data:/data ghcr.io/joinedcontext/antares-broker:dev
+  -v antares-data:/data ghcr.io/joinedcontext/antares-broker:latest
 
 # postgres / timescale
 docker run --rm -p 9090:9090 -e ANTARES_STORE=postgres \
   -e ANTARES_DATABASE_URL=postgresql://antares:antares@db:5432/antares \
-  ghcr.io/joinedcontext/antares-broker:dev
+  ghcr.io/joinedcontext/antares-broker:latest
 
 # local stacks: broker + PostGIS + NATS + mosquitto
 docker compose -f compose-files/docker-compose.yml up       # one broker
@@ -80,7 +94,8 @@ docker compose -f compose-files/docker-compose-ha.yml up    # two replicas + hap
 ```
 
 Image tags: `:dev` is the latest green `dev`, `:dev-<run>` one CI run,
-`:latest` the latest release. Images are multi-arch (amd64, arm64). The
+`:0.1.2` one release, `:0.1` the newest patch of a minor, `:latest` the
+latest release. Images are multi-arch (amd64, arm64). The
 role-split fleet (`--roles api,matcher,notifier,temporal,registry`) and
 the Kubernetes manifests are in [Deployment](docs/src/deployment.md).
 

@@ -232,7 +232,10 @@ jobs:
     # their own cadence and no longer gate the release.
     name: Publish the release image to GHCR
     if: startsWith(github.ref, 'refs/tags/v') && success()
-    needs: [matrix, build-arm]
+    # The binaries and the browser proof are in the set on purpose: the
+    # image and :latest move only when the whole release can ship, so a red
+    # binary never leaves a version on the registry that has no release.
+    needs: [matrix, build-arm, release-binaries, wasm]
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -258,16 +261,20 @@ jobs:
           docker load < antares-image-arm64.tgz
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           IMG=ghcr.io/${{ github.repository_owner }}/antares-broker
-          VER="${GITHUB_REF#refs/tags/}"
+          # Image tags carry the bare version (the git tag is v0.1.1, the
+          # image is :0.1.1, as registries name images), plus the minor
+          # (:0.1 follows the newest patch) and :latest.
+          VER="${GITHUB_REF_NAME#v}"
+          MINOR="${VER%.*}"
           SHA=${GITHUB_SHA::7}
           docker tag antares-local:latest "$IMG:$SHA-amd64"
           docker tag antares-local:arm64 "$IMG:$SHA-arm64"
           docker push "$IMG:$SHA-amd64"
           docker push "$IMG:$SHA-arm64"
           docker buildx imagetools create \
-            -t "$IMG:$VER" -t "$IMG:$SHA" -t "$IMG:latest" \
+            -t "$IMG:$VER" -t "$IMG:$MINOR" -t "$IMG:$SHA" -t "$IMG:latest" \
             "$IMG:$SHA-amd64" "$IMG:$SHA-arm64"
-          echo -e "\n## Released: \`$IMG:$VER\` + \`$IMG:latest\` (multi-arch amd64+arm64; amd64 = the tested bytes, matrix + serial, all four store modes green)" >> "$GITHUB_STEP_SUMMARY"
+          echo -e "\n## Released: \`$IMG:$VER\` + \`$IMG:$MINOR\` + \`$IMG:latest\` (multi-arch amd64+arm64; amd64 = the tested bytes, matrix + serial, all four store modes green)" >> "$GITHUB_STEP_SUMMARY"
 
   upgrade-path:
     # Data written by the PREVIOUS release must be served by this one. The
@@ -390,6 +397,9 @@ jobs:
       id-token: write # cosign keyless
     steps:
       - uses: actions/checkout@v5
+      - name: The image tag is the bare version
+        id: image
+        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v7
         with:
           pattern: release-bin-*
@@ -406,7 +416,7 @@ jobs:
       - name: SBOM (syft, spdx-json) of the released image
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/${{ github.repository_owner }}/antares-broker:${{ github.ref_name }}
+          image: ghcr.io/${{ github.repository_owner }}/antares-broker:${{ steps.image.outputs.tag }}
           format: spdx-json
           output-file: antares-${{ github.ref_name }}.sbom.spdx.json
           upload-artifact: false
@@ -416,11 +426,16 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          cosign sign --yes "ghcr.io/${{ github.repository_owner }}/antares-broker:${{ github.ref_name }}"
+          cosign sign --yes "ghcr.io/${{ github.repository_owner }}/antares-broker:${{ steps.image.outputs.tag }}"
       - name: Release notes from the commit log
         run: |
           VER="${GITHUB_REF#refs/tags/}"
-          git fetch -q --tags --unshallow 2>/dev/null || git fetch -q --tags
+          # --force, or the fetch dies silently: checkout pins the tag by
+          # sha (+<sha>:refs/tags/<tag>), leaving a lightweight local tag
+          # where the remote has an annotated object, and git rejects the
+          # update as "would clobber existing tag" — exit 1, no output,
+          # since -q swallows the rejection.
+          git fetch -q --tags --force --unshallow 2>/dev/null || git fetch -q --tags --force
           PREV=$(git describe --tags --abbrev=0 "$VER^" 2>/dev/null || true)
           git log --no-merges --format='- %s' ${PREV:+$PREV..}"$VER" > notes.md
           [ -s notes.md ] || echo "Antares $VER." > notes.md
