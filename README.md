@@ -4,7 +4,8 @@
 binary, about 35 MiB of memory under the full conformance suite, and a
 WebAssembly build that runs the same broker inside a web page.
 
-📖 **Docs:** <https://antaresbroker.joinedcontext.com/> ·
+📖 **Docs:** <https://antaresbroker.joinedcontext.com/>
+
 🚀 **Demo:** <https://antaresbroker.joinedcontext.com/demo/> — the context
 broker running in your browser 😅
 
