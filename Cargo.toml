@@ -76,7 +76,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # rayon's pool (crossbeam-epoch) is what Miri rejects
 geo = { version = "0.33", default-features = false }
 geo-types = "0.7"
-geojson = "0.24"
+geojson = "1.0"
 # @context parsed-LRU, sonic ingest fast path, allocator
 moka = { version = "0.12", features = ["sync"] }
 sonic-rs = "0.5"
