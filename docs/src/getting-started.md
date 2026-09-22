@@ -17,7 +17,7 @@ docker run --rm -p 9090:9090 ghcr.io/joinedcontext/antares-broker:dev
 cargo run -p antares-broker        # serves http://0.0.0.0:9090
 ```
 
-**Release binary**: attached to GitHub releases (from v0.1.0 on).
+**Release binary**: attached to GitHub releases (from v0.1.1 on).
 
 The default configuration needs zero infrastructure: in-memory store,
 in-process bus, all roles in one process. Check it is up:
