@@ -16,14 +16,14 @@
     "@xyflow/react": "^12",
     "react": "^19",
     "react-dom": "^19",
-    "swagger-ui-dist": "^5.32.8"
+    "swagger-ui-dist": "^5.33.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6",
     "@testing-library/react": "^16",
     "@vitejs/plugin-react": "^4",
     "jsdom": "^26",
-    "playwright-core": "^1.55",
+    "playwright-core": "^1.63",
     "vite": "^7",
     "vitest": "^3"
   }
