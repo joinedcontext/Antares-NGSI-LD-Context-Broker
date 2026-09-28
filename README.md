@@ -44,6 +44,14 @@ The latest full run of the ETSI NGSI-LD test suite (CIM 009 V1.9.1), one
 cell per store mode. The badges read the live report, so they always show
 the newest run.
 
+The suite in [`ngsi-ld-test-suite/`](ngsi-ld-test-suite/) started from the
+[ETSI NGSI-LD test suite](https://forge.etsi.org/rep/cim/ngsi-ld-test-suite)
+and was corrected and extended: each correction is recorded in
+[`testsuite-doubts.md`](ngsi-ld-test-suite/testsuite-doubts.md), the added
+tests live in [`AntaresSpecificTests/`](ngsi-ld-test-suite/AntaresSpecificTests/),
+and no test was weakened. Running the official ETSI suite unmodified is
+planned.
+
 | Store | Setup | Result |
 |---|---|---|
 | `memory` | in-RAM, zero dependencies | [![memory](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-memory.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
