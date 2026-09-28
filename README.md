@@ -12,6 +12,7 @@ broker running in your browser, yes in the browser 😅
 [![ci](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml)
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
 [![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
+[![unit tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/)
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fcoverage-badge.json)](https://antaresbroker.joinedcontext.com/reports/coverage/)
 [![docs](https://img.shields.io/badge/docs-antaresbroker.joinedcontext.com-blue)](https://antaresbroker.joinedcontext.com/)
 [![license: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
