@@ -46,11 +46,7 @@ the newest run.
 
 The suite in [`ngsi-ld-test-suite/`](ngsi-ld-test-suite/) started from the
 [ETSI NGSI-LD test suite](https://forge.etsi.org/rep/cim/ngsi-ld-test-suite)
-and was corrected and extended: each correction is recorded in
-[`testsuite-doubts.md`](ngsi-ld-test-suite/testsuite-doubts.md), the added
-tests live in [`AntaresSpecificTests/`](ngsi-ld-test-suite/AntaresSpecificTests/),
-and no test was weakened. Running the official ETSI suite unmodified is
-planned.
+and was corrected and extended; no test was weakened.
 
 | Store | Setup | Result |
 |---|---|---|
