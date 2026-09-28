@@ -36,6 +36,23 @@ broker running in your browser, yes in the browser 😅
   one deployment can hand every employee, department and use case a
   tenant of its own, 100,000 of them on one Postgres cluster.
 
+## ETSI conformance results
+
+The latest full run of the ETSI NGSI-LD test suite (CIM 009 V1.9.1), one
+cell per store mode. The badges read the live report, so they always show
+the newest run.
+
+| Store | Setup | Result |
+|---|---|---|
+| `memory` | in-RAM, zero dependencies | [![memory](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-memory.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `file` | redb file store | [![file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `postgres` | PostGIS | [![postgres](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `timescale` | PostGIS + TimescaleDB | [![timescale](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `postgres-nats` | PostGIS + NATS JetStream, ten containers rolled during the run | [![postgres-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `timescale-nats` | TimescaleDB + NATS JetStream, same rolling fleet | [![timescale-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `wasm-file` | WebAssembly build over the file store, MQTT excluded | [![wasm-file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-wasm-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| unit + integration | `cargo test` | [![unit](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/) |
+
 ## Quickstart
 
 ```bash
