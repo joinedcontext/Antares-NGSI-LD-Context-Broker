@@ -118,7 +118,7 @@ console_error_panic_hook = "0.1"
 # std::time re-export natively; performance.now()-backed on wasm32 —
 # std::time::Instant::now() PANICS on wasm32-unknown-unknown.
 web-time = "1"
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 # Sound single-thread Send/Sync bridge (runtime-checked) — reqwest's wasm
 # client/futures are !Send but axum demands Send everywhere.
 send_wrapper = { version = "0.6", features = ["futures"] }
