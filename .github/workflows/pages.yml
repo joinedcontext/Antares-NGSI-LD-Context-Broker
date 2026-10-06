@@ -56,7 +56,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The book IS the site root, and mdbook CLEANS its output directory —
       # so it has to run before anything else is folded into site/.
