@@ -204,8 +204,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          art=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=antares-www&per_page=1" \
-               -q '.artifacts[0] | "\(.id) \(.workflow_run.head_sha)"' 2>/dev/null || true)
+          # only a bundle built on this repository's dev is executed here
+          # (same filter as dev/fold-reports.sh)
+          repo_id=$(gh api "repos/${{ github.repository }}" -q .id)
+          art=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=antares-www&per_page=30" \
+               -q "[.artifacts[] | select(.expired == false and .workflow_run.head_branch == \"dev\" and .workflow_run.head_repository_id == $repo_id)][0] | \"\(.id) \(.workflow_run.head_sha)\"" \
+               2>/dev/null || true)
           id=${art%% *}
           if [ -z "$id" ] || [ "$id" = "null" ]; then
             echo "::warning::browser example SKIPPED — no antares-www artifact in retention (dispatch wasm.yml to produce one)"
@@ -217,7 +221,8 @@ jobs:
 
           gh api "repos/${{ github.repository }}/actions/artifacts/$id/zip" > www.zip
           unzip -q -o www.zip -d www-artifact
-          cp -r www-artifact/pkg www/ 2>/dev/null || cp -r www-artifact/www/pkg www/
+          # the artifact is the Pages site: the playground (and its pkg) sits under demo/
+          cp -r www-artifact/demo/pkg www/
           node www/node-shim.mjs 9090 & shim=$!
           for i in $(seq 50); do curl -sf localhost:9090/q/health >/dev/null && break; sleep 0.2; done
           curl -sf -o /dev/null -w 'wasm create: %{http_code}\n' -X POST \
