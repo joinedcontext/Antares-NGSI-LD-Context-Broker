@@ -9,8 +9,10 @@ name: perf-janitor
 # failed and deserves eyes.
 
 on:
-  schedule:
-    - cron: "43 */6 * * *"
+  # Schedule off while the Hetzner token is out of service, like
+  # perf-weekly and scale-weekly; restore by uncommenting.
+  # schedule:
+  #   - cron: "43 */6 * * *"
   workflow_dispatch:
 
 # The sweep reads the checkout and talks to Hetzner with its own token;
@@ -26,6 +28,13 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
+          # perf-weekly and scale-weekly provision with this same secret: no
+          # token means they cannot have created anything to sweep. A token
+          # that IS set but refused still goes red below.
+          if [ -z "$HCLOUD_TOKEN" ]; then
+            echo "::notice::HCLOUD_TOKEN is not set — no perf servers can exist, nothing to sweep"
+            exit 0
+          fi
           NOW=$(date +%s)
           # A sweep that cannot list is not a clean sweep. Without this the
           # listing failing (expired token, API outage) leaves the loops with
@@ -74,7 +83,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/failure-issue
         with:
           title: perf-runner server leaked past its TTL

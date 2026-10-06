@@ -12,6 +12,8 @@ broker running in your browser, yes in the browser 😅
 [![ci](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/ci.yml)
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
 [![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
+[![NGSI-LD conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres.json&label=NGSI-LD%20conformance)](#etsi-conformance-results)
+[![unit tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/)
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fcoverage-badge.json)](https://antaresbroker.joinedcontext.com/reports/coverage/)
 [![docs](https://img.shields.io/badge/docs-antaresbroker.joinedcontext.com-blue)](https://antaresbroker.joinedcontext.com/)
 [![license: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
@@ -35,6 +37,27 @@ broker running in your browser, yes in the browser 😅
   first request that names it. Nothing in the broker caps the count, so
   one deployment can hand every employee, department and use case a
   tenant of its own, 100,000 of them on one Postgres cluster.
+
+## ETSI conformance results
+
+The latest full run of the ETSI NGSI-LD test suite (CIM 009 V1.9.1), one
+cell per store mode. The badges read the live report, so they always show
+the newest run.
+
+The suite in [`ngsi-ld-test-suite/`](ngsi-ld-test-suite/) started from the
+[ETSI NGSI-LD test suite](https://forge.etsi.org/rep/cim/ngsi-ld-test-suite)
+and was corrected and extended; no test was weakened.
+
+| Store | Setup | Result |
+|---|---|---|
+| `memory` | in-RAM, zero dependencies | [![memory](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-memory.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `file` | redb file store | [![file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `postgres` | PostGIS | [![postgres](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `timescale` | PostGIS + TimescaleDB | [![timescale](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `postgres-nats` | PostGIS + NATS JetStream, ten containers rolled during the run | [![postgres-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `timescale-nats` | TimescaleDB + NATS JetStream, same rolling fleet | [![timescale-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `wasm-file` | WebAssembly build over the file store, MQTT excluded | [![wasm-file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-wasm-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| unit + integration | `cargo test` | [![unit](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/) |
 
 ## Quickstart
 
@@ -94,7 +117,7 @@ docker compose -f compose-files/docker-compose-ha.yml up    # two replicas + hap
 ```
 
 Image tags: `:dev` is the latest green `dev`, `:dev-<run>` one CI run,
-`:0.1.2` one release, `:0.1` the newest patch of a minor, `:latest` the
+`:0.1.3` one release, `:0.1` the newest patch of a minor, `:latest` the
 latest release. Images are multi-arch (amd64, arm64). The
 role-split fleet (`--roles api,matcher,notifier,temporal,registry`) and
 the Kubernetes manifests are in [Deployment](docs/src/deployment.md).
