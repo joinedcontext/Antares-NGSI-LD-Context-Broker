@@ -9,8 +9,10 @@ name: perf-janitor
 # failed and deserves eyes.
 
 on:
-  schedule:
-    - cron: "43 */6 * * *"
+  # Schedule off while the Hetzner token is out of service, like
+  # perf-weekly and scale-weekly; restore by uncommenting.
+  # schedule:
+  #   - cron: "43 */6 * * *"
   workflow_dispatch:
 
 # The sweep reads the checkout and talks to Hetzner with its own token;
