@@ -26,6 +26,13 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HCLOUD_TOKEN }}
         run: |
+          # perf-weekly and scale-weekly provision with this same secret: no
+          # token means they cannot have created anything to sweep. A token
+          # that IS set but refused still goes red below.
+          if [ -z "$HCLOUD_TOKEN" ]; then
+            echo "::notice::HCLOUD_TOKEN is not set — no perf servers can exist, nothing to sweep"
+            exit 0
+          fi
           NOW=$(date +%s)
           # A sweep that cannot list is not a clean sweep. Without this the
           # listing failing (expired token, API outage) leaves the loops with
