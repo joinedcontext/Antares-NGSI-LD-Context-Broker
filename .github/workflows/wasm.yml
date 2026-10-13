@@ -104,7 +104,7 @@ jobs:
           path: site
       - name: Upload Pages artifact
         if: inputs.deploy_pages
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
