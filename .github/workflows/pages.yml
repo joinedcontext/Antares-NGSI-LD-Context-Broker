@@ -140,7 +140,7 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
       - name: File an issue on a failed auto-deploy
         # a broken auto-deploy means the public report goes silently stale
