@@ -46,7 +46,7 @@ jobs:
 
 
       - name: Load the image built for this run
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: antares-image
 
