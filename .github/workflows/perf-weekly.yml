@@ -195,7 +195,7 @@ jobs:
               for f in core-scale shapes saturate; do echo; cat "$d/$f.md" 2>/dev/null; done
             done
           } >> "$GITHUB_STEP_SUMMARY" || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: perf-weekly-results
