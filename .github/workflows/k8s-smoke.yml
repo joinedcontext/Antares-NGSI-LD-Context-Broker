@@ -44,7 +44,7 @@ jobs:
       - uses: helm/kind-action@v1
         with:
           cluster_name: antares-smoke
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: antares-image
       - name: Load the image under test
