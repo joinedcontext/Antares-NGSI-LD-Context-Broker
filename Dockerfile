@@ -5,7 +5,7 @@
 # own layer, keyed by Cargo.lock via recipe.json — a source-only commit reuses
 # it and rebuilds only the antares-* crates. CI persists the layer with a
 # BuildKit gha cache (etsi-matrix.yml), cutting the image build ~10 min → ~3.
-FROM rust:1-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS chef
+FROM rust:1-slim@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS chef
 WORKDIR /src
 # jemalloc ships C sources that configure+make themselves;
 # rust:1-slim carries a linker but no make, so tikv-jemalloc-sys' build script
