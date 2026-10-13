@@ -177,7 +177,7 @@ jobs:
         run: ./dev/etsi-pipeline.sh || true
       - name: Upload wasm-tier results
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ETSI-wasm-node
           path: |
@@ -379,7 +379,7 @@ jobs:
           strip "target/${{ matrix.target }}/release/antares"
           VER="${GITHUB_REF#refs/tags/}"
           tar czf "antares-$VER-${{ matrix.target }}.tar.gz"             -C "target/${{ matrix.target }}/release" antares             -C "$GITHUB_WORKSPACE" LICENSE README.md
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-bin-${{ matrix.target }}
           path: antares-*.tar.gz

@@ -67,7 +67,7 @@ jobs:
           ./dev/install-wasm-tools.sh
           export PATH="$HOME/.local/bin:$PATH"
           ./dev/wasm-build.sh
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: antares-wasm-pkg
           path: www/pkg
@@ -154,7 +154,7 @@ jobs:
 
       - name: Upload cell results
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ETSI-cell-${{ matrix.cell }}
           path: |
@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload the ONE results bundle
         id: bundle
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           # quick bundles carry a different name ON PURPOSE: the Pages fold
           # (dev/fold-reports.sh) downloads the newest ETSI-matrix-results,
