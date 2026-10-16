@@ -94,7 +94,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 opentelemetry = "0.32"
-opentelemetry_sdk = "0.32"
+opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "logs",
