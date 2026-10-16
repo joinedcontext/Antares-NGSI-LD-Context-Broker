@@ -102,7 +102,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "reqwest-blocking-client",
 ] }
 opentelemetry-appender-tracing = "0.32"
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 console-subscriber = "0.5"
 
 # dev
