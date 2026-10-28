@@ -167,8 +167,8 @@ jobs:
       # --run-ignored all: that would also pull in the release-only timing gate.
       - name: Tests that need a live database
         run: |
-          dev/unit-junit.sh ignored-db-api -p antares-api \
-            --test split_entities_5_7_2 --test temporal_fed_paging_5_7_4 \
+          dev/unit-junit.sh ignored-db-api -p antares-api --test it \
+            -E 'test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)' \
             --run-ignored ignored-only
           dev/unit-junit.sh ignored-db-broker -p antares-broker --bin antares \
             --run-ignored ignored-only outbox_flush_waits
