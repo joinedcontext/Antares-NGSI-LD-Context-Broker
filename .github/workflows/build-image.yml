@@ -70,7 +70,7 @@ jobs:
       - name: Export it for the downstream jobs
         run: docker save "antares-local:$TAG" | gzip > "$ART.tgz"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ART }}
           path: ${{ env.ART }}.tgz

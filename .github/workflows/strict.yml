@@ -169,7 +169,7 @@ jobs:
       # figures are the ones in unit-cov.txt and api-cov.txt.
       - name: Publish the coverage map
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-map
           path: |

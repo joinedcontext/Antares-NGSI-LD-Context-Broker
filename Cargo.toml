@@ -107,16 +107,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # Observability: antares_ Prometheus metrics, env-gated OTLP traces
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-opentelemetry = "0.32"
-opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
     "http-proto",
     "reqwest-blocking-client",
 ] }
-opentelemetry-appender-tracing = "0.32"
-tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.33"
+tracing-opentelemetry = "0.34"
 console-subscriber = "0.5"
 
 # dev
