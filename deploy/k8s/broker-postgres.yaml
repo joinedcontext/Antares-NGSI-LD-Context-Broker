@@ -94,6 +94,10 @@ spec:
             - { name: ANTARES_NATS_URL, value: "nats://nats.antares.svc:4222" }
             - { name: ANTARES_NATS_REPLICAS, value: "3" }
             - { name: ANTARES_ROLES, value: api }
+            - { name: ANTARES_DEFAULT_LIMIT, value: "100" }
+            - { name: ANTARES_MAX_LIMIT, value: "1000" }
+            - { name: ANTARES_TEMPORAL_DEFAULT_INSTANCES, value: "100" }
+            - { name: ANTARES_TEMPORAL_INSTANCE_LIMIT, value: "1000" }
             # Paired with the memory limit below: a served connection can hold
             # a forwarded read, and one measures about 1.8 MiB of broker
             # memory while it runs. The 10 000 default admits twenty times

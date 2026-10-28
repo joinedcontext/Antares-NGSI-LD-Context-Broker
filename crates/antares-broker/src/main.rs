@@ -36,17 +36,39 @@ const KNOWN_KEYS: &[&str] = &[
     // `observed` records only instances carrying observedAt; `none`
     // auto-records nothing (temporal API + reads stay on).
     "ANTARES_TEMPORAL_RECORD",
+    // behaviour profile (docs/conformance/profiles.md)
+    "ANTARES_NON_OBJECT_BODY",
+    "ANTARES_FED_WRITE_SOURCE_404",
+    "ANTARES_IMPLICIT_TENANTS",
+    // History dedup on append: `off` records an instance equal to the
+    // newest one again; anything else (default) skips it.
+    "ANTARES_TEMPORAL_DEDUP",
+    // 6.3.10 ceiling: instances of one Attribute per temporal response
+    // (default 1000; the ETSI brokers set 9 for the suite's 206 cases), and
+    // the Entities of one query page (default 1000).
+    "ANTARES_TEMPORAL_INSTANCE_LIMIT",
+    "ANTARES_MAX_LIMIT",
+    // The defaults when a request names no lastN / limit (100 each, never
+    // above the ceilings above).
+    "ANTARES_TEMPORAL_DEFAULT_INSTANCES",
+    "ANTARES_DEFAULT_LIMIT",
     "ANTARES_DATA_DIR",
     // Egress: private-range destinations are ALLOWED by default (ADR-0010 —
     // brokers federate inside private networks); a hardened deployment sets
     // this to false to arm the SSRF wall.
     "ANTARES_EGRESS_ALLOW_PRIVATE",
+    // Host names that may still resolve to a private address while the wall
+    // is armed: the in-cluster peers; never loopback or metadata.
+    "ANTARES_EGRESS_PRIVATE_HOSTS",
     // Refuse to start when the DB role bypasses RLS (production gate;
     // default off so the dev/ETSI superuser stack still boots).
     "ANTARES_REQUIRE_RLS",
     // Temporal retention horizon in days; absent = keep forever (a
     // maintenance job must never default to dropping data).
     "ANTARES_TEMPORAL_RETENTION_DAYS",
+    // a value older than the current one goes to history only
+    // (`on`); off keeps NGSI-LD's last-write-wins.
+    "ANTARES_HISTORY_BACKFILL",
     // 4.22 GC interval (memory/file arm); default 900 s, the ETSI stack runs
     // at 2 s so the transient TPs (422_01) exercise the sweep itself.
     "ANTARES_SWEEP_SECS",
@@ -65,6 +87,13 @@ const KNOWN_KEYS: &[&str] = &[
     // The HTTP surfaces mounted beside the NGSI-LD API root, comma-separated;
     // default `admin` (/q). An unknown name is fatal and names the shelf.
     "ANTARES_API_SURFACES",
+    // The /q admin credential: a file holding the bearer secret,
+    // and whether /q/metrics answers without it (token | open).
+    "ANTARES_ADMIN_TOKEN_FILE",
+    "ANTARES_ADMIN_METRICS",
+    // A second listener that serves /q/metrics and nothing else; set, the
+    // API port answers /q/metrics 404. Unset = /q/metrics on the API port.
+    "ANTARES_METRICS_PORT",
     // Drain: the LB notice window, and the ceiling on waiting for
     // in-flight requests once the listener has closed.
     "ANTARES_DRAIN_DELAY_MS",
@@ -96,7 +125,13 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_NOTIFY_MAX_AGE_SECS",
     // Postgres pool size (max connections); default 20.
     "ANTARES_PG_POOL",
+    // connections of that pool only batch writes take; default 0.
+    "ANTARES_PG_WRITE_RESERVE",
     "ANTARES_PG_STATEMENT_TIMEOUT_MS",
+    // batch writes commit with synchronous_commit = off; default off.
+    "ANTARES_PG_BATCH_ASYNC_COMMIT",
+    // the key that seals Subscription receiverInfo at rest.
+    "ANTARES_SECRET_KEY",
     // bus=local over a shared postgres/timescale store is refused — every
     // replica would run its own matcher and fire its own copy of each
     // notification. This opt-in states the deployment runs exactly ONE
@@ -113,6 +148,12 @@ const KNOWN_KEYS: &[&str] = &[
     // whole broker, and the share of that width one tenant may hold.
     "ANTARES_DELIVERY_WIDTH",
     "ANTARES_DELIVERY_WIDTH_PER_TENANT",
+    // Estimated heap every delivery lane may hold at once.
+    "ANTARES_DELIVERY_LANE_BYTES",
+    // Batch write bodies in flight at once, in bytes.
+    "ANTARES_BATCH_INFLIGHT_BYTES",
+    // Batch writes running at once, each holding a connection.
+    "ANTARES_BATCH_INFLIGHT",
     // 5.7.2.4 fan-out ceiling: how many matching registrations one
     // distributed operation may contact.
     "ANTARES_FED_FANOUT",
@@ -126,6 +167,19 @@ const KNOWN_KEYS: &[&str] = &[
     // migration on boot.
     "ANTARES_MIGRATE",
 ];
+
+/// The keys of each surface this binary was built with, listed by the crate
+/// that reads them: a surface's new variable lands in its own crate, not in
+/// this file, which every surface branch used to edit.
+const SURFACE_KEYS: &[&[&str]] = &[];
+
+/// Every config key this binary accepts.
+fn known_keys() -> impl Iterator<Item = &'static str> {
+    KNOWN_KEYS
+        .iter()
+        .chain(SURFACE_KEYS.iter().flat_map(|keys| keys.iter()))
+        .copied()
+}
 
 /// Jemalloc with decay-based purging — RSS returns to ~live×1.2 when idle;
 /// tune via MALLOC_CONF (e.g. dirty_decay_ms). Deliberately not glibc
@@ -144,7 +198,7 @@ fn unknown_config_key(key: &str) -> bool {
     if !key.starts_with("ANTARES_") || key.starts_with("ANTARES_TEST_") {
         return false;
     }
-    if KNOWN_KEYS.contains(&key) {
+    if known_keys().any(|known| known == key) {
         return false;
     }
     // kubelet service-link shapes for the Services OUR manifests ship
@@ -189,6 +243,24 @@ fn is_off(v: &str) -> bool {
         || v.eq_ignore_ascii_case("no")
 }
 
+/// ANTARES_METRICS_PORT: unset or empty is no metrics listener; a port is
+/// one that differs from the API port (both binds would fail, the second
+/// one only after the store connected).
+fn parse_metrics_port(raw: Option<&str>, api_port: u16) -> Result<Option<u16>, String> {
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<u16>() {
+        Ok(p) if p != 0 && p != api_port => Ok(Some(p)),
+        Ok(p) => Err(format!(
+            "ANTARES_METRICS_PORT must be a port 1-65535 other than ANTARES_HTTP_PORT {api_port}, got {p}"
+        )),
+        Err(e) => Err(format!(
+            "ANTARES_METRICS_PORT must be a port number 1-65535, got {raw:?} ({e})"
+        )),
+    }
+}
+
 /// One plain HTTP/1.0 GET of /q/health on the configured port; anything but
 /// a 200 status line is an error, so `HEALTHCHECK` sees exit 1.
 fn health_probe() -> Result<(), Box<dyn std::error::Error>> {
@@ -230,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              (an unknown ANTARES_* key is fatal at startup).\n",
             env!("CARGO_PKG_VERSION")
         );
-        for key in KNOWN_KEYS {
+        for key in known_keys() {
             println!("  {key}");
         }
         return Ok(());
@@ -260,7 +332,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();
         if unknown_config_key(&key) {
-            return Err(format!("unknown config key {key} (known: {KNOWN_KEYS:?})").into());
+            let known: Vec<&str> = known_keys().collect();
+            return Err(format!("unknown config key {key} (known: {known:?})").into());
         }
     }
 
@@ -268,6 +341,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = port_raw.parse().map_err(|e| {
         format!("ANTARES_HTTP_PORT must be a port number 0-65535, got {port_raw:?} ({e})")
     })?;
+    let metrics_port =
+        parse_metrics_port(std::env::var("ANTARES_METRICS_PORT").ok().as_deref(), port)?;
     // Every remaining config value is parsed HERE, before the runtime starts,
     // so a garbage window, cadence or switch fails the process instead of
     // silently running at its default.
@@ -340,6 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drivers.temporal_name,
             drivers.maintenance,
             metrics_render,
+            metrics_port,
             sweep_secs,
             drain_delay,
             drain_deadline,
@@ -363,6 +439,27 @@ fn parse_pg_statement_timeout(raw: Option<&str>) -> Result<std::time::Duration, 
     }
 }
 
+/// ANTARES_PG_BATCH_ASYNC_COMMIT → batch writes commit asynchronously:
+/// absent or an off value = no; `1`/`true`/`on`/`yes` = yes;
+/// anything else is fatal, so a typo never silently picks a durability.
+fn parse_pg_batch_async_commit(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None => Ok(false),
+        Some(v) if is_off(v) => Ok(false),
+        Some(v)
+            if v == "1"
+                || ["true", "on", "yes"]
+                    .iter()
+                    .any(|o| v.eq_ignore_ascii_case(o)) =>
+        {
+            Ok(true)
+        }
+        Some(v) => Err(format!(
+            "ANTARES_PG_BATCH_ASYNC_COMMIT must be true or false (got {v:?})"
+        )),
+    }
+}
+
 /// ANTARES_PG_POOL → pool size: absent defaults to 20; anything that is not
 /// a positive integer is fatal (a misread size must never silently run with
 /// a default, matching the unknown-key policy).
@@ -375,6 +472,24 @@ fn parse_pg_pool(raw: Option<&str>) -> Result<u32, String> {
                 "ANTARES_PG_POOL must be a positive integer (got {v:?})"
             )),
         },
+    }
+}
+
+/// ANTARES_PG_WRITE_RESERVE → how many of the `pool` connections only the
+/// batch writes take: absent or 0 is off (one shared pool). A
+/// reserve must leave the reads at least one connection; anything else is
+/// fatal, like ANTARES_PG_POOL.
+fn parse_pg_write_reserve(raw: Option<&str>, pool: u32) -> Result<u32, String> {
+    let Some(v) = raw else { return Ok(0) };
+    match v.parse::<u32>() {
+        Ok(n) if n < pool => Ok(n),
+        Ok(n) => Err(format!(
+            "ANTARES_PG_WRITE_RESERVE ({n}) must be below ANTARES_PG_POOL ({pool}): \
+             the reads need at least one connection"
+        )),
+        Err(_) => Err(format!(
+            "ANTARES_PG_WRITE_RESERVE must be a non-negative integer (got {v:?})"
+        )),
     }
 }
 
@@ -669,18 +784,43 @@ async fn build_builtin(
             Ok((AnyStore::Mem(Store::open_file(&dir)?), None))
         }
         StoreMode::Postgres | StoreMode::Timescale => {
+            // The URL carries the database password: held as a Secret so no
+            // error or log line below can print it.
             let url = std::env::var("ANTARES_DATABASE_URL")
+                .map(antares_api::secret::Secret::new)
                 .map_err(|_| format!("ANTARES_STORE={mode} requires ANTARES_DATABASE_URL"))?;
             let pool_size = parse_pg_pool(std::env::var("ANTARES_PG_POOL").ok().as_deref())?;
+            let write_reserve = parse_pg_write_reserve(
+                std::env::var("ANTARES_PG_WRITE_RESERVE").ok().as_deref(),
+                pool_size,
+            )?;
             let statement_timeout = parse_pg_statement_timeout(
                 std::env::var("ANTARES_PG_STATEMENT_TIMEOUT_MS")
                     .ok()
                     .as_deref(),
             )?;
+            let async_batch = parse_pg_batch_async_commit(
+                std::env::var("ANTARES_PG_BATCH_ASYNC_COMMIT")
+                    .ok()
+                    .as_deref(),
+            )?;
+            // read before the pool opens, so a bad key fails the boot
+            // before any connection exists; never echoed.
+            let mut secret_key = match std::env::var("ANTARES_SECRET_KEY") {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    Some(antares_sql::store::pg::seal::SecretKey::from_base64(&raw)?)
+                }
+                _ => None,
+            };
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
-                match antares_sql::store::pg::connect_with(&url, pool_size, statement_timeout).await
+                match antares_sql::store::pg::connect_with(
+                    url.expose(),
+                    pool_size.saturating_sub(write_reserve),
+                    statement_timeout,
+                )
+                .await
                 {
                     Ok(pool) => {
                         // The temporal backend is what the migrations actually
@@ -748,11 +888,59 @@ async fn build_builtin(
                         // Read once, here: /q/health is polled, so what it
                         // says about the server is captured at startup and
                         // never queried on the request.
-                        let version = antares_sql::store::pg::version_info(&pool).await;
-                        return Ok((
-                            AnyStore::Pg(PgBackend::new(pool).with_version(version)),
-                            Some(backend),
-                        ));
+                        let mut version = antares_sql::store::pg::version_info(&pool).await;
+                        // the operator sized ANTARES_PG_POOL as a whole: the
+                        // reads' pool holds poolSize - poolWriteReserve
+                        if let Some(m) = version.as_object_mut() {
+                            m.insert("poolSize".into(), pool_size.into());
+                            m.insert("poolWriteReserve".into(), write_reserve.into());
+                        }
+                        let mut backend_pg = PgBackend::new(pool).with_version(version);
+                        if write_reserve > 0 {
+                            let reserve = antares_sql::store::pg::connect_reserve(
+                                url.expose(),
+                                write_reserve,
+                                statement_timeout,
+                            )
+                            .await
+                            .map_err(|e| {
+                                format!("ANTARES_PG_WRITE_RESERVE: reserve pool not opened: {e}")
+                            })?;
+                            tracing::info!(
+                                "ANTARES_PG_WRITE_RESERVE: {write_reserve} of {pool_size} \
+                                 connections are kept for batch writes"
+                            );
+                            backend_pg = backend_pg.with_write_reserve(reserve);
+                        }
+                        let sealing = secret_key.is_some();
+                        if let Some(key) = secret_key.take() {
+                            backend_pg = backend_pg.with_secret_key(key);
+                        }
+                        let store = AnyStore::Pg(backend_pg);
+                        if sealing {
+                            let sealed = store.seal_plaintext_credentials().await.map_err(|e| {
+                                format!(
+                                    "ANTARES_SECRET_KEY: sealing stored receiverInfo failed: {e}"
+                                )
+                            })?;
+                            tracing::info!(
+                                "ANTARES_SECRET_KEY: receiverInfo is sealed at rest \
+                                 ({sealed} row(s) written before the key sealed now)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "ANTARES_SECRET_KEY is not set: Subscription receiverInfo \
+                                 (notification credentials) is stored in plaintext"
+                            );
+                        }
+                        if async_batch {
+                            tracing::info!(
+                                "ANTARES_PG_BATCH_ASYNC_COMMIT: batch writes commit with \
+                                 synchronous_commit = off"
+                            );
+                        }
+                        store.set_async_batch_commit(async_batch);
+                        return Ok((store, Some(backend)));
                     }
                     Err(e) if antares_sql::store::pg::is_schema_mismatch(&e) => {
                         // Waiting cannot make this database match: its
@@ -816,6 +1004,7 @@ async fn run(
         antares_sql::store::pg::maintenance::TemporalBackend,
     )>,
     metrics_render: Option<telemetry::MetricsRender>,
+    metrics_port: Option<u16>,
     sweep_secs: u64,
     drain_delay: std::time::Duration,
     drain_deadline: std::time::Duration,
@@ -857,6 +1046,7 @@ async fn run(
         .as_deref()
         .unwrap_or("all")
         .parse()?;
+    state.profile = antares_api::Profile::from_env()?;
     // The surfaces mounted beside the NGSI-LD API root, from configuration
     // rather than from a hard-wired list: the selection replaces what the
     // default mounting put there, before the state is shared.
@@ -877,9 +1067,27 @@ async fn run(
     // A notification binding compiled in from outside the workspace mounts
     // exactly like the two shipped ones: one registration, no core-crate
     // edit. It is not in a release build — the feature is off by default,
-    // so the shipped binary serves network schemes only.
+    // so the shipped binary serves network schemes only. Every sink before
+    // the state is shared: the registry is sealed then.
     #[cfg(feature = "plugin-example")]
-    let mut state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    {
+        state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    }
+    // The /q admin credential, before the router mounts the admin surface.
+    // Unconfigured, /q serves as before and says so once, here.
+    match antares_api::admin_auth::AdminAuth::from_config(
+        std::env::var("ANTARES_ADMIN_TOKEN_FILE").ok().as_deref(),
+        std::env::var("ANTARES_ADMIN_METRICS").ok().as_deref(),
+    )? {
+        Some(auth) => {
+            tracing::info!("/q admin routes require the admin token ({auth:?})");
+            state = state.with_admin_auth(auth);
+        }
+        None => tracing::warn!(
+            "/q admin routes (tenants, dead letters, metrics) answer without a credential: \
+             ANTARES_ADMIN_TOKEN_FILE is unset"
+        ),
+    }
     // /q/metrics renders through this closure (None without the
     // `telemetry` feature — the endpoint answers 404); the sampler feeds
     // the process-level gauges the whole run.
@@ -907,7 +1115,8 @@ async fn run(
         // consumers per role, topology asserted before traffic.
         let url = std::env::var("ANTARES_NATS_URL")
             .map_err(|_| "ANTARES_BUS=nats requires ANTARES_NATS_URL")?;
-        wiring::wire_nats(&mut state, &url, roles).await?;
+        let bus = wiring::wire_nats(&mut state, &url, roles).await?;
+        drop(bus);
     } else {
         antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
     }
@@ -1030,15 +1239,21 @@ async fn run(
     // Only the api role serves the NGSI-LD surface — a worker pod
     // exposes health/ready/metrics and nothing else (a subscription created
     // on a worker would bypass the roles.api KV sync and never notify).
+    // ANTARES_METRICS_PORT: the renderer moves to the metrics listener, so
+    // the API port's /q/metrics answers 404 and a scraper needs no path to
+    // the API.
+    let metrics_app = metrics_port.map(|p| {
+        let app = antares_api::Admin::metrics_router(state.clone());
+        state.metrics_render = None;
+        (p, app)
+    });
     let routed = if roles.api {
         antares_api::router(state)
     } else {
         antares_api::ops_router(state)
-    };
-    let app = tower::Layer::layer(
-        &tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash(),
-        routed,
-    );
+    }
+    .layer(antares_api::compression());
+    let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
     // slot forever; hyper closes it after this timeout.
@@ -1060,6 +1275,15 @@ async fn run(
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("listening on http://0.0.0.0:{port}");
+    if let Some((p, app)) = metrics_app {
+        let metrics_listener = tokio::net::TcpListener::bind(("0.0.0.0", p)).await?;
+        tracing::info!("serving /q/metrics only on http://0.0.0.0:{p}");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, app).await {
+                tracing::error!(error = %e, "metrics listener stopped");
+            }
+        });
+    }
     // Count open connections so the drain can wait for them. Incremented
     // before the task is spawned — incrementing inside the task would race the
     // drain's first check and let a just-accepted connection be missed.
@@ -1194,8 +1418,10 @@ fn accept_backoff(e: &std::io::Error) -> bool {
     )
 }
 
-/// The served app: the router under trailing-slash normalization.
-type App = tower_http::normalize_path::NormalizePath<axum::Router>;
+/// The served app: the router under trailing-slash normalization, which
+/// trims every path.
+type App =
+    tower::util::MapRequest<axum::Router, fn(axum::extract::Request) -> axum::extract::Request>;
 
 /// One accepted connection. Split out of the accept loop so the drain's
 /// notice window serves connections with identical behaviour, and so the
@@ -1228,7 +1454,10 @@ fn serve(
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(header_read_timeout)
             .title_case_headers(true);
-        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), svc);
+        // With upgrades: a socket surface answers 101 and takes the
+        // stream; without an upgrading route nothing changes.
+        let conn =
+            builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc);
         let mut conn = std::pin::pin!(conn);
         // On drain, close an IDLE keep-alive connection immediately —
         // hyper finishes any active request first, then closes. Without this
@@ -1318,11 +1547,6 @@ mod config_key_tests {
         }
     }
 
-    /// Unknown keys are FATAL, so every ANTARES_* variable the workspace
-    /// actually reads has to be accepted — otherwise setting a documented
-    /// deployment knob is a CrashLoopBackOff and the knob cannot be used at
-    /// all. Scans the sources rather than restating the list, so the check
-    /// keeps holding as crates add knobs.
     #[test]
     fn known_keys_cover_every_variable_the_workspace_reads() {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1454,6 +1678,25 @@ mod sweep_secs_tests {
             let err =
                 parse_sweep_secs(Some(bad)).expect_err(&format!("SWEEP_SECS={bad:?} is fatal"));
             assert!(err.contains("ANTARES_SWEEP_SECS"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod metrics_port_tests {
+    use super::parse_metrics_port;
+
+    /// ANTARES_METRICS_PORT: unset or empty is no metrics listener,
+    /// and a value that is no port, port 0 or the API port is fatal.
+    #[test]
+    fn metrics_port_parses_and_rejects() {
+        assert_eq!(parse_metrics_port(None, 9090), Ok(None));
+        assert_eq!(parse_metrics_port(Some(""), 9090), Ok(None));
+        assert_eq!(parse_metrics_port(Some("9464"), 9090), Ok(Some(9464)));
+        for bad in ["0", "9090", "-1", "abc", "70000"] {
+            let err = parse_metrics_port(Some(bad), 9090)
+                .expect_err(&format!("METRICS_PORT={bad:?} is fatal"));
+            assert!(err.contains("ANTARES_METRICS_PORT"), "{err}");
         }
     }
 }
@@ -1649,6 +1892,38 @@ mod api_surface_tests {
             assert!(err.contains("ANTARES_API_SURFACES"), "{err}");
         }
     }
+
+    /// With no addon feature the shelf is the admin surface alone, and a
+    /// path under `/x` is unrouted. A surface that lands without its feature
+    /// gate turns this red.
+    #[cfg(not(feature = "plugin-example"))]
+    #[tokio::test]
+    async fn the_vanilla_shelf_is_admin_alone() {
+        use tower::ServiceExt;
+
+        let shelf: Vec<&str> = SURFACE_SHELF.iter().map(|(n, _)| *n).collect();
+        assert_eq!(shelf, vec!["admin"]);
+        let surfaces = api_surfaces(None)
+            .expect("selection")
+            .iter()
+            .map(|(_, build)| build())
+            .collect();
+        let state = antares_api::AppState::new("antares-test".into())
+            .with_surfaces(surfaces)
+            .expect("the admin surface mounts");
+        let app = antares_api::router(state);
+        for path in ["/x", "/x/any/ngsi-ld/v1/entities", "/x/example/v1"] {
+            let request = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("answered");
+            assert_eq!(
+                response.status(),
+                404,
+                "{path} is routed in the vanilla build"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1716,7 +1991,23 @@ mod policy_shelf_tests {
 
 #[cfg(test)]
 mod pg_pool_tests {
-    use super::{parse_pg_pool, parse_pg_statement_timeout};
+    use super::{
+        parse_pg_batch_async_commit, parse_pg_pool, parse_pg_statement_timeout,
+        parse_pg_write_reserve, unknown_config_key,
+    };
+
+    /// ANTARES_PG_BATCH_ASYNC_COMMIT: off unless asked; a typo is fatal.
+    #[test]
+    fn pg_batch_async_commit_is_off_unless_asked() {
+        assert_eq!(parse_pg_batch_async_commit(None), Ok(false));
+        for off in ["", "0", "false", "OFF", "no"] {
+            assert_eq!(parse_pg_batch_async_commit(Some(off)), Ok(false), "{off}");
+        }
+        for on in ["1", "true", "On", "yes"] {
+            assert_eq!(parse_pg_batch_async_commit(Some(on)), Ok(true), "{on}");
+        }
+        assert!(parse_pg_batch_async_commit(Some("treu")).is_err());
+    }
 
     /// ANTARES_PG_POOL: absent defaults to 20; a value that is not a
     /// positive integer is fatal — misconfiguration must never silently
@@ -1744,5 +2035,19 @@ mod pg_pool_tests {
             "a zero-sized pool must be fatal"
         );
         assert!(parse_pg_pool(Some("-3")).is_err());
+    }
+
+    /// ANTARES_PG_WRITE_RESERVE: absent is off, a reserve leaves
+    /// the reads at least one connection, and a bad value is fatal.
+    #[test]
+    fn pg_write_reserve_parse_bounds() {
+        assert_eq!(parse_pg_write_reserve(None, 16), Ok(0));
+        assert_eq!(parse_pg_write_reserve(Some("0"), 16), Ok(0));
+        assert_eq!(parse_pg_write_reserve(Some("4"), 16), Ok(4));
+        assert_eq!(parse_pg_write_reserve(Some("15"), 16), Ok(15));
+        assert!(parse_pg_write_reserve(Some("16"), 16).is_err());
+        assert!(parse_pg_write_reserve(Some("-1"), 16).is_err());
+        assert!(parse_pg_write_reserve(Some("four"), 16).is_err());
+        assert!(!unknown_config_key("ANTARES_PG_WRITE_RESERVE"));
     }
 }

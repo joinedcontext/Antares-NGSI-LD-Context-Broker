@@ -19,8 +19,8 @@
 //!   from the initial filtering performed by the temporal query", so the
 //!   window belongs INSIDE the existence test.
 //! * extension leaves (superset-only, see `instance_predicate`): `!=` as
-//!   NOT-of-Eq, `[lang]`/`[*]` via the languageMap wildcard, string
-//!   ordering via `COLLATE "C"` with array pass-through.
+//!   NOT-of-Eq, `[lang]`/`[*]` via the languageMap wildcard; string
+//!   ordering stays TRUE (byte order is not the evaluator's time order).
 //! * negated existence, patterns, dotted/linked paths — TRUE (entity-level
 //!   negation over per-instance rows is not superset-safe to push; regex
 //!   dialects differ).
@@ -40,7 +40,7 @@ use super::temporal::{column_range_bound, InstanceRange};
 pub fn compile_prefilter(
     node: &QNode,
     range: Option<&InstanceRange<'_>>,
-    entity: &str,
+    entity: &'static str,
     first_bind: usize,
     expand: &dyn Fn(&str) -> String,
 ) -> Option<CompiledSql> {
@@ -82,7 +82,7 @@ fn emit_prefilter(
             let mut exact = true;
             for it in items {
                 if let Some((s, b, e)) =
-                    emit_prefilter(it, range, entity, first + binds.len(), expand)
+                    emit_prefilter(it, range, entity, first.saturating_add(binds.len()), expand)
                 {
                     sqls.push(s);
                     binds.extend(b);
@@ -100,7 +100,8 @@ fn emit_prefilter(
             let mut binds = Vec::new();
             let mut exact = true;
             for it in items {
-                let (s, b, e) = emit_prefilter(it, range, entity, first + binds.len(), expand)?;
+                let (s, b, e) =
+                    emit_prefilter(it, range, entity, first.saturating_add(binds.len()), expand)?;
                 sqls.push(s);
                 binds.extend(b);
                 exact &= e;
@@ -144,10 +145,12 @@ fn leaf(
         // without an end) is refused by `column_range_bound` too, so there is
         // no widened bound to fall back on: the EXISTS then keeps the
         // attribute predicate alone — unwindowed, which only widens.
-        if let Some(c) =
-            crate::compile::temporal::compile_instance_range(r, "qi.data", first + binds.len())
-        {
-            let time_bind = first + binds.len() + 1;
+        if let Some(c) = crate::compile::temporal::compile_instance_range(
+            r,
+            "qi.data",
+            first.saturating_add(binds.len()),
+        ) {
+            let time_bind = first.saturating_add(binds.len()).saturating_add(1);
             window = format!(" AND {}", c.sql);
             binds.extend(c.binds);
             if let Some(cb) = column_range_bound(r, "qi", time_bind) {
@@ -158,9 +161,10 @@ fn leaf(
     }
     let (inner, arm_exact) = instance_predicate(path, cmp, first, &mut binds)?;
     let sql = format!(
-        "EXISTS (SELECT 1 FROM attr_instances qi \
-         WHERE qi.tenant_id = {entity}.tenant_id AND qi.entity_id = {entity}.id \
-         AND qi.attr_id = ${first}{window} AND {inner})"
+        "EXISTS (SELECT 1 FROM (SELECT * FROM attr_instances \
+         WHERE tenant_id = {entity}.tenant_id AND entity_id = {entity}.id AND attr_id = ${first} \
+         UNION ALL SELECT * FROM attr_rows_at({entity}.tenant_id, {entity}.id, ${first})) qi \
+         WHERE true{window} AND {inner})"
     );
     Some((sql, binds, win_exact && arm_exact))
 }
@@ -176,10 +180,6 @@ fn leaf(
 ///   universal quantification over arrays and p.92's datatype-mismatch-
 ///   matches both fall out of the negation; a deletion instance passes to
 ///   the evaluator (which is why the arm is never exact).
-/// * string ordering — `COLLATE "C"` byte comparison, the SQL spelling of
-///   the p.89 RFC 8259 code-unit SHALL; scalar strings compare exactly,
-///   array values pass through, non-string scalars are a datatype
-///   mismatch on both sides.
 fn instance_predicate(
     path: &QPath,
     cmp: Option<(CmpOp, &QValue)>,
@@ -196,7 +196,7 @@ fn instance_predicate(
             Some(f) => format!("$.\"languageMap\".*{f}"),
             None => "$.\"languageMap\".*".to_owned(),
         };
-        let n = first + binds.len();
+        let n = first.saturating_add(binds.len());
         binds.push(jp);
         let lang = format!("qi.data @? ${n}::jsonpath");
         // `[*]` is only ever the language wildcard. A NAMED bracket is
@@ -217,47 +217,25 @@ fn instance_predicate(
             None => member,
         };
         // value_or_filter numbers from `first + binds.len()` itself
-        let members = q::value_or_filter("$", Some(&member_filter), "qi.data", first, binds);
+        let members = q::value_or_filter("$", Some(&member_filter), "qi.data", first, binds, true);
         return Some((format!("({lang} OR {members})"), false));
     }
     if let Some((CmpOp::Ne, v)) = cmp {
         let f = q::eq_filter(v)?;
         // value_or_filter numbers as `first + binds.len()` itself — hand it
         // the leaf's base offset, not an already-advanced one
-        let sql = q::value_or_filter("$", Some(&f), "qi.data", first, binds);
+        let sql = q::value_or_filter("$", Some(&f), "qi.data", first, binds, true);
         return Some((format!("NOT {sql}"), false));
     }
-    if let Some(l) = compile_instance_leaf(cmp, "qi.data", first + binds.len()) {
+    if let Some(l) = compile_instance_leaf(cmp, "qi.data", first.saturating_add(binds.len())) {
         binds.extend(l.binds);
         // existence leaves stay inexact: deletion-instance semantics differ
         return Some((l.sql, cmp.is_some()));
     }
-    if let Some((op @ (CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le), QValue::Str(sv))) = cmp {
-        let o = match op {
-            CmpOp::Gt => ">",
-            CmpOp::Ge => ">=",
-            CmpOp::Lt => "<",
-            _ => "<=",
-        };
-        let mut parts = Vec::new();
-        for key in [
-            "value",
-            "object",
-            "vocab",
-            "json",
-            "valueList",
-            "objectList",
-        ] {
-            let n = first + binds.len();
-            binds.push(sv.clone());
-            parts.push(format!(
-                "(jsonb_typeof(qi.data->'{key}') = 'string' \
-                 AND (qi.data->>'{key}') COLLATE \"C\" {o} ${n}::text) \
-                 OR jsonb_typeof(qi.data->'{key}') = 'array'"
-            ));
-        }
-        return Some((format!("({})", parts.join(" OR ")), false));
-    }
+    // String ordering is NOT narrowed: a byte compare puts `…00.500Z`
+    // below `…00Z` (the evaluator orders temporal strings by time) and
+    // misses a typed `{"@value"}` instance, so it would drop rows `eval_q`
+    // keeps. `antares_ql::sql::cmp_filter` declines it for the same reason.
     None
 }
 
@@ -301,8 +279,13 @@ mod tests {
         let c = pf("speed>25").expect("compiles");
         assert!(!c.sql.contains("speed"), "IRI must travel as a bind");
         assert_eq!(c.binds[0], ex("speed"));
-        assert!(c.sql.contains("EXISTS (SELECT 1 FROM attr_instances qi"));
-        assert!(c.sql.contains("qi.attr_id = $3"), "{}", c.sql);
+        assert!(c
+            .sql
+            .contains("EXISTS (SELECT 1 FROM (SELECT * FROM attr_instances"));
+        assert!(c
+            .sql
+            .contains("UNION ALL SELECT * FROM attr_rows_at(m.tenant_id, m.id, $"));
+        assert!(c.sql.contains("AND attr_id = $3 "), "{}", c.sql);
         // byte-exact text window predicate INSIDE the existence test
         // (5.7.4.4 S2 — this is what makes a Cmp leaf EXACT), its binds
         // [timeproperty, timeAt, endTimeAt] at $4..$6…
@@ -338,8 +321,8 @@ mod tests {
         assert!(e("speed==10..40"));
         assert!(e(r#"route=="550","551""#));
         // dropped conjunct / refused branch / existence / negation → inexact
-        assert!(!e(r#"speed>25;name~="^x""#), "And drop widens");
-        assert!(!e(r#"speed>25|name~="^x""#), "Or refusal is trivial");
+        assert!(!e(r#"speed>25;name~="\d""#), "And drop widens");
+        assert!(!e(r#"speed>25|name~="\d""#), "Or refusal is trivial");
         assert!(!e("speed"), "existence: deletion semantics differ");
         assert!(!e("!speed"));
         assert!(!e("speed!=10"));
@@ -354,7 +337,7 @@ mod tests {
     #[test]
     fn and_drops_an_uncompilable_member_or_keeps_both() {
         // pattern leaf is outside the exact subset → dropped, one EXISTS left
-        let c = pf(r#"speed>25;name~="^x""#).expect("compiles");
+        let c = pf(r#"speed>25;name~="\d""#).expect("compiles");
         assert_eq!(c.sql.matches("EXISTS").count(), 1, "{}", c.sql);
         // two compilable members: both EXISTS, AND'd, dense numbering
         let c = pf("speed>25;heading<90").expect("compiles");
@@ -366,7 +349,7 @@ mod tests {
     #[test]
     fn or_with_an_uncompilable_branch_is_trivial() {
         // a TRUE branch absorbs the OR — no prefilter at all
-        assert!(pf(r#"speed>25|name~="^x""#).is_none());
+        assert!(pf(r#"speed>25|name~="\d""#).is_none());
         // both branches compile → OR of EXISTS
         let c = pf("speed>25|heading>100").expect("compiles");
         assert!(c.sql.contains(" OR "), "{}", c.sql);
@@ -377,7 +360,7 @@ mod tests {
     fn shapes_outside_the_exact_subset_are_trivial_not_wrong() {
         for q in [
             "!speed",        // negated existence: not superset-safe per-row
-            r#"name~="^x""#, // regex dialect mismatch
+            r#"name~="\d""#, // regex dialect mismatch
             "a.b==1",        // dotted path ambiguity
         ] {
             assert!(pf(q).is_none(), "{q} must be trivial");
@@ -399,13 +382,26 @@ mod tests {
             c.binds
         );
         assert!(pf(r#"label[*]=="hi""#).is_some());
-        // string ordering — COLLATE "C" scalar compare + array pass-through
-        let c = pf(r#"name>"m""#).expect("compiles");
-        assert!(c.sql.contains("COLLATE \"C\" >"), "{}", c.sql);
-        assert!(c.sql.contains("= 'array'"), "{}", c.sql);
-        // all three are superset-only: never page-exact
+        // string ordering never narrows: byte order is not
+        // the evaluator's temporal order, and a typed @value would be missed
+        for q in [
+            r#"name>"m""#,
+            r#"t>"2020-01-01T00:00:00Z""#,
+            r#"t<="2020-01-01T00:00:00Z""#,
+        ] {
+            assert!(pf(q).is_none(), "{q} must not narrow");
+        }
+        // an AND keeps the other leaf
+        let c = pf(r#"speed>25;t>"2020-01-01T00:00:00Z""#).expect("compiles");
+        assert!(!c.sql.contains("->>'value'"), "{}", c.sql);
+        assert!(
+            !c.binds.contains(&"2020-01-01T00:00:00Z".to_owned()),
+            "{:?}",
+            c.binds
+        );
+        // both remaining extensions are superset-only: never page-exact
         let r = between();
-        for q in [r#"name>"m""#, "speed!=10", r#"label[en]=="hi""#] {
+        for q in ["speed!=10", r#"label[en]=="hi""#] {
             assert!(
                 !prefilter_exact(&parse_q(q).expect("parse"), Some(&r), &ex),
                 "{q} must stay inexact"
@@ -452,18 +448,18 @@ mod tests {
     /// would keep.
     #[test]
     fn a_refused_disjunction_drops_only_its_own_conjunct() {
-        let c = pf(r#"(speed>25|name~="^x");heading<90"#).expect("compiles");
+        let c = pf(r#"(speed>25|name~="\d");heading<90"#).expect("compiles");
         assert_eq!(c.sql.matches("EXISTS").count(), 1, "{}", c.sql);
         assert_eq!(c.binds[0], ex("heading"), "the surviving conjunct");
         assert_dense(&c, 3);
         let r = between();
         assert!(!prefilter_exact(
-            &parse_q(r#"(speed>25|name~="^x");heading<90"#).expect("parse"),
+            &parse_q(r#"(speed>25|name~="\d");heading<90"#).expect("parse"),
             Some(&r),
             &ex
         ));
         // nothing left to keep → no prefilter at all, never an empty predicate
-        assert!(pf(r#"name~="^x";label!~="^y""#).is_none());
+        assert!(pf(r#"name~="\d";label!~="^y""#).is_none());
     }
 
     /// A conjunction that dropped a member is still a legal OR branch: it
@@ -471,14 +467,14 @@ mod tests {
     /// a superset. It must never be reported exact.
     #[test]
     fn a_widened_conjunction_inside_a_disjunction_still_widens() {
-        let c = pf(r#"(speed>25;name~="^x")|heading>100"#).expect("compiles");
+        let c = pf(r#"(speed>25;name~="\d")|heading>100"#).expect("compiles");
         assert_eq!(c.sql.matches("EXISTS").count(), 2, "{}", c.sql);
         assert!(c.sql.contains(" OR "), "{}", c.sql);
         assert_eq!(c.binds[0], ex("speed"));
         assert_dense(&c, 3);
         let r = between();
         assert!(!prefilter_exact(
-            &parse_q(r#"(speed>25;name~="^x")|heading>100"#).expect("parse"),
+            &parse_q(r#"(speed>25;name~="\d")|heading>100"#).expect("parse"),
             Some(&r),
             &ex
         ));

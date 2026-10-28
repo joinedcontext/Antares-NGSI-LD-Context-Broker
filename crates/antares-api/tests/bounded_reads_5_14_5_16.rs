@@ -13,7 +13,7 @@
 //! can is never asked to do more.
 #![allow(clippy::unwrap_used)] // an unwrap here is the assertion
 
-mod common;
+use crate::common;
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -136,6 +136,39 @@ async fn clause_5_14_4_the_candidate_scan_is_read_a_page_at_a_time() {
         0,
         "the candidate scan asked the store for the whole tenant"
     );
+}
+
+/// the temporal candidate set behind an EntityMap, and the recheck
+/// a later page runs against it, are read up to the broker's buffer bound;
+/// past it the request is TooManyResults (5.5.6), not a body held whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_5_6_temporal_entity_map_reads_stop_at_the_byte_bound() {
+    let (mut st, _) = seeded().await;
+    let path = "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after\
+        &timeAt=2000-01-01T00:00:00Z&timeproperty=createdAt";
+    let (status, headers, body) = send(&st, "GET", &format!("{path}&entityMap=true"), None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let map = headers
+        .get("NGSILD-EntityMap")
+        .and_then(|v| v.to_str().ok())
+        .expect("NGSILD-EntityMap header")
+        .to_owned();
+    st.max_answer_bytes = 16;
+    let (status, _, body) = send(&st, "GET", &format!("{path}&entityMap=true"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the build: {body}");
+    assert_eq!(body["title"], "TooManyResults", "{body}");
+    assert_eq!(
+        body["detail"],
+        antares_api::bounds::ANSWER_TOO_LARGE,
+        "{body}"
+    );
+    let req = Request::builder()
+        .uri(path)
+        .header("NGSILD-EntityMap", map)
+        .body(Body::empty())
+        .unwrap();
+    let res = antares_api::router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "the recheck");
 }
 
 /// The walks above against a store that really pages: the memory arm answers
@@ -306,6 +339,53 @@ mod paging_store {
         }
     }
 
+    /// a geoquery the store narrows but cannot decide reads the
+    /// candidates its page needs, in id order, where one flat read took up
+    /// to the store's undecided ceiling for a page of 20; the page is still
+    /// exact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_geoquery_page_reads_the_candidates_of_its_page() {
+        let Some((mut st, tenant)) = pg_state(1000, "boundedgeo").await else {
+            return;
+        };
+        for i in 1..=12 {
+            let body = json!({"id": format!("urn:ngsi-ld:Vehicle:g{i:02}"), "type": "Vehicle",
+                "location": {"type": "GeoProperty",
+                    "value": {"type": "Point", "coordinates": [f64::from(i) * 0.001, 0.0]}}})
+            .to_string();
+            let (status, _, b) =
+                send_t(&st, &tenant, "POST", "/ngsi-ld/v1/entities", Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{b}");
+        }
+        let spy = Arc::new(Double::passthrough(st.store.clone()));
+        st.store = spy.clone();
+        let (status, _, body) = send_t(
+            &st,
+            &tenant,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Vehicle&georel=near%3BmaxDistance%3D%3D100000\
+             &geometry=Point&coordinates=%5B0,0%5D&limit=2&offset=4",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, ["urn:ngsi-ld:Vehicle:g05", "urn:ngsi-ld:Vehicle:g06"]);
+        // the window and one match past it: 7 of the 12 candidates
+        assert_eq!(spy.rows_read(), 7, "the page read every candidate");
+        for doc in st.store.list(&tenant, Kind::Entity).await.expect("list") {
+            if let Some(id) = doc["id"].as_str() {
+                st.store
+                    .delete(&tenant, Kind::Entity, id)
+                    .await
+                    .expect("clean");
+            }
+        }
+    }
+
     /// 5.14.4.4: the candidate ids are the query's matches, and an idPattern
     /// is applied after the store answers — so a chunk can come back with
     /// nothing in it while every match is still waiting behind it.
@@ -338,4 +418,70 @@ mod paging_store {
             }
         }
     }
+}
+
+/// 5.8.6: a periodic Subscription whose stored `q` no longer parses (one
+/// stored percent-encoded before 5.2.12's read-as-written) matches
+/// nothing, as `conditions_match` decides, so the sweep does not read the
+/// Entities of its types to throw them all away.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_8_6_a_periodic_subscription_with_an_unparseable_q_reads_nothing() {
+    let (st, spy) = seeded().await;
+    let tenant = antares_model::TenantId::new("default").expect("tenant");
+    let id = "urn:ngsi-ld:Subscription:stale-q";
+    let created = chrono::Utc::now() - chrono::Duration::seconds(10);
+    let sub = json!({"id": id, "type": "Subscription", "timeInterval": 1,
+        "createdAt": created.to_rfc3339(),
+        "entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"}],
+        "q": "speed%3E10%29",
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}}});
+    st.store
+        .create(&tenant, antares_store::Kind::Subscription, id, sub.clone())
+        .await
+        .expect("subscription row");
+    // the sweep reads the indexed mirror the write path keeps
+    if let Some(m) = &st.sub_mirror {
+        m.apply(tenant.as_str(), id, Some(sub));
+    }
+
+    antares_api::notify::interval_tick(&st).await;
+
+    assert_eq!(
+        spy.unpaged_queries(),
+        0,
+        "the sweep read the Entities for a q that matches nothing"
+    );
+}
+
+/// under bus=nats the claim stamps `lastNotification`; a stored
+/// `q` that no longer parses sends nothing, so it claims nothing either.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unparseable_q_claims_no_periodic_firing() {
+    let mut st = AppState::new("test".into());
+    st.nats = true;
+    let tenant = antares_model::TenantId::new("default").expect("tenant");
+    let id = "urn:ngsi-ld:Subscription:stale-q-claim";
+    let created = chrono::Utc::now() - chrono::Duration::seconds(10);
+    let sub = json!({"id": id, "type": "Subscription", "timeInterval": 1,
+        "createdAt": created.to_rfc3339(),
+        "entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"}],
+        "q": "((",
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}}});
+    st.store
+        .create(&tenant, antares_store::Kind::Subscription, id, sub.clone())
+        .await
+        .expect("subscription row");
+    if let Some(m) = &st.sub_mirror {
+        m.apply(tenant.as_str(), id, Some(sub));
+    }
+
+    antares_api::notify::interval_tick(&st).await;
+
+    let stored = st
+        .store
+        .get(&tenant, antares_store::Kind::Subscription, id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.pointer("/notification/lastNotification"), None);
 }

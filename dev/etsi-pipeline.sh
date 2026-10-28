@@ -236,6 +236,7 @@ if [ "${WASM:-0}" = 1 ]; then
         -e ANTARES_STORE="$STORE" -e ANTARES_FILE="/data/antares-$port.redb" \
         -e ANTARES_SWEEP_SECS="${ANTARES_SWEEP_SECS:-2}" \
         -e ANTARES_HOST_ALIAS="antares$((port - 9089))" \
+        -e ANTARES_TEMPORAL_INSTANCE_LIMIT=9 \
         -e ANTARES_PUBLIC_URL="http://localhost:$port" \
         -v "$WASM_STORE_DIR:/data" \
         antares-wasm-local:latest "$port" >/dev/null \
@@ -247,6 +248,7 @@ if [ "${WASM:-0}" = 1 ]; then
       ANTARES_STORE="$STORE" ANTARES_FILE="$WASM_STORE_DIR/antares-$port.redb" \
       ANTARES_SWEEP_SECS="${ANTARES_SWEEP_SECS:-2}" \
       ANTARES_HOST_ALIAS="antares$((port - 9089))" \
+      ANTARES_TEMPORAL_INSTANCE_LIMIT=9 \
       ANTARES_PUBLIC_URL="http://localhost:$port" \
         node www/node-shim.mjs "$port" > "$RESULTS/shim-$port.log" 2>&1 &
       WASM_PIDS+=($!)
@@ -295,6 +297,7 @@ teardown() {
   kill "$MONITOR_PID" 2>/dev/null || true
   [ -n "$ROLL_PID" ] && { kill "$ROLL_PID" 2>/dev/null || true; }
   rm -f "$PHASE_FILE"
+  RESULTS="$RESULTS" dev/etsi-local-context.sh stop || true
   # Leave the suite tree clean — the IOP step seds variables.py and
   # the MQTT step overlays MqttUtils.resource.
   git -C ngsi-ld-test-suite checkout -- resources/variables.py \
@@ -317,6 +320,19 @@ teardown() {
   fi
 }
 trap teardown EXIT
+
+# 4b. The suite's @context from this checkout, not from GitHub on `dev`:
+# teardown puts the rewritten files back. A caller that already
+# serves it and rewrote the suite to it (external-suites, forge-free.sh)
+# names it in SUITE_CONTEXT, as etsi-run.sh allows: a second rewrite would
+# hand the broker one URL and the expectations another.
+local_context=0
+if [ -z "${SUITE_CONTEXT:-}" ]; then
+  SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
+    || { echo "could not serve the suite context locally"; exit 1; }
+  local_context=1
+fi
+export SUITE_CONTEXT
 
 # 5. Serial suites against broker1 (STOP_ON_ERROR respected by etsi-run.sh).
 serial_status=0
@@ -358,23 +374,33 @@ if ! .venv/bin/python -c "import HttpCtrl" >/dev/null 2>&1; then
   .venv/bin/python -c "import HttpCtrl" \
     || { echo "venv: HttpCtrl still broken — aborting"; exit 1; }
 fi
+# A suite whose own `url` names no /ngsi-ld/v1 adds the path itself (forge's later commits), as
+# etsi-run.sh does: with it the IOP TPs sent /ngsi-ld/v1/ngsi-ld/v1 and every setup got 404.
+iop_api=/ngsi-ld/v1
+grep -q "^url = '.*/ngsi-ld/v1/\?'" ngsi-ld-test-suite/resources/variables.py || iop_api=
 ( cd ngsi-ld-test-suite/resources
-  sed -i "s|^url = .*|url = 'http://localhost:9090/ngsi-ld/v1'|" variables.py
-  sed -i "s|^temporal_api_url = .*|temporal_api_url = 'http://localhost:9090/ngsi-ld/v1'|" variables.py
+  sed -i "s|^url = .*|url = 'http://localhost:9090$iop_api'|" variables.py
+  sed -i "s|^temporal_api_url = .*|temporal_api_url = 'http://localhost:9090$iop_api'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '${CALLBACK_HOST:-localhost}'|" variables.py
-  sed -i "s|^context_server_host = .*|context_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py )
+  sed -i "s|^context_server_host = .*|context_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
+  printf "\nngsild_test_suite_context = '%s'\n" "$SUITE_CONTEXT" >> variables.py )
 # Console tee'd into the results dir: when robot dies before writing
 # output.xml (import error, unreachable broker), the artifact must still
 # say why — a 1 KB artifact with no clue is undebuggable in CI.
 ( cd ngsi-ld-test-suite && ../.venv/bin/robot --outputdir "../$RESULTS/IOP" \
-    --variable b1_url:http://localhost:9090/ngsi-ld/v1 \
-    --variable b2_url:http://localhost:9091/ngsi-ld/v1 \
-    --variable b3_url:http://localhost:9092/ngsi-ld/v1 \
-    --variable b4_url:http://localhost:9093/ngsi-ld/v1 \
-    --variable b5_url:http://localhost:9094/ngsi-ld/v1 \
+    --variable b1_url:http://localhost:9090$iop_api \
+    --variable b2_url:http://localhost:9091$iop_api \
+    --variable b3_url:http://localhost:9092$iop_api \
+    --variable b4_url:http://localhost:9093$iop_api \
+    --variable b5_url:http://localhost:9094$iop_api \
     IOP_TP ) 2>&1 | tee "$RESULTS/IOP-console.log" || true
 fi
+
+# 7a. No TP may have resolved the suite context outside this run.
+context_status=0
+[ "$local_context" = 0 ] || RESULTS="$RESULTS" dev/etsi-local-context.sh check | tee "$RESULTS/local-context-check.txt" \
+  || context_status=1
 
 # 7. Report: suite table, per-broker CPU/RSS, spike attribution, downloadable
 # failure + sample CSVs, image size and the memory gate.
@@ -382,5 +408,7 @@ kill "$MONITOR_PID" 2>/dev/null || true
 IMAGE_BYTES=$(docker image inspect antares-local:latest --format '{{.Size}}' 2>/dev/null || echo 0)
 RESULTS="$RESULTS" STORE="$STORE" MEM_LIMIT_MB="$MEM_LIMIT_MB" IMAGE_BYTES="$IMAGE_BYTES" \
   python3 dev/etsi-report.py
+# the cell gate is this file (etsi-matrix.yml): a context fetched off-run fails it
+[ "$context_status" = 0 ] || echo FAIL > "$RESULTS/gate-status.txt"
 
-grep -q '^PASS$' "$RESULTS/gate-status.txt"
+grep -q '^PASS$' "$RESULTS/gate-status.txt" && [ "$context_status" = 0 ]

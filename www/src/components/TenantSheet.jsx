@@ -127,7 +127,8 @@ export default function TenantSheet({ space, picked, onPick }) {
           )}
         </div>
         <div className="row">
-          <select value={fedTo} onChange={(e) => setFedTo(e.target.value)} data-testid="fed-to">
+          <select value={fedTo} onChange={(e) => setFedTo(e.target.value)} data-testid="fed-to"
+            aria-label="space to federate with">
             <option value="">federate with…</option>
             {peers.map((p) => <option key={p}>{p}</option>)}
           </select>
@@ -143,15 +144,18 @@ export default function TenantSheet({ space, picked, onPick }) {
         <div className="row filters">
           <input
             placeholder="filter…"
+            aria-label="filter by id, type or attribute"
             value={text}
             onChange={(e) => setText(e.target.value)}
             data-testid="filter-text"
           />
-          <select value={type} onChange={(e) => setType(e.target.value)} data-testid="filter-type">
+          <select value={type} onChange={(e) => setType(e.target.value)} data-testid="filter-type"
+            aria-label="entity type">
             <option value="all">all types</option>
             {typeOptions.map((t) => <option key={t}>{t}</option>)}
           </select>
-          <select value={origin} onChange={(e) => setOrigin(e.target.value)} data-testid="filter-origin">
+          <select value={origin} onChange={(e) => setOrigin(e.target.value)} data-testid="filter-origin"
+            aria-label="origin">
             <option value="all">any origin</option>
             {originOptions.map((o) => (
               <option key={o} value={o}>{o === "local" ? "🏠 local" : `🌐 ${o}`}</option>
@@ -159,7 +163,7 @@ export default function TenantSheet({ space, picked, onPick }) {
           </select>
         </div>
       </div>
-      <div className="sheet-table">
+      <div className="sheet-table" tabIndex={0} role="region" aria-label={`entities of ${space}`}>
         <table>
           <thead>
             <tr><th>name</th><th>value</th><th>origin</th><th>attribute</th><th>type</th><th>id</th></tr>

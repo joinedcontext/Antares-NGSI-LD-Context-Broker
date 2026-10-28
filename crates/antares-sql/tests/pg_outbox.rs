@@ -2,6 +2,10 @@
 //! Transactional outbox atomicity.
 //! Skips loudly without ANTARES_TEST_DATABASE_URL.
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing.
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::outbox;
@@ -238,14 +242,23 @@ async fn a_retained_row_leaves_the_page_and_stays_readable_until_it_is_reaped() 
 async fn retain_and_read_back_hold_under_the_non_superuser_role() {
     let url = require_db!();
     let admin = pg::connect(&url, 5).await.expect("connect");
+    // The same advisory lock as tests/pg.rs app_role: nextest runs each test in its own process
+    // against one server, and an unlocked GRANT here broke that test's concurrent setup with
+    // "tuple concurrently updated".
+    let mut tx = admin.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(4334)")
+        .execute(&mut *tx)
+        .await
+        .expect("advisory lock");
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {
-        sqlx::query(stmt).execute(&admin).await.expect(stmt);
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
     }
+    tx.commit().await.expect("commit");
     let app_url = url.replace("antares:antares@", "antares_app:app@");
     assert_ne!(app_url, url, "test URL must embed antares:antares creds");
     let app = sqlx::postgres::PgPoolOptions::new()

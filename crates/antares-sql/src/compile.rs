@@ -3,7 +3,8 @@
 //! this module; every value a client supplied travels as a bind.
 
 pub mod geo;
-pub mod q;
+/// The `q=` SQL lowering, shared with a gateway through `antares_ql`.
+pub use antares_ql::sql as q;
 pub mod qprefilter;
 pub mod scope;
 pub mod temporal;
@@ -47,7 +48,7 @@ mod tests {
             binds + 1,
         )
         .expect("geo compiles");
-        binds += c.geo_binds.len() + c.num_binds.len();
+        binds += c.geo_binds.len() + c.num_binds.len() + c.cell_binds.len();
         sql.push(c.sql);
 
         let statement = sql.join(" AND ");

@@ -30,6 +30,10 @@ pub struct Double {
     refuse_create: Option<(Kind, String)>,
     overloaded: bool,
     unpaged_queries: AtomicUsize,
+    geo_paged: AtomicUsize,
+    rows_read: AtomicUsize,
+    registration_reads: AtomicUsize,
+    tenant_probes: AtomicUsize,
 }
 
 impl Double {
@@ -48,6 +52,10 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -67,6 +75,10 @@ impl Double {
             refuse_create: None,
             overloaded: true,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -86,6 +98,10 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -107,6 +123,10 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -140,6 +160,10 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -159,10 +183,14 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
-    /// The INSERT of one document fails while the rest of the store keeps
+    /// The INSERT (create or upsert) of one document fails while the rest of the store keeps
     /// working — a backend that refuses one write, or loses the connection
     /// between two of them. A caller that discards the result writes nothing
     /// and reports the document as stored.
@@ -178,6 +206,10 @@ impl Double {
             refuse_create: Some((kind, id.to_owned())),
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -193,6 +225,29 @@ impl Double {
         self.unpaged_queries.load(Ordering::SeqCst)
     }
 
+    /// How many `query_entities` calls carried a geoquery and a page: the
+    /// spatial pushdown reached the store.
+    pub fn geo_paged(&self) -> usize {
+        self.geo_paged.load(Ordering::SeqCst)
+    }
+
+    /// Entity documents `query_entities` has handed out, whatever the double
+    /// was built for: what a read costs the store.
+    pub fn rows_read(&self) -> usize {
+        self.rows_read.load(Ordering::SeqCst)
+    }
+
+    /// `matching_registrations` calls: one per federated request while no
+    /// registration mirror is installed.
+    pub fn registration_reads(&self) -> usize {
+        self.registration_reads.load(Ordering::SeqCst)
+    }
+
+    /// How many times a caller asked whether a Tenant exists.
+    pub fn tenant_probes(&self) -> usize {
+        self.tenant_probes.load(Ordering::SeqCst)
+    }
+
     fn refused_create(&self, kind: Kind, id: &str) -> Result<(), NgsiError> {
         if self
             .refuse_create
@@ -205,6 +260,16 @@ impl Double {
     }
 
     /// The connection pool gave up before this call could start.
+    /// The pool wall, then the counters a store read moves.
+    fn saw_query(&self, f: &antares_store::filter::EntityFilter<'_>) -> Result<(), NgsiError> {
+        self.pool_wall()?;
+        if f.page.is_none() {
+            self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
+        } else if !f.geo.is_empty() {
+            self.geo_paged.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
     fn pool_wall(&self) -> Result<(), NgsiError> {
         if self.overloaded {
             return Err(NgsiError::InternalError(
@@ -315,6 +380,7 @@ impl CurrentStateDriver for Double {
         doc: Value,
     ) -> Result<bool, NgsiError> {
         self.pool_wall()?;
+        self.refused_create(kind, id)?;
         self.inner.upsert(tenant, kind, id, doc).await
     }
     async fn get(
@@ -352,6 +418,7 @@ impl CurrentStateDriver for Double {
         ids: Option<&[String]>,
         types: Option<&[String]>,
     ) -> Result<Vec<Value>, NgsiError> {
+        self.registration_reads.fetch_add(1, Ordering::SeqCst);
         self.pool_wall()?;
         if self.refuse_registrations {
             return Err(NgsiError::InternalError("registrations unreadable".into()));
@@ -363,11 +430,24 @@ impl CurrentStateDriver for Double {
         tenant: &TenantId,
         f: &antares_store::filter::EntityFilter<'_>,
     ) -> Result<antares_store::filter::QueryOutcome, NgsiError> {
+        self.saw_query(f)?;
+        let out = self.inner.query_entities(tenant, f).await?;
+        self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);
+        Ok(out)
+    }
+    async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &antares_store::filter::EntityFilter<'_>,
+    ) -> Result<antares_store::filter::QueryOutcome, NgsiError> {
+        self.saw_query(f)?;
+        let out = self.inner.query_candidates(tenant, f).await?;
+        self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);
+        Ok(out)
+    }
+    async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
         self.pool_wall()?;
-        if f.page.is_none() {
-            self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.query_entities(tenant, f).await
+        self.inner.entity_type_names(tenant).await
     }
     async fn mutate_boxed<'a>(
         &self,
@@ -396,6 +476,7 @@ impl CurrentStateDriver for Double {
         self.inner.record_delivery(tenant, kind, id, now).await
     }
     async fn tenant_exists(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
+        self.tenant_probes.fetch_add(1, Ordering::SeqCst);
         self.inner.tenant_exists(tenant).await
     }
     async fn subscription_tenants(&self) -> Result<Vec<String>, NgsiError> {
@@ -415,6 +496,14 @@ impl CurrentStateDriver for Double {
         id: &str,
     ) -> Result<Option<Value>, NgsiError> {
         self.inner.context_get(tenant, id).await
+    }
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        self.inner.context_mutate(tenant, id, f).await
     }
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError> {
         self.inner.context_delete(tenant, id).await

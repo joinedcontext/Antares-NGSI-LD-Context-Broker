@@ -18,12 +18,24 @@ impl TenantId {
     /// The default tenant name, used when no `NGSILD-Tenant` header is sent.
     pub const DEFAULT: &'static str = "default";
 
+    /// The longest tenant name, in bytes (all of them ASCII).
+    pub const MAX_LEN: usize = 64;
+
     /// Tenant names the broker mints for its own bookkeeping: the snapshot
     /// module's reverse index and one tenant per snapshot share a prefix, the
-    /// distributed-subscription inbound index is a fixed name.
+    /// distributed-subscription inbound index and the `antares-*` tenants
+    /// that hold broker-internal documents are fixed names, kept out of
+    /// clients' reach so a database shared with an extended build never
+    /// mixes a client's Entities into them.
     pub const RESERVED_PREFIXES: &'static [&'static str] = &["snap-"];
     /// The reserved names that are not a prefix family.
-    pub const RESERVED_EXACT: &'static [&'static str] = &["distsub-index"];
+    pub const RESERVED_EXACT: &'static [&'static str] = &[
+        "distsub-index",
+        "antares-views",
+        "antares-policy",
+        "antares-grants",
+        "antares-channels",
+    ];
 
     /// Whether `raw` names one of the broker's own tenants.
     ///
@@ -66,7 +78,7 @@ impl TenantId {
     /// marker). Never for a name a client supplied.
     pub fn new_internal(raw: &str) -> Result<Self, NgsiError> {
         let ok = !raw.is_empty()
-            && raw.len() <= 64
+            && raw.len() <= Self::MAX_LEN
             && raw
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
@@ -163,6 +175,12 @@ fn is_id_char(c: char) -> bool {
         && !invisible
 }
 
+/// The longest Entity id accepted, in bytes. TS 104 175 sets no
+/// maximum; 2048 stays under the store's btree key limit (~2.7 KB), so a
+/// longer id is a 400 rather than a failed insert, and above every id the
+/// deployment seeds (129 bytes at 2026-10-25).
+pub const MAX_ENTITY_ID_BYTES: usize = 2048;
+
 /// Entity id: a valid URI per CIM 009 clause 4.5.1 and Table 5.2.4-1, where
 /// "URI" also means an IRI per clause 5.2.1. Invalid → BadRequestData, which
 /// Table 6.3.2-1 maps to 400.
@@ -174,6 +192,11 @@ impl EntityId {
     /// Validates an entity id as a URI/IRI (4.5.1, 5.2.1): a non-empty scheme,
     /// only URI-legal characters and no `.`/`..` path segment; else BadRequestData.
     pub fn new(raw: &str) -> Result<Self, NgsiError> {
+        if raw.len() > MAX_ENTITY_ID_BYTES {
+            return Err(NgsiError::BadRequestData(format!(
+                "entity id is longer than {MAX_ENTITY_ID_BYTES} bytes"
+            )));
+        }
         // Lazy URI check: a scheme followed by ':', over characters a URI or
         // IRI is allowed to contain. Full IRI validation happens during
         // JSON-LD expansion; this guards the id-shaped entry points, so that
@@ -262,6 +285,8 @@ mod tests {
             "snap-index",
             "snap-0123456789abcdef0123456789abcdef",
             "distsub-index",
+            "antares-views",
+            "antares-policy",
         ] {
             assert!(
                 TenantId::new(reserved).is_err(),
@@ -315,6 +340,21 @@ mod tests {
     /// reaches a different resource on the peer: an id of
     /// `urn:a/../../csourceRegistrations` turns a write on one entity into a
     /// write on the peer's registration collection.
+    #[test]
+    fn entity_id_is_bounded_in_length() {
+        let long = EntityId::new(&format!("urn:x:{}", "a".repeat(10_000)));
+        let status = long.as_ref().err().map(NgsiError::status);
+        assert_eq!(status, Some(400), "{long:?}");
+        let at = format!(
+            "urn:x:{}",
+            "a".repeat(MAX_ENTITY_ID_BYTES.saturating_sub(6))
+        );
+        assert_eq!(at.len(), MAX_ENTITY_ID_BYTES);
+        assert!(EntityId::new(&at).is_ok());
+        let past = format!("{at}a");
+        assert!(EntityId::new(&past).is_err());
+    }
+
     #[test]
     fn entity_id_rejects_dot_segments() {
         for bad in [
@@ -425,7 +465,8 @@ mod tests {
     fn entity_id_rejection_message_is_escaped() {
         let e = EntityId::new("urn:x\r\nX-Injected:1").expect_err("rejected");
         let msg = e.to_string();
-        assert!(!msg.contains('\r') && !msg.contains('\n'), "{msg}");
+        assert!(!msg.contains('\r'), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
     }
 
     /// Deserialization is an entry point of its own: change events arriving
@@ -465,5 +506,17 @@ mod tests {
             assert!(TenantId::new(bad).is_err(), "should reject {bad:?}");
         }
         assert!(TenantId::new(&"x".repeat(64)).is_ok(), "64 is the boundary");
+    }
+
+    /// The string conversions round-trip the original text.
+    #[test]
+    fn ids_convert_to_and_from_their_string() {
+        let t = TenantId::new("city").expect("tenant");
+        assert_eq!(t.to_string(), "city");
+        assert_eq!(String::from(t), "city");
+        let e = EntityId::try_from("urn:ngsi-ld:Car:1".to_owned()).expect("entity id");
+        assert_eq!(e.to_string(), "urn:ngsi-ld:Car:1");
+        assert_eq!(String::from(e), "urn:ngsi-ld:Car:1");
+        assert!(EntityId::try_from("no uri".to_owned()).is_err());
     }
 }

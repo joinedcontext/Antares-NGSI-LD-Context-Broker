@@ -203,6 +203,19 @@ async fn bad_tenant_and_bad_limit_are_400() {
             "{b}"
         );
     }
+    // the page ceiling every paged list shares (ANTARES_MAX_LIMIT)
+    let (s, b) = send(&st, "GET", "/q/dead-letters?limit=1001").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    assert!(
+        b["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("TooManyResults")),
+        "{b}"
+    );
+    assert_eq!(
+        send(&st, "GET", "/q/dead-letters?limit=1000").await.0,
+        StatusCode::OK
+    );
     let (s, _) = send(&st, "DELETE", "/q/dead-letters/urn:x?tenant=snap-abc").await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     let (s, _) = send(&st, "POST", "/q/dead-letters/urn:x/replay?tenant=snap-abc").await;
@@ -453,6 +466,7 @@ async fn replay_respects_the_egress_policy_of_the_moment() {
     st.egress = Arc::new(antares_api::egress::Egress::new(
         antares_jsonld::EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         },
     ));
     let (uri, hits, _) = receiver(StatusCode::OK).await;

@@ -4,6 +4,7 @@
 
 use crate::context::Context;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 /// Entity-instance members whose values stay verbatim during compaction.
 const VERBATIM: &[&str] = &[
@@ -39,6 +40,7 @@ pub fn compact_entity(internal: &Value, ctx: &Context) -> Value {
     let Some(obj) = internal.as_object() else {
         return internal.clone();
     };
+    let members = within_types(obj, ctx);
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
@@ -55,8 +57,8 @@ pub fn compact_entity(internal: &Value, ctx: &Context) -> Value {
                 out.insert(k.clone(), v.clone());
             }
             _ => {
-                let term = ctx.compact_iri(k);
-                out.insert(term, compact_attr_value(v, ctx));
+                let term = members.compact_iri(k);
+                out.insert(term, compact_attr_value(v, &ctx.within(k)));
             }
         }
     }
@@ -113,8 +115,9 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
                 o => o.clone(),
             };
             out.insert(k.clone(), compacted);
-        } else if k == "objectType" {
-            out.insert("objectType".into(), compact_types(v, ctx));
+        } else if k == "objectType" || k == "valueType" {
+            // both are type coerced on input (4.5.2.2), so terms on output
+            out.insert(k.clone(), compact_types(v, ctx));
         } else if k == "entityTypeSealed" {
             // 4.5.2.2 / annex B: @vocab-coerced — compacts back to a term
             // exactly like a type name; entityIdSealed needs no arm (a
@@ -140,7 +143,7 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
             out.insert(k.clone(), v.clone());
         } else {
             // sub-attribute
-            out.insert(ctx.compact_iri(k), compact_attr_value(v, ctx));
+            out.insert(ctx.compact_iri(k), compact_attr_value(v, &ctx.within(k)));
         }
     }
     Value::Object(out)
@@ -153,17 +156,26 @@ pub fn compact_entity_shallow(internal: &Value, ctx: &Context) -> Value {
     let Some(obj) = internal.as_object() else {
         return internal.clone();
     };
+    let members = within_types(obj, ctx);
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
-            "id" | "scope" | "createdAt" | "modifiedAt" | "deletedAt" | "expiresAt" => {
+            "id" | "createdAt" | "modifiedAt" | "deletedAt" | "expiresAt" => {
                 out.insert(k.clone(), v.clone());
+            }
+            // 4.5.1: a Scope, or an array only "in case of an Entity that has
+            // multiple Scopes" — the same rule as the normalized form
+            "scope" => {
+                out.insert("scope".into(), unwrap_single(v.clone()));
             }
             "type" => {
                 out.insert("type".into(), compact_types(v, ctx));
             }
             _ => {
-                out.insert(ctx.compact_iri(k), compact_simplified_value(v, ctx));
+                out.insert(
+                    members.compact_iri(k),
+                    compact_simplified_value(v, &ctx.within(k)),
+                );
             }
         }
     }
@@ -216,6 +228,17 @@ fn compact_simplified_value(v: &Value, ctx: &Context) -> Value {
     v.clone()
 }
 
+/// `ctx` with the type-scoped core contexts of the Entity's types in force
+/// for its own members (TS 104 175 Annex B), the reverse of expansion.
+fn within_types<'a>(entity: &Map<String, Value>, ctx: &'a Context) -> Cow<'a, Context> {
+    let types: Vec<&str> = match entity.get("type") {
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        Some(Value::String(t)) => vec![t.as_str()],
+        _ => Vec::new(),
+    };
+    ctx.within_types(&types)
+}
+
 fn unwrap_single(v: Value) -> Value {
     match v {
         Value::Array(mut items) if items.len() == 1 => items.remove(0),
@@ -227,8 +250,86 @@ fn unwrap_single(v: Value) -> Value {
 mod tests {
     use super::*;
     use crate::expand::{expand_entity, ExpandOpts};
-    use crate::loader::Loader;
     use serde_json::json;
+
+    const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    /// TS 104 175 Annex B: a type-scoped core context applies to the
+    /// members of a node of that type and not below it (type-scoped
+    /// contexts do not propagate, JSON-LD 1.1 4.1.8); outside the type the
+    /// same name expands through @vocab. Compaction is the reverse.
+    #[test]
+    fn a_type_scoped_term_expands_inside_its_type_only() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let feature = json!({
+            "id": "urn:ngsi-ld:Feature:1",
+            "type": "Feature",
+            "geometry": {"type": "Property", "value": "point",
+                "geometry": {"type": "Property", "value": "nested"}}
+        });
+        let out = expand_entity(feature.as_object().unwrap(), &ctx, ExpandOpts::default())
+            .expect("expand");
+        let attr = &out["https://purl.org/geojson/vocab#geometry"];
+        assert!(attr.is_array(), "Feature scope: {out}");
+        assert!(
+            attr[0].get(&format!("{DEFAULT}geometry")).is_some(),
+            "a sub-attribute is below the type scope: {out}"
+        );
+        assert_eq!(compact_entity(&out, &ctx), feature);
+
+        let vehicle = json!({
+            "id": "urn:ngsi-ld:Vehicle:1",
+            "type": "Vehicle",
+            "geometry": {"type": "Property", "value": "point"}
+        });
+        let out = expand_entity(vehicle.as_object().unwrap(), &ctx, ExpandOpts::default())
+            .expect("expand");
+        assert!(out.get(&format!("{DEFAULT}geometry")).is_some(), "{out}");
+        assert_eq!(compact_entity(&out, &ctx), vehicle);
+    }
+
+    /// 4.5.2.2: valueType is type coerced into a datatype URI on input, so
+    /// it compacts back on output: the entity reads back as it was written
+    /// (Coraine value_type_subattr).
+    #[test]
+    fn a_value_type_round_trips() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let e = json!({"id": "urn:E1", "type": "T",
+            "P1": {"type": "Property", "value": 1, "valueType": "Integer"}});
+        let out =
+            expand_entity(e.as_object().unwrap(), &ctx, ExpandOpts::default()).expect("expand");
+        assert_eq!(
+            out[&format!("{DEFAULT}P1")][0]["valueType"],
+            format!("{DEFAULT}Integer")
+        );
+        assert_eq!(compact_entity(&out, &ctx), e);
+    }
+
+    /// A property-scoped core context applies to everything inside the
+    /// property, sub-attributes included (property-scoped contexts
+    /// propagate), and compacts back to the scoped term.
+    #[test]
+    fn a_property_scoped_term_expands_inside_its_property() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let doc = json!({
+            "id": "urn:ngsi-ld:Device:1",
+            "type": "Device",
+            "endpoint": {"type": "Property", "value": "x",
+                "uri": {"type": "Property", "value": "http://a.example",
+                    "uri": {"type": "Property", "value": "deeper"}}},
+            "uri": {"type": "Property", "value": "top"}
+        });
+        let out =
+            expand_entity(doc.as_object().unwrap(), &ctx, ExpandOpts::default()).expect("expand");
+        let inner = &out["https://uri.etsi.org/ngsi-ld/endpoint"][0];
+        let uri = &inner["https://uri.etsi.org/ngsi-ld/uri"][0];
+        assert!(
+            uri.get("https://uri.etsi.org/ngsi-ld/uri").is_some(),
+            "{out}"
+        );
+        assert!(out.get(&format!("{DEFAULT}uri")).is_some(), "{out}");
+        assert_eq!(compact_entity(&out, &ctx), doc);
+    }
 
     #[test]
     fn round_trip_under_core_context() {
@@ -238,7 +339,7 @@ mod tests {
             "name": {"type": "Property", "value": "Eiffel Tower"},
             "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [2.29, 48.85]}}
         });
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let expanded =
             expand_entity(input.as_object().unwrap(), &ctx, ExpandOpts::default()).unwrap();
         let compacted = compact_entity(&expanded, &ctx);
@@ -251,7 +352,7 @@ mod tests {
     /// dataset-map instances compact per instance (Example 9).
     #[test]
     fn simplified_vocab_compacts_to_term() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let doc = json!({
             "id": "urn:ngsi-ld:V:1",
             "type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle",
@@ -278,7 +379,7 @@ mod tests {
             "route": {"type": "ListRelationship",
                       "objectList": [{"object": "urn:ngsi-ld:R:1"}, "urn:ngsi-ld:R:2"]}
         });
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let expanded =
             expand_entity(input.as_object().unwrap(), &ctx, ExpandOpts::default()).unwrap();
         let route = &expanded["https://uri.etsi.org/ngsi-ld/default-context/route"][0];
@@ -329,7 +430,7 @@ mod tests {
     /// own and the system members keep their values.
     #[test]
     fn reserved_members_are_not_clobbered_by_attributes() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let vocab = "https://uri.etsi.org/ngsi-ld/default-context/";
         let mut internal = Map::new();
         internal.insert("id".into(), json!("urn:ngsi-ld:B:1"));
@@ -361,7 +462,7 @@ mod tests {
     /// verbatim; a single-element scope array is unwrapped.
     #[test]
     fn entity_edge_shapes() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         assert_eq!(
             compact_entity(&json!("not an object"), &ctx),
             json!("not an object")
@@ -500,7 +601,7 @@ mod tests {
     /// wrapped twice, and a non-array objectList passes through.
     #[test]
     fn object_list_wrapping_edges() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let out = compact_instance(
             &json!({"type": "ListRelationship",
                     "objectList": ["urn:a", {"object": "urn:b"}],
@@ -560,10 +661,48 @@ mod tests {
         assert_eq!(compact_entity_shallow(&json!("x"), &ctx), json!("x"));
     }
 
+    /// 4.5.1 (CIM 009 V1.9.1 p.47-48): "scope" is "a Scope ... or an
+    /// unordered JSON array with multiple Scopes in case of an Entity that
+    /// has multiple Scopes". A stored one-element union (append with
+    /// noOverwrite, Coraine append_scope_union_single) is one Scope in
+    /// keyValues as in normalized; two stay an array.
+    #[test]
+    fn simplified_single_scope_is_unwrapped() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let out = compact_entity_shallow(&json!({"id": "urn:x", "scope": ["/x"]}), &ctx);
+        assert_eq!(out["scope"], json!("/x"));
+        let out = compact_entity_shallow(&json!({"id": "urn:x", "scope": ["/x", "/y"]}), &ctx);
+        assert_eq!(out["scope"], json!(["/x", "/y"]));
+    }
+
+    /// vocab members that are not IRIs (a number in the array, an object
+    /// instead of a string) pass through on both paths; an array of IRIs
+    /// compacts element by element in the simplified form too.
+    #[test]
+    fn vocab_members_that_are_not_iris_stay_verbatim() {
+        let ctx = ctx_of(json!({"cat": "https://example.org/cat"}));
+        let out = compact_instance(
+            &json!({"type": "VocabProperty",
+                    "vocab": ["https://example.org/cat", 3],
+                    "previousVocab": {"x": 1}}),
+            &ctx,
+        );
+        assert_eq!(out["vocab"], json!(["cat", 3]));
+        assert_eq!(out["previousVocab"], json!({"x": 1}));
+        let out = compact_entity_shallow(
+            &json!({"id": "urn:x", "type": "https://example.org/T",
+                    "https://example.org/a": {"vocab": ["https://example.org/cat", 3]},
+                    "https://example.org/b": {"vocab": {"x": 1}}}),
+            &ctx,
+        );
+        assert_eq!(out["https://example.org/a"], json!({"vocab": ["cat", 3]}));
+        assert_eq!(out["https://example.org/b"], json!({"vocab": {"x": 1}}));
+    }
+
     /// A "dataset" member whose value is not an object is left alone.
     #[test]
     fn simplified_dataset_edges() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let out = compact_entity_shallow(
             &json!({"https://uri.etsi.org/ngsi-ld/default-context/a": {"dataset": 5}}),
             &ctx,

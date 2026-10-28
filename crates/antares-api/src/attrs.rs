@@ -3,6 +3,7 @@
 
 use crate::federation::path_segment;
 use crate::negotiate::*;
+use crate::policy::Condition;
 use crate::state::{now_iso, AppState};
 use antares_jsonld::{expand_entity, ExpandOpts};
 use antares_model::{check_attr_name, NgsiError};
@@ -133,11 +134,10 @@ async fn write_attrs(
     let tenant = tenant_from(headers)?;
     antares_model::EntityId::new(id)?;
     check_params(params, &["options", "local", "type"])?;
-    let parsed = parse_body(&st.loader, headers, body, mode.body_kind).await?;
+    let parsed = parse_body(st, headers, body, mode.body_kind).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
-    gate!(st, &tenant, headers, mode.clause, ids: &[id]).await?;
     let fragment = expand_entity(
         obj,
         &parsed.ctx,
@@ -148,61 +148,76 @@ async fn write_attrs(
             ..Default::default()
         },
     )?;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await?;
+    let granted = gate!(
+        st, &tenant, headers, mode.clause,
+        ids: &[id],
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
+        attrs: &attr_iris_of(&fragment),
+        body: Some(&fragment),
+    )
+    .await?;
+    let cond = Condition::of(&granted);
     let (plan, all_attr_iris) =
         attr_fed_plan(st, &tenant, id, &fragment, &parsed.ctx, params, headers).await?;
     let regs = match plan {
         crate::federation::WritePlan::Answered(r) => return Ok(*r),
         crate::federation::WritePlan::Forward(regs) => regs,
     };
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, &all_attr_iris);
     let fragment = crate::federation::strip_covered_expanded(&fragment, &regs);
     let local_iris = attr_iris_of(&fragment);
     let ts = now_iso();
     let mut updated = Vec::new();
     let mut not_updated = Vec::new();
+    // The Entity's change, judged and applied on the document it lands on:
+    // inside the store's read-modify-write, or on a copy for a relay.
+    let apply = |doc: &mut Value| {
+        crate::history::restage(id);
+        Condition::pre(cond.as_ref(), id, doc)?;
+        // 5.6.2.4 / 5.6.3.4: the ?type selector narrows the target — a
+        // mismatch means the entity is not known for this operation.
+        if !matches_type_param(doc, params, &parsed.ctx) {
+            return Err(NgsiError::ResourceNotFound(format!(
+                "entity {id} does not match the type selector"
+            ))
+            .into());
+        }
+        let target = antares_store::stored_object(doc)?;
+        let frag = antares_jsonld::expanded_object(&fragment)?;
+        // 5.6.2.4 / 5.6.3.4: Entity Type names not yet in the target are
+        // added to its list
+        if let Some(new_types) = frag.get("type").and_then(Value::as_array) {
+            let mut cur: Vec<Value> = target
+                .get("type")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let known = cur.len();
+            for t in new_types {
+                if !cur.contains(t) {
+                    cur.push(t.clone());
+                }
+            }
+            if cur.len() > known {
+                target.insert("type".into(), Value::Array(cur));
+                updated.push("type".into());
+            }
+        }
+        merge(target, frag, &ts, &mut updated, &mut not_updated);
+        if updated.is_empty() {
+            return Err(Unwritten::Untouched);
+        }
+        target.insert("modifiedAt".into(), Value::String(ts.clone()));
+        Ok::<(), Unwritten>(())
+    };
     let local_resp: Option<ApiResult<Response>> = if local_covered {
         None
     } else {
-        let res = st
-            .store
-            .mutate(&tenant, Kind::Entity, id, |doc| {
-                // 5.6.2.4 / 5.6.3.4: the ?type selector narrows the target — a
-                // mismatch means the entity is not known for this operation.
-                if !matches_type_param(doc, params, &parsed.ctx) {
-                    return Err(NgsiError::ResourceNotFound(format!(
-                        "entity {id} does not match the type selector"
-                    ))
-                    .into());
-                }
-                let target = antares_store::stored_object(doc)?;
-                let frag = antares_jsonld::expanded_object(&fragment)?;
-                // 5.6.2.4 / 5.6.3.4: Entity Type names not yet in the target are
-                // added to its list
-                if let Some(new_types) = frag.get("type").and_then(Value::as_array) {
-                    let mut cur: Vec<Value> = target
-                        .get("type")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let known = cur.len();
-                    for t in new_types {
-                        if !cur.contains(t) {
-                            cur.push(t.clone());
-                        }
-                    }
-                    if cur.len() > known {
-                        target.insert("type".into(), Value::Array(cur));
-                        updated.push("type".into());
-                    }
-                }
-                merge(target, frag, &ts, &mut updated, &mut not_updated);
-                if updated.is_empty() {
-                    return Err(Unwritten::Untouched);
-                }
-                target.insert("modifiedAt".into(), Value::String(ts.clone()));
-                Ok::<(), Unwritten>(())
-            })
-            .await?;
+        let res = st.store.mutate(&tenant, Kind::Entity, id, apply).await?;
+        crate::history::settle(id, matches!(res, Some(Ok(()))));
         Some(match res {
             None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
             Some(Err(Unwritten::Failed(e))) => Err(e.into()),
@@ -223,13 +238,14 @@ async fn write_attrs(
         st,
         headers,
         &tenant,
-        &parsed.ctx.source,
+        &parsed.ctx,
         &regs,
         mode.op,
         mode.method.clone(),
         &format!("/entities/{}/attrs/", path_segment(id)),
         &query,
         Some(Value::Object(without_context_map(obj))),
+        true,
     )
     .await;
     Ok(combine_attr_parts(
@@ -265,6 +281,8 @@ async fn append_attrs_inner(
         body,
         &APPEND,
         |target, frag, ts, updated, not_updated| {
+            // The Entity as a backfill names it.
+            let shell = serde_json::json!({"id": target.get("id"), "type": target.get("type")});
             // appended scope: overwrite replaces; noOverwrite unions (010_07)
             if let Some(new_scope) = frag.get("scope") {
                 if target.contains_key("scope") && no_overwrite {
@@ -300,7 +318,12 @@ async fn append_attrs_inner(
                         updated.push(k.clone());
                     }
                     Some(existing) => {
-                        let merged = merge_instance_sets(existing, &incoming, no_overwrite);
+                        let merged = merge_instance_sets(
+                            existing,
+                            &incoming,
+                            no_overwrite,
+                            Some((&shell, k)),
+                        );
                         if merged {
                             updated.push(k.clone());
                         } else {
@@ -334,13 +357,19 @@ async fn update_attrs_inner(
         body,
         &UPDATE,
         |target, frag, ts, updated, not_updated| {
+            // The Entity as a backfill names it.
+            let shell = serde_json::json!({"id": target.get("id"), "type": target.get("type")});
             // 5.6.2: scope updates only when the entity already has one
             if let Some(new_scope) = frag.get("scope") {
-                if target.contains_key("scope") {
-                    target.insert("scope".into(), new_scope.clone());
+                if !target.contains_key("scope") {
+                    not_updated.push(("scope".into(), "entity has no scope".into()));
+                } else if antares_jsonld::is_ngsi_null_list(new_scope) {
+                    // 5.5.12: the NGSI-LD Null removes the member, as on merge
+                    target.remove("scope");
                     updated.push("scope".into());
                 } else {
-                    not_updated.push(("scope".into(), "entity has no scope".into()));
+                    target.insert("scope".into(), new_scope.clone());
+                    updated.push("scope".into());
                 }
             }
             for (k, v) in frag {
@@ -365,7 +394,7 @@ async fn update_attrs_inner(
                         updated.push(k.clone());
                     }
                     Some(existing) => {
-                        merge_instance_sets(existing, &incoming, false);
+                        merge_instance_sets(existing, &incoming, false, Some((&shell, k)));
                         if existing.as_array().is_some_and(Vec::is_empty) {
                             target.remove(k);
                         }
@@ -465,18 +494,16 @@ fn fwd_query(params: &HashMap<String, String>, keys: &[&str]) -> Vec<(String, St
         .collect()
 }
 
-/// Attribute IRIs of an expanded fragment (entity meta members excluded).
-fn attr_iris_of(fragment: &Value) -> Vec<String> {
+/// Attribute IRIs of an expanded fragment: every key but the Entity's own
+/// members (5.2.4, [`antares_model::is_meta`]), so `expiresAt` (4.22) is no
+/// Attribute name. A client `deletedAt` never reaches here: expansion drops
+/// it (5.2.2 "shall ignore").
+pub(crate) fn attr_iris_of(fragment: &Value) -> Vec<String> {
     fragment
         .as_object()
         .map(|o| {
             o.keys()
-                .filter(|k| {
-                    !matches!(
-                        k.as_str(),
-                        "id" | "type" | "scope" | "createdAt" | "modifiedAt"
-                    )
-                })
+                .filter(|k| !antares_model::is_meta(k))
                 .cloned()
                 .collect()
         })
@@ -544,6 +571,27 @@ fn combine_attr_parts(
             continue;
         }
         let covered: Vec<&String> = attr_iris.iter().filter(|a| reg.covers_attr(a)).collect();
+        // 5.2.18: a source's own 207 UpdateResult names what it "appended
+        // or updated"; only the Attributes this registration covers count
+        // (4.3.6.1), each listed once.
+        if let Some(u) = &part.update {
+            for a in covered {
+                if u.updated.contains(a) {
+                    any_fed_ok = true;
+                    if !updated.contains(a) {
+                        updated.push(a.clone());
+                    }
+                } else {
+                    let reason = u
+                        .not_updated
+                        .iter()
+                        .find(|(n, _)| n == a)
+                        .map_or_else(|| part.detail.clone(), |(_, r)| r.clone());
+                    not_updated.push((a.clone(), reason, Some(reg.reg_id.clone())));
+                }
+            }
+            continue;
+        }
         if part.ok() {
             any_fed_ok = true;
             for a in covered {
@@ -583,9 +631,7 @@ fn combine_attr_parts(
     if updated.is_empty()
         && !matches!(local, LocalOutcome::Ok)
         && !any_fed_ok
-        && fed_parts
-            .iter()
-            .any(|p| p.detail.contains("does not accept"))
+        && fed_parts.iter().any(|p| p.conflict)
     {
         let mut resp = (
             axum::http::StatusCode::CONFLICT,
@@ -608,15 +654,12 @@ fn combine_attr_parts(
     // 207 Multi Status is the answer for an entity distributed over multiple
     // endpoints, so a lone proxied source's failure passes through as itself.
     if let ([reg], [part]) = (regs, fed_parts) {
-        if reg.is_proxy() && !part.ok() && matches!(local, LocalOutcome::Skipped) {
-            return crate::federation::combine(
-                vec![crate::federation::Part {
-                    status: part.status,
-                    detail: part.detail.clone(),
-                }],
-                no_content(tenant),
-                tenant,
-            );
+        if reg.is_proxy()
+            && !part.ok()
+            && part.update.is_none()
+            && matches!(local, LocalOutcome::Skipped)
+        {
+            return crate::federation::part_error(part, tenant);
         }
     }
     if not_updated.is_empty() {
@@ -702,7 +745,16 @@ fn combine_single_attr(
 /// Merge incoming instances into an existing instance array by datasetId.
 /// Deletion-marker instances (urn:ngsi-ld:null) remove the matched instance.
 /// Returns false when nothing was applied (noOverwrite and all existed).
-fn merge_instance_sets(existing: &mut Value, incoming: &Value, no_overwrite: bool) -> bool {
+///
+/// `backfill` names the Entity (its id and type) and the attribute: an
+/// instance older than the one it would replace goes to history only then
+/// ([`crate::history::backfilled`]).
+fn merge_instance_sets(
+    existing: &mut Value,
+    incoming: &Value,
+    no_overwrite: bool,
+    backfill: Option<(&Value, &str)>,
+) -> bool {
     let (Some(cur), Some(inc)) = (existing.as_array_mut(), incoming.as_array()) else {
         return false;
     };
@@ -721,14 +773,23 @@ fn merge_instance_sets(existing: &mut Value, incoming: &Value, no_overwrite: boo
         }
         match pos {
             Some(p) => {
-                if !no_overwrite {
-                    // keep original createdAt
-                    let created = cur[p].get("createdAt").cloned();
-                    cur[p] = ni.clone();
-                    if let (Some(o), Some(c)) = (cur[p].as_object_mut(), created) {
-                        o.insert("createdAt".into(), c);
-                    }
+                let older = backfill
+                    .zip(cur.get(p))
+                    .is_some_and(|((doc, attr), current)| {
+                        crate::history::backfilled(doc, attr, current, ni)
+                    });
+                if older {
                     any = true;
+                } else if !no_overwrite {
+                    // keep original createdAt
+                    if let Some(slot) = cur.get_mut(p) {
+                        let created = slot.get("createdAt").cloned();
+                        *slot = ni.clone();
+                        if let (Some(o), Some(c)) = (slot.as_object_mut(), created) {
+                            o.insert("createdAt".into(), c);
+                        }
+                        any = true;
+                    }
                 }
             }
             None => {
@@ -782,11 +843,10 @@ async fn partial_update_inner(
     antares_model::EntityId::new(id)?;
     check_attr_name(attr)?;
     check_params(params, &["local", "type"])?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::MergePatch).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
-    gate!(st, &tenant, headers, "5.6.4", ids: &[id]).await?;
     let frag_inst = antares_jsonld::expand_attr_fragment(obj, &parsed.ctx)?;
     // 5.6.4.4: "Apply term expansion as mandated by clause 5.5.7, so that
     // the fully qualified name (URI) associated to the target Attribute is
@@ -794,6 +854,17 @@ async fn partial_update_inner(
     // valid Attribute name, and lands on a member of the stored document
     // that is not an Attribute.
     let attr_iri = antares_jsonld::expand_attr_name(attr, &parsed.ctx)?;
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
+    let granted = gate!(
+        st, &tenant, headers, "5.6.4",
+        ids: &[id],
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
+        attrs: std::slice::from_ref(&attr_iri),
+        body: Some(&frag_inst),
+    )
+    .await?;
+    let cond = Condition::of(&granted);
     // 5.6.4.4: "If the target Attribute is scope, then an error of type
     // BadRequestData shall be raised."
     if attr == "scope" || attr_iri == SCOPE_IRI {
@@ -807,6 +878,7 @@ async fn partial_update_inner(
     if let Some(r) = loop_answer {
         return Ok(r);
     }
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
     let want_ds = frag_inst
         .get("datasetId")
@@ -821,6 +893,7 @@ async fn partial_update_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
                 // 5.6.4.4: the ?type selector narrows the target entity
                 if !matches_type_param(doc, params, &parsed.ctx) {
                     return Err(NgsiError::ResourceNotFound(format!(
@@ -836,11 +909,11 @@ async fn partial_update_inner(
                         found = true;
                         if is_deletion {
                             existing.remove(p);
-                        } else {
+                        } else if let Some(slot) = existing.get_mut(p) {
                             // 5.6.4.4: the fragment may not change the Attribute type
                             if let (Some(ft), Some(et)) = (
                                 frag_inst.get("type").and_then(Value::as_str),
-                                existing[p].get("type").and_then(Value::as_str),
+                                slot.get("type").and_then(Value::as_str),
                             ) {
                                 if ft != et {
                                     return Err(NgsiError::BadRequestData(format!(
@@ -848,15 +921,25 @@ async fn partial_update_inner(
                                     )));
                                 }
                             }
-                            let t = antares_store::stored_object(&mut existing[p])?;
+                            let t = antares_store::stored_object(slot)?;
                             for (k, v) in antares_jsonld::expanded_object(&frag_inst)? {
                                 if matches!(k.as_str(), "createdAt" | "modifiedAt") {
                                     continue;
                                 }
-                                if v.is_null() || antares_jsonld::is_ngsi_null(v) {
+                                // a member set to the Null, or a sub-Attribute whose every
+                                // instance is a deletion, leaves the instance (10.2.5.4)
+                                if antares_jsonld::removes_member(v) {
                                     t.remove(k);
                                 } else {
                                     t.insert(k.clone(), v.clone());
+                                }
+                            }
+                            // 4.7.1: a GeoProperty's Value "shall be a GeoJSON
+                            // Geometry"; the fragment carries no type, so its value
+                            // is checked here, against the type it lands on.
+                            if t.get("type").and_then(Value::as_str) == Some("GeoProperty") {
+                                if let Some(g) = t.get("value") {
+                                    antares_jsonld::expand::validate_geojson(attr, g)?;
                                 }
                             }
                             t.insert("modifiedAt".into(), Value::String(ts.clone()));
@@ -884,7 +967,7 @@ async fn partial_update_inner(
         st,
         headers,
         &tenant,
-        &parsed.ctx.source,
+        &parsed.ctx,
         &regs,
         "updateAttrs",
         reqwest::Method::PATCH,
@@ -895,6 +978,7 @@ async fn partial_update_inner(
         ),
         &fwd_query(params, &["type"]),
         Some(Value::Object(without_context_map(obj))),
+        false,
     )
     .await;
     Ok(combine_single_attr(
@@ -927,11 +1011,10 @@ pub async fn replace_attr(
         antares_model::EntityId::new(&id)?;
         check_attr_name(&attr)?;
         check_params(&params, &["local", "type"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         // 5.5.7 term expansion first, then 5.6.19.4: "If the target Attribute
         // is scope, then an error of type BadRequestData shall be raised" —
         // the target is the expanded name, so the IRI spelling counts too.
-        gate!(st, &tenant, &headers, "5.6.19", ids: &[&id]).await?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &parsed.ctx)?;
         if attr == "scope" || attr_iri == SCOPE_IRI {
             return Err(NgsiError::BadRequestData(
@@ -954,6 +1037,17 @@ pub async fn replace_attr(
                 ..Default::default()
             },
         )?;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await?;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.19",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+            attrs: std::slice::from_ref(&attr_iri),
+            body: Some(&fragment),
+        )
+        .await?;
+        let cond = Condition::of(&granted);
         let incoming_arr = fragment
             .get(&attr_iri)
             .cloned()
@@ -972,6 +1066,7 @@ pub async fn replace_attr(
         if let Some(r) = loop_answer {
             return Ok(r);
         }
+        Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
         let ts = now_iso();
         let mut found = false;
@@ -981,6 +1076,7 @@ pub async fn replace_attr(
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, &id, |doc| {
+                    Condition::pre(cond.as_ref(), &id, doc)?;
                     // 5.6.19.4: the ?type selector narrows the target entity
                     if !matches_type_param(doc, &params, &parsed.ctx) {
                         return Err(NgsiError::ResourceNotFound(format!(
@@ -992,11 +1088,11 @@ pub async fn replace_attr(
                     {
                         // 5.6.19: only the instance with the matching datasetId is
                         // replaced; its createdAt survives (055_01/055_02)
-                        if let Some(p) = existing.iter().position(|ci| {
+                        if let Some(slot) = existing.iter_mut().find(|ci| {
                             ci.get("datasetId").and_then(Value::as_str) == want_ds.as_deref()
                         }) {
                             found = true;
-                            let created = existing[p].get("createdAt").cloned();
+                            let created = slot.get("createdAt").cloned();
                             let mut ni = new_inst.clone();
                             if let Some(o) = ni.as_object_mut() {
                                 if let Some(c) = created {
@@ -1006,7 +1102,7 @@ pub async fn replace_attr(
                                 }
                                 o.insert("modifiedAt".into(), Value::String(ts.clone()));
                             }
-                            existing[p] = ni;
+                            *slot = ni;
                         }
                     }
                     if found {
@@ -1027,7 +1123,7 @@ pub async fn replace_attr(
             &st,
             &headers,
             &tenant,
-            &parsed.ctx.source,
+            &parsed.ctx,
             &regs,
             "replaceAttrs",
             reqwest::Method::PUT,
@@ -1038,6 +1134,7 @@ pub async fn replace_attr(
             ),
             &fwd_query(&params, &["type"]),
             Some(Value::Object(without_context_map(obj))),
+            false,
         )
         .await;
         Ok(combine_single_attr(
@@ -1050,6 +1147,250 @@ pub async fn replace_attr(
         ))
     };
     go.await.unwrap_or_else(|e: ApiError| e.into_response())
+}
+
+// ---------- PUT /entities/{id}/attrs/{attrId}/value (TS 104 175 10.2.6) ----------
+
+/// Set Attribute Value (TS 104 175 10.2.6, TS 104 176 7.6.3.2): the body
+/// is the bare value. The stored instance keeps its type and every other
+/// sub-Attribute; only the member that type carries its value in changes.
+/// The policy engine judges it as Replace Attribute (5.6.19), the write it
+/// is, so no rule written for that clause can be stepped around here.
+pub async fn set_attr_value(
+    State(st): State<AppState>,
+    Path((id, attr)): Path<(String, String)>,
+    CleanParams(params): CleanParams,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    set_attr_value_inner(&st, &id, &attr, &params, &headers, &body)
+        .await
+        .unwrap_or_else(|e: ApiError| e.into_response())
+}
+
+async fn set_attr_value_inner(
+    st: &AppState,
+    id: &str,
+    attr: &str,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> ApiResult<Response> {
+    let tenant = tenant_from(headers)?;
+    antares_model::EntityId::new(id)?;
+    check_attr_name(attr)?;
+    check_params(params, &["datasetId", "observedAt", "local", "type"])?;
+    let ctx = request_context(&st.loader, headers).await?;
+    let attr_iri = antares_jsonld::expand_attr_name(attr, &ctx)?;
+    if attr == "scope" || attr_iri == SCOPE_IRI {
+        return Err(NgsiError::BadRequestData(
+            "scope cannot be the target of Set Attribute Value (10.2.6)".into(),
+        )
+        .into());
+    }
+    let observed = params.get("observedAt").map(String::as_str);
+    if observed.is_some_and(|t| !antares_jsonld::parse_datetime(t)) {
+        return Err(NgsiError::BadRequestData("observedAt must be a DateTime (4.8)".into()).into());
+    }
+    let want_ds = crate::repr::target_dataset_id(params).map(String::from);
+    if let Some(ds) = &want_ds {
+        antares_model::EntityId::new(ds)
+            .map_err(|_| NgsiError::BadRequestData(format!("datasetId {ds:?} is not a URI")))?;
+    }
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| NgsiError::InvalidRequest(format!("the body is not a JSON value: {e}")))?;
+    // 10.2.6.4: null and the NGSI-LD Null are refused except in a
+    // JsonProperty; without a local instance the type is unknown, so a
+    // null is refused before it can be forwarded
+    let stored = st.store.get(&tenant, Kind::Entity, id).await?;
+    let stored_inst = stored
+        .as_ref()
+        .and_then(|d| d.get(&attr_iri))
+        .and_then(|a| instance_with_dataset(a, want_ds.as_deref()))
+        .cloned();
+    refuse_null(stored_inst.as_ref(), &value)?;
+    // what the engine judges is the instance as it would be stored
+    let judged = stored_inst
+        .as_ref()
+        .map(|si| with_value(si, attr, &attr_iri, &value, &ctx, observed))
+        .transpose()?
+        .map(|i| serde_json::json!({ attr_iri.clone(): [i] }));
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
+    let granted = gate!(
+        st, &tenant, headers, "5.6.19",
+        ids: &[id],
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
+        attrs: std::slice::from_ref(&attr_iri),
+        body: judged.as_ref(),
+    )
+    .await?;
+    let cond = Condition::of(&granted);
+    let (regs, loop_answer) =
+        attr_regs_or_loop(st, &tenant, id, &attr_iri, &ctx, params, headers).await?;
+    if let Some(r) = loop_answer {
+        return Ok(r);
+    }
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
+    let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
+    let ts = now_iso();
+    let mut found = false;
+    let local_resp: Option<ApiResult<Response>> = if local_covered {
+        None
+    } else {
+        let res = st
+            .store
+            .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
+                if !matches_type_param(doc, params, &ctx) {
+                    return Err(NgsiError::ResourceNotFound(format!(
+                        "entity {id} does not match the type selector"
+                    )));
+                }
+                let target = antares_store::stored_object(doc)?;
+                let Some(existing) = target.get_mut(&attr_iri).and_then(Value::as_array_mut) else {
+                    return Ok(());
+                };
+                let Some(slot) = existing
+                    .iter_mut()
+                    .find(|ci| ci.get("datasetId").and_then(Value::as_str) == want_ds.as_deref())
+                else {
+                    return Ok(());
+                };
+                // from the instance under the lock, not the read above: a
+                // write in between must not be lost
+                refuse_null(Some(slot), &value)?;
+                let mut ni = with_value(slot, attr, &attr_iri, &value, &ctx, observed)?;
+                if let Some(o) = ni.as_object_mut() {
+                    o.insert("modifiedAt".into(), Value::String(ts.clone()));
+                }
+                *slot = ni;
+                found = true;
+                target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                Ok::<(), NgsiError>(())
+            })
+            .await?;
+        Some(single_attr_local(res, found, id, attr, &tenant))
+    };
+    if regs.is_empty() {
+        return local_resp
+            .unwrap_or_else(|| Err(NgsiError::InternalError("no local result".into()).into()));
+    }
+    // Decided: 9.2 names no operation for 10.2.6, so a source is
+    // asked when it supports replaceAttrs, and on its own value resource
+    let fed_parts = crate::federation::fed_attr_parts(
+        st,
+        headers,
+        &tenant,
+        &ctx,
+        &regs,
+        "replaceAttrs",
+        reqwest::Method::PUT,
+        &format!(
+            "/entities/{}/attrs/{}/value",
+            path_segment(id),
+            path_segment(attr)
+        ),
+        &fwd_query(params, &["type", "datasetId", "observedAt"]),
+        Some(value),
+        false,
+    )
+    .await;
+    Ok(combine_single_attr(
+        &tenant,
+        &attr_iri,
+        local_covered,
+        &local_resp,
+        &regs,
+        &fed_parts,
+    ))
+}
+
+/// The instance of a stored Attribute with this datasetId (`None` = the
+/// default instance).
+fn instance_with_dataset<'a>(attr: &'a Value, ds: Option<&str>) -> Option<&'a Value> {
+    attr.as_array()?
+        .iter()
+        .find(|i| i.get("datasetId").and_then(Value::as_str) == ds)
+}
+
+/// 10.2.6.4: "the payload body contains "urn:ngsi-ld:null" or contains null
+/// (excepting for Attribute fragments representing a JsonProperty)" is
+/// InvalidRequest, wherever in the value it sits.
+fn refuse_null(stored: Option<&Value>, value: &Value) -> Result<(), NgsiError> {
+    fn holds_null(v: &Value) -> bool {
+        match v {
+            Value::Null => true,
+            Value::String(s) => s == "urn:ngsi-ld:null",
+            Value::Array(a) => a.iter().any(holds_null),
+            Value::Object(o) => o.values().any(holds_null),
+            _ => false,
+        }
+    }
+    let json_property = stored.is_some_and(|i| i.get("type") == Some(&Value::from("JsonProperty")));
+    if !json_property && holds_null(value) {
+        return Err(NgsiError::InvalidRequest(
+            "a value may hold no null and no urn:ngsi-ld:null (10.2.6.4)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The stored instance `si` with its value replaced: the member its type
+/// carries the value in, expanded and validated as that type would be in a
+/// fragment (8.2.4); observedAt follows the request when the instance had
+/// one, and goes otherwise (10.2.6.4).
+fn with_value(
+    si: &Value,
+    attr: &str,
+    attr_iri: &str,
+    value: &Value,
+    ctx: &antares_jsonld::Context,
+    observed: Option<&str>,
+) -> Result<Value, NgsiError> {
+    let ty = si.get("type").and_then(Value::as_str).unwrap_or("Property");
+    let member = match ty {
+        "Relationship" => "object",
+        "LanguageProperty" => "languageMap",
+        "JsonProperty" => "json",
+        "VocabProperty" => "vocab",
+        "ListProperty" => "valueList",
+        "ListRelationship" => "objectList",
+        _ => "value",
+    };
+    let mut wrapper = Map::new();
+    wrapper.insert(
+        attr.to_owned(),
+        serde_json::json!({ "type": ty, member: value }),
+    );
+    let expanded = expand_entity(
+        &wrapper,
+        ctx,
+        ExpandOpts {
+            fragment: true,
+            allow_null: false,
+            temporal: false,
+            ..Default::default()
+        },
+    )?;
+    let new_value = expanded
+        .get(attr_iri)
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|i| i.get(member))
+        .cloned()
+        .ok_or_else(|| NgsiError::BadRequestData(format!("not a {ty} value")))?;
+    let mut out = si.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.insert(member.into(), new_value);
+        if o.contains_key("observedAt") {
+            match observed {
+                Some(t) => o.insert("observedAt".into(), Value::String(t.to_owned())),
+                None => o.remove("observedAt"),
+            };
+        }
+    }
+    Ok(out)
 }
 
 // ---------- DELETE /entities/{id}/attrs/{attrId} (5.6.5) ----------
@@ -1078,7 +1419,6 @@ async fn delete_attr_inner(
     check_attr_name(attr)?;
     check_params(params, &["datasetId", "deleteAll", "local", "type"])?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, "5.6.5", ids: &[id]).await?;
     // 5.6.5.4 expands the path name the same way 5.6.4.4 does, and then
     // addresses `scope` as itself rather than as an Attribute. The target is
     // what the name expands to, so both spellings — the reserved short name
@@ -1092,6 +1432,16 @@ async fn delete_attr_inner(
             iri => iri,
         }
     };
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
+    let granted = gate!(
+        st, &tenant, headers, "5.6.5",
+        ids: &[id],
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
+        attrs: std::slice::from_ref(&attr_iri),
+    )
+    .await?;
+    let cond = Condition::of(&granted);
     let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
     let want_ds = crate::repr::target_dataset_id(params).map(String::from);
     let (regs, loop_answer) =
@@ -1099,6 +1449,7 @@ async fn delete_attr_inner(
     if let Some(r) = loop_answer {
         return Ok(r);
     }
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
     let ts = now_iso();
     let mut found = false;
@@ -1108,6 +1459,7 @@ async fn delete_attr_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
                 // 5.6.5.4: the ?type selector narrows the target entity
                 if !matches_type_param(doc, params, &ctx) {
                     return Err(NgsiError::ResourceNotFound(format!(
@@ -1146,28 +1498,14 @@ async fn delete_attr_inner(
                 Ok::<(), NgsiError>(())
             })
             .await?;
-        // The temporal representation records the deletion (4.8 deletedAt) — and
-        // the entity may exist ONLY temporally (created via 5.6.11), so a
-        // missing current-state entity still records. A REFUSED delete (the
-        // 5.6.5.4 type selector did not match) deleted nothing and must leave
-        // the attribute history untouched.
-        let temporal_had = !matches!(res, Some(Err(_)))
-            && crate::history::mirror_delete_attr(
-                st,
-                &tenant,
-                id,
-                &attr_iri,
-                want_ds.as_deref(),
-                &ts,
-            )
-            .await;
-        // An entity that exists only temporally still answers 204: the
-        // deletion was recorded even though there was no current state.
-        Some(if res.is_none() && temporal_had {
-            Ok(no_content(&tenant))
-        } else {
-            single_attr_local(res, found || temporal_had, id, attr, &tenant)
-        })
+        // The store's change hook records the deletion (4.8 deletedAt,
+        // notify::record_temporal_change). Only what the Entity held is
+        // deleted (5.6.5.4: "If the target Entity does not contain the target
+        // Attribute then an error of type ResourceNotFound shall be raised"),
+        // so an Entity held only temporally, an Attribute already deleted and
+        // a refused delete (the type selector did not match) write nothing
+        // and leave the history untouched.
+        Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
         // the local half is skipped only while registrations cover the
@@ -1180,7 +1518,7 @@ async fn delete_attr_inner(
         st,
         headers,
         &tenant,
-        &ctx.source,
+        &ctx,
         &regs,
         "deleteAttrs",
         reqwest::Method::DELETE,
@@ -1191,6 +1529,7 @@ async fn delete_attr_inner(
         ),
         &query,
         None,
+        false,
     )
     .await;
     Ok(combine_single_attr(
@@ -1304,6 +1643,103 @@ mod attr_name_and_via_paths {
             StatusCode::CREATED,
             "entity create"
         );
+    }
+
+    /// Antares serves the form it forwards: Append and Update
+    /// Entity Attributes (5.6.2, 5.6.3) go out as `…/attrs/`, the form the
+    /// ETSI mock sources expect, and the router itself answers that path,
+    /// not only the binary's layer. So a registration whose endpoint is
+    /// another Antares, or this one through the router in process or in the
+    /// browser build, lands. The peer is a second broker (its own alias, or
+    /// the Via chain reads the forward as a loop) served by the bare router
+    /// over HTTP; the Entity lives in its tenant `t3701` only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forward_between_two_antares_tenants_lands() {
+        if std::env::var_os("ANTARES_TEST_SANITIZER").is_some() {
+            return;
+        }
+        const ENTITY: &str = "urn:ngsi-ld:Vehicle:attrs-slash";
+        let st = state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = AppState::new("antares-peer".into());
+        let served = crate::router(peer.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, served).await;
+        });
+        let call = |method: &str, uri: String, tenant: Option<&str>, body: Option<String>| {
+            let mut req = Request::builder().method(method).uri(uri);
+            if let Some(t) = tenant {
+                req = req.header("NGSILD-Tenant", t);
+            }
+            if let Some(b) = &body {
+                req = req
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", b.len());
+            }
+            req.body(body.map_or_else(Body::empty, Body::from))
+                .expect("request")
+        };
+        let entity = serde_json::json!({"id": ENTITY, "type": "Vehicle",
+                                        "speed": {"type": "Property", "value": 1}});
+        let req = call(
+            "POST",
+            "/ngsi-ld/v1/entities".into(),
+            Some("t3701"),
+            Some(entity.to_string()),
+        );
+        assert_eq!(send(&peer, req).await.status(), StatusCode::CREATED);
+        let reg = serde_json::json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:attrs-slash",
+            "type": "ContextSourceRegistration", "mode": "redirect", "tenant": "t3701",
+            "operations": ["updateEntity", "updateAttrs", "replaceAttrs", "deleteAttrs", "appendAttrs"],
+            "information": [{"entities": [{"type": "Vehicle", "id": ENTITY}]}],
+            "endpoint": format!("http://127.0.0.1:{port}"),
+        });
+        assert_eq!(
+            post(&st, "/ngsi-ld/v1/csourceRegistrations", reg.to_string()).await,
+            StatusCode::CREATED
+        );
+        let attrs = format!("/ngsi-ld/v1/entities/{ENTITY}/attrs");
+        let update = r#"{"speed":{"type":"Property","value":2}}"#.to_owned();
+        let append = r#"{"colour":{"type":"Property","value":"red"}}"#.to_owned();
+        for (method, body) in [("PATCH", update), ("POST", append)] {
+            let resp = send(&st, call(method, attrs.clone(), None, Some(body))).await;
+            let status = resp.status();
+            let bytes = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .expect("body")
+                .to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "{method} forwarded: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let req = call(
+            "GET",
+            format!("/ngsi-ld/v1/entities/{ENTITY}?options=keyValues"),
+            Some("t3701"),
+            None,
+        );
+        let resp = send(&peer, req).await;
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("body")
+            .to_bytes();
+        let got: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            (&got["speed"], &got["colour"]),
+            (&serde_json::json!(2), &serde_json::json!("red")),
+            "{got}"
+        );
+        // and the router answers the slash form itself, whoever sends it
+        let direct = r#"{"speed":{"type":"Property","value":3}}"#.to_owned();
+        let req = call("PATCH", format!("{attrs}/"), Some("t3701"), Some(direct));
+        assert_eq!(send(&peer, req).await.status(), StatusCode::NO_CONTENT);
     }
 
     /// 4.6.2: a name starts with a letter, so no valid Attribute name is a
@@ -1582,12 +2018,11 @@ mod attr_name_and_via_paths {
         }
     }
 
-    /// 6.3.17/6.3.18 (Table 6.3.18-2): a Via chain naming this broker leaves
-    /// the matching registrations out of the operation, which then runs
-    /// locally. 508 is reserved for a SINGLE exclusive/redirect source, so two
-    /// registrations must produce an answer — never a 500.
+    /// TS 104 175 9.7: a write whose Via chain names this broker is
+    /// a detected loop, 508 whatever its registrations, neither forwarded nor
+    /// applied locally; two registrations change nothing about that.
     #[tokio::test(flavor = "multi_thread")]
-    async fn self_via_with_two_registrations_answers_locally() {
+    async fn self_via_with_two_registrations_is_a_detected_loop() {
         const ENTITY: &str = "urn:ngsi-ld:Vehicle:attrs-via";
         let st = state();
         create_entity(&st, ENTITY).await;
@@ -1606,7 +2041,7 @@ mod attr_name_and_via_paths {
             .header("Via", via.as_str())
             .body(Body::from(body))
             .expect("request");
-        assert_eq!(send(&st, req).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(send(&st, req).await.status(), StatusCode::LOOP_DETECTED);
 
         // 5.6.5 Delete Attribute — the single-attribute plan
         let req = Request::builder()
@@ -1615,13 +2050,27 @@ mod attr_name_and_via_paths {
             .header("Via", via.as_str())
             .body(Body::empty())
             .expect("request");
-        assert_eq!(send(&st, req).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(send(&st, req).await.status(), StatusCode::LOOP_DETECTED);
 
         assert_eq!(
             hits.load(Ordering::SeqCst),
             0,
             "registrations dropped by the Via chain must not be contacted"
         );
+        // a read with the same chain is served locally: the write never landed
+        let req = Request::builder()
+            .uri(format!("/ngsi-ld/v1/entities/{ENTITY}"))
+            .header("Via", via.as_str())
+            .body(Body::empty())
+            .expect("request");
+        let resp = send(&st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let entity: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(entity["speed"]["value"], 1, "{entity}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 }
 
@@ -1718,7 +2167,7 @@ mod clause_5_5_8 {
              "observedAt": "2022-03-14T13:00:00.000Z"},
             {"type": "Property", "value": 8, "datasetId": "urn:ngsi-ld:Dataset:b"}
         ]);
-        assert!(merge_instance_sets(&mut existing, &incoming, false));
+        assert!(merge_instance_sets(&mut existing, &incoming, false, None));
         let arr = existing.as_array().unwrap();
         assert_eq!(arr.len(), 3, "default replaced + a kept + b added");
         let default = arr
@@ -1739,7 +2188,7 @@ mod clause_5_5_8 {
             {"type": "Property", "value": "urn:ngsi-ld:null",
              "datasetId": "urn:ngsi-ld:Dataset:a"}
         ]);
-        assert!(merge_instance_sets(&mut existing, &deletion, false));
+        assert!(merge_instance_sets(&mut existing, &deletion, false, None));
         let arr = existing.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert!(
@@ -1763,7 +2212,7 @@ mod clause_5_5_8 {
             {"type": "Property", "value": 2},
             {"type": "Property", "value": 3, "datasetId": "urn:ngsi-ld:Dataset:n"}
         ]);
-        assert!(merge_instance_sets(&mut existing, &incoming, true));
+        assert!(merge_instance_sets(&mut existing, &incoming, true, None));
         let arr = existing.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(
@@ -1809,10 +2258,7 @@ mod update_result_tests {
             "urn:ngsi-ld:ContextSourceRegistration:csr1",
             Some(vec![brand.clone()]),
         )];
-        let parts = vec![Part {
-            status: 504,
-            detail: "distributed operation timed out".into(),
-        }];
+        let parts = vec![Part::local(504, "distributed operation timed out")];
         let resp = combine_attr_parts(
             &tenant,
             &all,
@@ -1857,10 +2303,10 @@ mod update_result_tests {
                     mode: mode.into(),
                     ..reg("urn:ngsi-ld:ContextSourceRegistration:csr1", None)
                 }];
-                let parts = vec![Part {
+                let parts = vec![Part::local(
                     status,
-                    detail: "distributed operation to registration csr1 failed".into(),
-                }];
+                    "distributed operation to registration csr1 failed",
+                )];
                 let resp = combine_attr_parts(
                     &tenant,
                     std::slice::from_ref(&speed),
@@ -1898,16 +2344,7 @@ mod update_result_tests {
             reg("urn:ngsi-ld:ContextSourceRegistration:csr1", None),
             reg("urn:ngsi-ld:ContextSourceRegistration:csr2", None),
         ];
-        let parts = vec![
-            Part {
-                status: 204,
-                detail: "ok".into(),
-            },
-            Part {
-                status: 404,
-                detail: "not found".into(),
-            },
-        ];
+        let parts = vec![Part::local(204, "ok"), Part::local(404, "not found")];
         let resp = combine_attr_parts(
             &tenant,
             std::slice::from_ref(&speed),
@@ -1927,10 +2364,7 @@ mod update_result_tests {
         let tenant = antares_model::TenantId::new("default").expect("tenant");
         let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed".to_owned();
         let regs = vec![reg("urn:ngsi-ld:ContextSourceRegistration:csr1", None)];
-        let ok_parts = vec![Part {
-            status: 204,
-            detail: "ok".into(),
-        }];
+        let ok_parts = vec![Part::local(204, "ok")];
         let resp = combine_attr_parts(
             &tenant,
             std::slice::from_ref(&speed),
@@ -1943,10 +2377,7 @@ mod update_result_tests {
         );
         assert_eq!(resp.status().as_u16(), 204);
         // entity unknown locally AND every forward failed → 404 ProblemDetails
-        let bad_parts = vec![Part {
-            status: 404,
-            detail: "not found".into(),
-        }];
+        let bad_parts = vec![Part::local(404, "not found")];
         let resp = combine_attr_parts(
             &tenant,
             std::slice::from_ref(&speed),

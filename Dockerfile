@@ -16,8 +16,9 @@ RUN apt-get update \
 # Release binaries embed their dependency list (SBOM) via
 # cargo-auditable — `cargo audit bin /antares` can then verify a shipped
 # broker against advisories with no source tree at hand. Installed (with chef)
-# BEFORE any source COPY so the layer caches across source changes.
-RUN cargo install cargo-chef cargo-auditable --locked
+# BEFORE any source COPY so the layer caches across source changes; both at
+# an exact version, as every build tool is.
+RUN cargo install cargo-chef@0.1.78 cargo-auditable@0.7.7 --locked
 # The pinned toolchain must be present from the first cargo invocation —
 # otherwise the dep layer compiles with the image's default toolchain and the
 # final build recompiles everything under the pinned one, defeating the cache.
@@ -29,12 +30,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
+# The recipe holds workspace members only; vendor/rumqttc is a [patch] path crate outside them,
+# so the cook needs its source to compile it with the other dependencies.
+COPY vendor/ vendor/
+# Cargo features of the broker (empty = the default build); an image that
+# carries an addon names it here with --build-arg FEATURES=<feature>.
+ARG FEATURES=""
 # Cook scoped to the shipped package so feature unification matches the real
 # build below — a workspace-wide cook can resolve different features and
 # quietly recompile deps anyway.
-RUN cargo chef cook --release -p antares-broker --recipe-path recipe.json --locked
+RUN cargo chef cook --release -p antares-broker ${FEATURES:+--features "$FEATURES"} --recipe-path recipe.json --locked
 COPY . .
-RUN cargo auditable build --release --locked -p antares-broker \
+RUN cargo auditable build --release --locked -p antares-broker ${FEATURES:+--features "$FEATURES"} \
  && mkdir /data-init
 
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
@@ -42,10 +49,21 @@ COPY --from=build /src/target/release/antares /antares
 # jemalloc decay tuning, measured: without a background
 # thread, freed pages only purge on ALLOCATION activity — an idle broker
 # after a burst parked ~48 MiB of dead pages forever; with it, RSS decays
-# back toward live×1.2 within seconds. Both env spellings: tikv-jemalloc
-# reads _RJEM_MALLOC_CONF (prefixed build), MALLOC_CONF covers unprefixed.
-ENV MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:10000,muzzy_decay_ms:10000 \
-    _RJEM_MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:10000,muzzy_decay_ms:10000
+# back toward live×1.2 within seconds. Under a batch upsert flood the 10 s
+# decays kept RSS at live×1.5 (1.39 GiB of a 1.5 GiB limit); 1 s dirty and no
+# muzzy stage held it at live×1.3, the same throughput. Both env
+# spellings: tikv-jemalloc reads _RJEM_MALLOC_CONF (prefixed build),
+# MALLOC_CONF covers unprefixed.
+ENV MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0 \
+    _RJEM_MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0
+# Read sizes, the binary's own defaults spelled out: a page of any list
+# answers 100 items unless the request names `limit`, at most 1000; a
+# temporal answer serves 100 instances of an Attribute unless it names
+# `lastN`, at most 1000.
+ENV ANTARES_DEFAULT_LIMIT=100 \
+    ANTARES_MAX_LIMIT=1000 \
+    ANTARES_TEMPORAL_DEFAULT_INSTANCES=100 \
+    ANTARES_TEMPORAL_INSTANCE_LIMIT=1000
 # Pre-create /data owned by nonroot (65532): a fresh named volume inherits the
 # mountpoint's ownership, so `file` mode can write without running as root —
 # distroless has no shell to chown at runtime.

@@ -131,6 +131,11 @@ impl FedReg {
                 }
             }
         }
+        self.covers_types(obj, ctx)
+    }
+    /// The type half of `covers_item`: does the item's `type` name one of the
+    /// registration's EntityInfo types? No type to check ⇒ covered.
+    pub fn covers_types(&self, obj: &Map<String, Value>, ctx: &Context) -> bool {
         if !self.ent_types.is_empty() {
             let types: Vec<String> = match obj.get("type") {
                 Some(Value::String(t)) => vec![ctx.expand_key(t)],
@@ -266,34 +271,29 @@ pub fn via_loop(headers: &HeaderMap, alias: &str) -> bool {
     via_hops(headers) > MAX_VIA_HOPS || via_tokens(headers).iter().any(|t| t == alias)
 }
 
-/// 6.3.17/6.3.18 loop handling for operations with matching registrations.
-/// 508 Loop Detected is mandated ONLY "in the case of an exclusive or
-/// redirect registration, where all of the data is held outside of the
-/// Context Broker and held in a single registered source ... registered to
-/// redirect back on to the Context Broker". Any other loop clears `regs` —
-/// the Via listing "is used when determining matching registrations"
-/// (Table 6.3.18-2), so the operation proceeds locally without re-forwarding.
+/// Loop handling for a distributed write (6.3.17, 6.3.18, TS 104 175 9.7).
+/// 9.7: "If the requested endpoint is also listed as previously encountered
+/// when a Context Source receives a call to that endpoint, this is an
+/// indication that a new loop has been detected. A suitable error shall be
+/// returned". A write whose `Via`
+/// already names this broker in this tenant is answered 508 Loop Detected
+/// whatever its registrations, the single exclusive or redirect source of
+/// TS 104 176 6.3.5 included, and nothing is forwarded; a read with the same
+/// chain is served locally with a 199 warning by its own handler.
 pub fn handle_via_loop(
     headers: &HeaderMap,
     alias: &str,
     tenant: &TenantId,
     regs: &mut Vec<FedReg>,
 ) -> Option<Response> {
-    // A chain past [`MAX_VIA_HOPS`] is refused outright: the operation is
-    // not re-forwarded and not run locally either, because a request that
-    // deep is a cascade the pseudonyms failed to close.
-    if via_hops(headers) > MAX_VIA_HOPS {
-        regs.clear();
-        return Some(loop_508(tenant));
-    }
-    if regs.is_empty() || !via_loop(headers, alias) {
+    // [`via_loop`] also refuses a chain past [`MAX_VIA_HOPS`] outright: the
+    // operation is not re-forwarded and not run locally either, because a
+    // request that deep is a cascade the pseudonyms failed to close.
+    if !via_loop(headers, alias) {
         return None;
     }
-    if regs.len() == 1 && regs[0].is_proxy() {
-        return Some(loop_508(tenant));
-    }
     regs.clear();
-    None
+    Some(loop_508(tenant))
 }
 
 /// One `NGSILD-Warning` header value (6.3.17), in RFC 7234 warn form:
@@ -427,16 +427,26 @@ async fn reg_docs(
     // match that pattern, so narrowing to the id list alone would drop a
     // Context Source 5.12 matches — the one thing a prefilter may never do.
     let ids = spec.ids.as_deref().filter(|_| spec.id_pattern.is_none());
-    match &st.reg_mirror {
-        Some(m) => Ok(m.matching(tenant.as_str(), ids, types.as_deref())),
-        None => Ok(st
+    let mut docs: Vec<std::sync::Arc<Value>> = match &st.reg_mirror {
+        Some(m) => m.matching(tenant.as_str(), ids, types.as_deref()),
+        None => st
             .store
             .matching_registrations(tenant, ids, types.as_deref())
             .await?
             .into_iter()
             .map(std::sync::Arc::new)
-            .collect()),
-    }
+            .collect(),
+    };
+    // The mirror answers in hash order, Postgres in its collation's id order
+    // and the memory store by its own keys: one order for all of them (id,
+    // bytewise) keeps forwards, 207 reasons and the first failing
+    // registration the same whichever one answered.
+    docs.sort_by(|a, b| doc_id(a).cmp(doc_id(b)));
+    Ok(docs)
+}
+
+fn doc_id(doc: &Value) -> &str {
+    doc.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
 /// Does one stored registration take part in this operation, and through
@@ -541,16 +551,7 @@ pub async fn matching_regs(
                 .get("contextSourceAlias")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let endpoint = doc
-                .get("endpoint")
-                .and_then(Value::as_str)?
-                .trim_end_matches('/');
-            // registrations may name the API root itself (…/ngsi-ld/v1) —
-            // normalize so forward URLs never double the prefix (IOP fixtures)
-            let endpoint = endpoint
-                .strip_suffix("/ngsi-ld/v1")
-                .unwrap_or(endpoint)
-                .to_owned();
+            let endpoint = endpoint_base(doc.get("endpoint").and_then(Value::as_str)?);
             let mode = doc
                 .get("mode")
                 .and_then(Value::as_str)
@@ -571,14 +572,17 @@ pub async fn matching_regs(
             let mut ent_types = Vec::new();
             let mut ent_patterns = Vec::new();
             let mut ent_unrestricted = false;
+            // an info that names no type admits every type; ent_types empty
+            // is how every reader of it spells "no type restriction"
+            let mut any_type = false;
             for info in &infos {
-                let props = info.get("propertyNames").and_then(Value::as_array);
-                let rels = info.get("relationshipNames").and_then(Value::as_array);
-                if props.is_none() && rels.is_none() {
-                    attrs = None; // an unscoped info covers everything
-                } else if let Some(list) = &mut attrs {
-                    for src in [props, rels].into_iter().flatten() {
-                        list.extend(src.iter().filter_map(Value::as_str).map(str::to_owned));
+                // TS 104 175 9.4.2: attributeNames, else the deprecated pair
+                match antares_model::registration_attribute_names(info) {
+                    None => attrs = None, // an unscoped info covers everything
+                    Some(names) => {
+                        if let Some(list) = &mut attrs {
+                            list.extend(names.into_iter().map(str::to_owned));
+                        }
                     }
                 }
                 if let Some(es) = info.get("entities").and_then(Value::as_array) {
@@ -599,13 +603,17 @@ pub async fn matching_regs(
                             Some(Value::String(t)) => ent_types.push(t.clone()),
                             Some(Value::Array(ts)) => ent_types
                                 .extend(ts.iter().filter_map(Value::as_str).map(str::to_owned)),
-                            _ => {}
+                            _ => any_type = true,
                         }
                     }
                 } else {
                     // an attributes-only RegistrationInfo imposes no id scope
                     ent_unrestricted = true;
+                    any_type = true;
                 }
+            }
+            if any_type {
+                ent_types.clear();
             }
             let tenant = doc.get("tenant").and_then(Value::as_str).map(str::to_owned);
             let csi = csi_of(doc);
@@ -653,6 +661,21 @@ fn op_set(r: &FedReg) -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
+fn same_entity_scope(a: &FedReg, b: &FedReg) -> bool {
+    a.ent_ids == b.ent_ids
+        && a.ent_types == b.ent_types
+        && a.ent_patterns == b.ent_patterns
+        && a.ent_unrestricted == b.ent_unrestricted
+}
+
+fn covers_everything(r: &FedReg) -> bool {
+    r.attrs.is_none()
+        && r.ent_types.is_empty()
+        && r.ent_ids.is_empty()
+        && r.ent_patterns.is_empty()
+        && r.ent_unrestricted
+}
+
 /// Registrations naming the same Context Source (same endpoint, mode,
 /// tenant, contextSourceAlias, contextSourceInfo, localOnly) fold into ONE
 /// forwarded request (5.2.9: the alias identifies a source, so a different
@@ -671,6 +694,12 @@ fn op_set(r: &FedReg) -> std::collections::BTreeSet<&'static str> {
 /// itself twice with different operation lists and both lists cover the
 /// operation at hand; 4.5.5 merges the two answers by Entity id, so the
 /// caller sees the same data either way.
+///
+/// For the same reason they fold only when the union is exact: (Vehicle ×
+/// all) and (OffStreetParking × two attributes) would fold to
+/// (both types × all), and the source's whole OffStreetParking would be
+/// imported (ETSI IOP_003_02_02). Equal attribute scopes, equal entity
+/// scopes, or one side covering everything keep the union exact.
 fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
     let mut out: Vec<(FedReg, std::collections::BTreeSet<&'static str>)> = Vec::new();
     for r in regs {
@@ -683,6 +712,10 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
                 && o.csi == r.csi
                 && o.local_only == r.local_only
                 && *o_ops == ops
+                && (o.attrs == r.attrs
+                    || same_entity_scope(o, &r)
+                    || covers_everything(o)
+                    || covers_everything(&r))
         });
         let Some((o, _)) = same else {
             out.push((r, ops));
@@ -700,7 +733,11 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
             _ => None,
         };
         o.ent_ids.extend(r.ent_ids);
-        o.ent_types.extend(r.ent_types);
+        if o.ent_types.is_empty() || r.ent_types.is_empty() {
+            o.ent_types.clear(); // either side admits every type
+        } else {
+            o.ent_types.extend(r.ent_types);
+        }
         o.ent_patterns.extend(r.ent_patterns);
         o.ent_unrestricted |= r.ent_unrestricted;
     }
@@ -714,6 +751,10 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
 /// contentType, jsonldContext, ngsildConformance) are TRANSFORMED by
 /// `forward` rather than passed through raw, which would corrupt
 /// negotiation instead.
+/// Headers that carry the triggering caller's own credential: never copied
+/// from the request by a `urn:ngsi-ld:request` contextSourceInfo entry.
+const REQUEST_CREDENTIALS: &[&str] = &["authorization", "proxy-authorization", "cookie"];
+
 const CSI_SKIP: &[&str] = &[
     "ngsild-tenant",
     "content-length",
@@ -745,7 +786,7 @@ async fn read_body_capped(resp: reqwest::Response) -> Value {
         loop {
             match resp.chunk().await {
                 Ok(Some(c)) => {
-                    if buf.len() + c.len() > cap {
+                    if buf.len().saturating_add(c.len()) > cap {
                         tracing::warn!("federation response over the {cap}-byte cap, skipped");
                         return Value::Null;
                     }
@@ -808,16 +849,13 @@ where
 /// segment stops at the next `/`, so `/attrs/{name}/value` and
 /// `/attrs/{name}/{instanceId}` both name `{name}` and nothing more.
 fn path_attr_segment(url: &str) -> Option<(std::ops::Range<usize>, String)> {
-    let path_end = url.find('?').unwrap_or(url.len());
-    let at = url[..path_end].find("/attrs/")? + "/attrs/".len();
-    let rest = &url[at..path_end];
-    let end = at + rest.find('/').unwrap_or(rest.len());
-    (end > at).then(|| {
-        (
-            at..end,
-            crate::negotiate::percent_decode(&url.as_bytes()[at..end]),
-        )
-    })
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let (before, rest) = path.split_once("/attrs/")?;
+    let name = rest.split_once('/').map_or(rest, |(name, _)| name);
+    // `before` and "/attrs/" are a prefix of `url`, so the range lies inside it
+    let at = before.len().checked_add("/attrs/".len())?;
+    let end = at.checked_add(name.len())?;
+    (!name.is_empty()).then(|| (at..end, crate::negotiate::percent_decode(name.as_bytes())))
 }
 
 /// Table 5.2.9-2 and 5.2.34: one forward's outcome, booked on the
@@ -853,56 +891,273 @@ async fn note_forward(st: &AppState, tenant: &TenantId, reg: &FedReg, ok: bool) 
     }
 }
 
+/// One forward's answer: the status, the body (`Null` when there is none
+/// or it does not parse), and the `NGSILD-Warning` values the source sent.
+pub type ForwardAnswer = (u16, Value, Vec<String>);
+
+/// The answer a [`ForwardTransport`] is working on.
+pub type ForwardFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ForwardAnswer> + Send + 'a>>;
+
+/// A transport that serves some forwards without a socket (the forward
+/// transport seam). Every distributed operation reaches
+/// it through `federation::forward`, after the request is built and before the
+/// egress check; vanilla registers none
+/// ([`AppState::with_forward_transport`]).
+pub trait ForwardTransport: Send + Sync {
+    /// `Some(answer)` when this transport serves `req`; `None` sends it over
+    /// HTTP as before. The 5.2.34 cooldown and timeout, the bookkeeping of
+    /// Table 5.2.9-2 and the cap on the source's warnings apply to the
+    /// answer as they do over HTTP; the egress guard and the breaker do
+    /// not, since no socket is opened.
+    fn forward<'a>(&'a self, req: BuiltForward<'a>) -> Option<ForwardFuture<'a>>;
+
+    /// Whether Tenant `source` may store a registration whose forwards go
+    /// to `endpoint` in Tenant `target` (`None`: the default Tenant), asked
+    /// at 12.2.2 and 12.2.4 before anything is stored.
+    /// `Ok` for an endpoint this transport does not serve: its forwards go
+    /// over HTTP, as before. `Err` carries the reason of the 403.
+    fn admit<'a>(
+        &'a self,
+        _source: &'a TenantId,
+        _endpoint: &'a str,
+        _target: Option<&'a str>,
+    ) -> AdmitFuture<'a> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    /// Whether this transport delivers the notifications sent to `uri`.
+    /// Such a delivery opens no socket, so the egress
+    /// guard and the breaker do not judge it; `false` leaves it to the
+    /// binding of the URI's scheme, as before.
+    fn notifies(&self, _uri: &str) -> bool {
+        false
+    }
+
+    /// One attempt to deliver `notification`, which a Subscription of
+    /// Tenant `tenant` sends to `uri`, an endpoint [`Self::notifies`] took.
+    /// `Err` carries why it failed: a failed attempt under the 5.8.6 retry
+    /// and dead-letter policy, as an HTTP one is. No subject is carried:
+    /// delivery is broker-initiated (ADR-0020).
+    fn notify<'a>(
+        &'a self,
+        _tenant: &'a TenantId,
+        _uri: &'a str,
+        _notification: &'a Value,
+    ) -> NotifyFuture<'a> {
+        Box::pin(std::future::ready(Err(
+            "this transport delivers no notification".into(),
+        )))
+    }
+}
+
+/// What [`ForwardTransport::notify`] answers.
+pub type NotifyFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// What [`ForwardTransport::admit`] answers.
+pub type AdmitFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// The registered transport's [`ForwardTransport::admit`] for the
+/// registration document `doc` of `tenant`; `Ok` without a transport.
+pub(crate) async fn admit_registration(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &serde_json::Map<String, Value>,
+) -> Result<(), crate::policy::Denied> {
+    let (Some(transport), Some(endpoint)) = (
+        st.forward_transport.get(),
+        doc.get("endpoint").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    let target = doc.get("tenant").and_then(Value::as_str);
+    transport
+        .admit(tenant, endpoint, target)
+        .await
+        .map_err(crate::policy::Denied)
+}
+
+/// The request `federation::forward` built, as the HTTP client would send it: a
+/// transport reads it and cannot change what is sent, only how.
+#[derive(Clone)]
+pub struct BuiltForward<'a> {
+    method: reqwest::Method,
+    url: String,
+    query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+    tenant: &'a TenantId,
+    reg: &'a FedReg,
+    subject: HeaderMap,
+}
+
+impl BuiltForward<'_> {
+    /// The method.
+    #[must_use]
+    pub fn method(&self) -> &reqwest::Method {
+        &self.method
+    }
+
+    /// The URL on the registration's endpoint, without the query.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The URL with the query encoded as the HTTP client encodes it, or
+    /// `None` when the URL does not parse (the HTTP client refuses it too).
+    #[must_use]
+    pub fn target(&self) -> Option<String> {
+        let mut url = reqwest::Url::parse(&self.url).ok()?;
+        if !self.query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&self.query);
+        }
+        Some(url.into())
+    }
+
+    /// The query parameters, in order.
+    #[must_use]
+    pub fn query(&self) -> &[(String, String)] {
+        &self.query
+    }
+
+    /// The headers, in the order they are sent: `Accept`, `Via`, `Link`,
+    /// `NGSILD-Tenant`, the 4.3.6.5 `contextSourceInfo` ones, `Content-Type`.
+    #[must_use]
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// The payload, serialized.
+    #[must_use]
+    pub fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
+
+    /// The forwarding Tenant: the one the triggering request ran in.
+    #[must_use]
+    pub fn tenant(&self) -> &TenantId {
+        self.tenant
+    }
+
+    /// The registration this forward is made for.
+    #[must_use]
+    pub fn registration_id(&self) -> &str {
+        &self.reg.reg_id
+    }
+
+    /// Whether the registration is the `exclusive` or `redirect` kind
+    /// (9.3.3), whose single failure is the operation's answer (6.3.17).
+    #[must_use]
+    pub fn proxied(&self) -> bool {
+        self.reg.is_proxy()
+    }
+
+    /// The registration's 5.2.9 `tenant`: the Tenant the forward targets,
+    /// `None` for the default Tenant (4.14).
+    #[must_use]
+    pub fn registration_tenant(&self) -> Option<&str> {
+        self.reg.tenant.as_deref()
+    }
+
+    /// The policy subject headers of the triggering request (ADR-0020):
+    /// never on the wire, for a transport that asks the target's engine
+    /// about the caller in process.
+    #[must_use]
+    pub fn subject(&self) -> &HeaderMap {
+        &self.subject
+    }
+}
+
+/// 5.2.34 cooldown (per REGISTRATION, distinct from the host:port breaker):
+/// inside the declared window "a timeout error response for the
+/// registration is automatically returned" — the source is not contacted.
+fn in_cooldown(st: &AppState, tenant: &TenantId, reg: &FedReg) -> bool {
+    reg.cooldown_ms.is_some_and(|cd| {
+        st.egress
+            .reg_in_cooldown(&crate::egress::reg_key(tenant.as_str(), &reg.reg_id), cd)
+    })
+}
+
+/// 5.2.34 timeout: the per-registration budget, below the 8 s ceiling.
+fn deadline_ms(reg: &FedReg) -> u32 {
+    let ceiling = crate::state::slow_factor().saturating_mul(8_000);
+    reg.timeout_ms.map_or(ceiling, |t| t.min(ceiling)) as u32
+}
+
+/// `fut`, or `None` once `ms` have passed.
+#[cfg(not(target_arch = "wasm32"))]
+async fn within<T>(ms: u32, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(std::time::Duration::from_millis(u64::from(ms)), fut)
+        .await
+        .ok()
+}
+
+/// The browser timer is not Send, so the wait is one Send unit, as an
+/// HTTP interaction is.
+#[cfg(target_arch = "wasm32")]
+async fn within<T>(ms: u32, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    antares_jsonld::http_interaction(antares_jsonld::io_deadline(fut, ms)).await
+}
+
 /// One forwarded request. `body` is compacted JSON (no @context member).
+/// The registered [`ForwardTransport`] is asked first; without one, or
+/// when it does not serve this forward, it goes over HTTP.
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 pub async fn forward(
     st: &AppState,
     method: reqwest::Method,
-    mut url: String,
+    url: String,
     query: &[(String, String)],
     headers: &HeaderMap,
     tenant: &TenantId,
     reg: &FedReg,
     ctx_url: &str,
-    mut body: Option<Value>,
-) -> (u16, Value, Vec<String>) {
-    // 6.3.17: NGSILD-Warning values received from the peer are returned to
-    // the caller — abnormal behaviour detected downstream in a cascade
-    // (4.3.6.4) must surface on the aggregated response, not vanish here.
+    body: Option<Value>,
+) -> ForwardAnswer {
     // Process-wide slot first (bounds::MAX_FED_INFLIGHT): the buffers and
     // connections below exist only while a slot is held.
     let _slot = crate::bounds::FED_INFLIGHT.acquire().await;
-    // One policy for every outbound class — scheme allowlist,
-    // private-range deny, per-destination circuit breaker.
-    if let Err(e) = st.egress.check_url(&url).await {
-        // 5.2.9 allows any URI as the registered endpoint, and a URI's
-        // authority may carry credentials reqwest sends as basic auth, so a
-        // peer URL loses its userinfo on the way into the log.
-        tracing::warn!(
-            "federation forward to {} refused: {e}",
-            antares_notifier::redact_userinfo(&url)
-        );
-        return (502, Value::Null, Vec::new());
+    let built = build_forward(st, method, url, query, headers, tenant, reg, ctx_url, body).await;
+    if let Some(answer) = ask_transport(st, &built).await {
+        return answer;
     }
-    if st.egress.is_open(tenant.as_str(), &url) {
-        tracing::debug!(
-            "federation forward to {} short-circuited (breaker open)",
-            antares_notifier::redact_userinfo(&url)
-        );
-        return (503, Value::Null, Vec::new());
+    send_http(st, built).await
+}
+
+/// The forward through the registered transport, or `None` when there is
+/// none or it does not serve this one.
+async fn ask_transport(st: &AppState, built: &BuiltForward<'_>) -> Option<ForwardAnswer> {
+    let answer = st.forward_transport.get()?.forward(built.clone())?;
+    let (tenant, reg) = (built.tenant, built.reg);
+    if in_cooldown(st, tenant, reg) {
+        return Some((504, Value::Null, Vec::new()));
     }
-    // 5.2.34 cooldown (per REGISTRATION, distinct from the host:port
-    // breaker): inside the declared window "a timeout error response for
-    // the registration is automatically returned" — the source is not
-    // contacted.
-    if let Some(cd) = reg.cooldown_ms {
-        if st
-            .egress
-            .reg_in_cooldown(&crate::egress::reg_key(tenant.as_str(), &reg.reg_id), cd)
-        {
-            return (504, Value::Null, Vec::new());
-        }
-    }
+    let Some((status, body, mut warnings)) = within(deadline_ms(reg), answer).await else {
+        note_forward(st, tenant, reg, false).await;
+        return Some((504, Value::Null, Vec::new()));
+    };
+    warnings.truncate(crate::bounds::MAX_PEER_WARNINGS);
+    note_forward(st, tenant, reg, (200..300).contains(&status)).await;
+    Some((status, body, warnings))
+}
+
+/// The request one forward sends: the 4.3.6.6 processing, the headers and
+/// the payload, exactly as the HTTP client puts them on the wire.
+#[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
+async fn build_forward<'a>(
+    st: &AppState,
+    method: reqwest::Method,
+    mut url: String,
+    query: &[(String, String)],
+    headers: &HeaderMap,
+    tenant: &'a TenantId,
+    reg: &'a FedReg,
+    ctx_url: &str,
+    mut body: Option<Value>,
+) -> BuiltForward<'a> {
     // 4.3.6.6: the four contextSourceInfo keys with processing
     // semantics. Values were validated at registration time (5.9.2).
     let csi_get = |key: &str| {
@@ -1086,22 +1341,18 @@ pub async fn forward(
     } else {
         None
     };
-    let mut req = st
-        .fed_http
-        .request(method, &url)
-        .header("Accept", accept)
-        .header(
-            "Via",
+    let mut sent: Vec<(String, String)> = vec![
+        ("Accept".into(), accept.to_owned()),
+        (
+            "Via".into(),
             outbound_via(headers, &alias_for(&st.host_alias, tenant)),
-        );
+        ),
+    ];
     if inline_ctx.is_none() {
-        req = req.header(
-            "Link",
+        sent.push((
+            "Link".into(),
             format!("<{link_ctx}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\""),
-        );
-    }
-    if !query.is_empty() {
-        req = req.query(&query);
+        ));
     }
     // 4.14: "the Tenant information from the Context Source Registration has
     // to be used. If no Tenant information is present in the Context Source
@@ -1109,7 +1360,7 @@ pub async fn forward(
     // Tenant is targeted" — the requesting tenant never flows through; 6.3.14
     // omits the header for the default Tenant.
     if let Some(peer_tenant) = reg.tenant.as_deref().filter(|t| *t != "default") {
-        req = req.header("NGSILD-Tenant", peer_tenant);
+        sent.push(("NGSILD-Tenant".into(), peer_tenant.to_owned()));
     }
     // 4.3.6.5 contextSourceInfo ⇒ extra headers; the special value
     // "urn:ngsi-ld:request" copies the header from the triggering request
@@ -1135,6 +1386,17 @@ pub async fn forward(
             continue;
         }
         let val = if v == "urn:ngsi-ld:request" {
+            // the triggering request's own credential is the
+            // caller's, not the registrant's: copying it would hand every
+            // caller's token or session to whoever registered the source.
+            // A value the registration states itself is its own and goes.
+            if REQUEST_CREDENTIALS.contains(&lower.as_str()) {
+                tracing::warn!(
+                    "registration {} asks for the request's credential header {k:?}; not forwarded",
+                    reg.reg_id
+                );
+                continue;
+            }
             match headers.get(k.as_str()).and_then(|h| h.to_str().ok()) {
                 Some(h) => h.to_owned(),
                 None => continue,
@@ -1142,8 +1404,9 @@ pub async fn forward(
         } else {
             v.clone()
         };
-        req = req.header(k.as_str(), val);
+        sent.push((k.clone(), val));
     }
+    let mut bytes = None;
     if let Some(mut b) = body {
         // 4.3.6.6 "contentType": provide request + @context as the MIME type
         // requires — ld+json carries the context inline. When "jsonldContext"
@@ -1157,16 +1420,86 @@ pub async fn forward(
             if let Some(o) = b.as_object_mut() {
                 o.insert("@context".into(), ic.clone());
             }
-            req = req.header("Content-Type", "application/ld+json");
+            sent.push(("Content-Type".into(), "application/ld+json".into()));
         } else if want_ld {
             if let Some(o) = b.as_object_mut() {
                 o.insert("@context".into(), Value::String(link_ctx.clone()));
             }
-            req = req.header("Content-Type", "application/ld+json");
+            sent.push(("Content-Type".into(), "application/ld+json".into()));
         } else {
-            req = req.header("Content-Type", "application/json");
+            sent.push(("Content-Type".into(), "application/json".into()));
         }
-        req = req.body(serde_json::to_vec(&b).unwrap_or_default());
+        bytes = Some(serde_json::to_vec(&b).unwrap_or_default());
+    }
+    let mut subject = HeaderMap::new();
+    for name in crate::policy::SUBJECT_HEADERS.iter() {
+        let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        for v in headers.get_all(&name) {
+            subject.append(name.clone(), v.clone());
+        }
+    }
+    BuiltForward {
+        method,
+        url,
+        query,
+        headers: sent,
+        body: bytes,
+        tenant,
+        reg,
+        subject,
+    }
+}
+
+/// One forward over HTTP: the egress policy, the breaker and the cooldown
+/// first, then the request `built` describes.
+async fn send_http(st: &AppState, built: BuiltForward<'_>) -> ForwardAnswer {
+    let BuiltForward {
+        method,
+        url,
+        query,
+        headers: sent,
+        body,
+        tenant,
+        reg,
+        ..
+    } = built;
+    // 6.3.17: NGSILD-Warning values received from the peer are returned to
+    // the caller — abnormal behaviour detected downstream in a cascade
+    // (4.3.6.4) must surface on the aggregated response, not vanish here.
+    // One policy for every outbound class — scheme allowlist,
+    // private-range deny, per-destination circuit breaker.
+    if let Err(e) = st.egress.check_url(&url).await {
+        // 5.2.9 allows any URI as the registered endpoint, and a URI's
+        // authority may carry credentials reqwest sends as basic auth, so a
+        // peer URL loses its userinfo on the way into the log.
+        tracing::warn!(
+            "federation forward to {} refused: {e}",
+            antares_notifier::redact_userinfo(&url)
+        );
+        return (502, Value::Null, Vec::new());
+    }
+    if st.egress.is_open(tenant.as_str(), &url) {
+        tracing::debug!(
+            "federation forward to {} short-circuited (breaker open)",
+            antares_notifier::redact_userinfo(&url)
+        );
+        return (503, Value::Null, Vec::new());
+    }
+    // 5.2.34 cooldown: the source is not contacted.
+    if in_cooldown(st, tenant, reg) {
+        return (504, Value::Null, Vec::new());
+    }
+    let mut req = st.fed_http.request(method, &url);
+    for (k, v) in &sent {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if !query.is_empty() {
+        req = req.query(&query);
+    }
+    if let Some(b) = body {
+        req = req.body(b);
     }
     // The whole HTTP interaction is one Send unit (http_interaction) so
     // the handler futures above stay Send on wasm32 too.
@@ -1177,8 +1510,7 @@ pub async fn forward(
         // 5.2.34 timeout bounds the forward below the 8 s ceiling.
         // Natively io_deadline is a passthrough (the client owns the 8 s
         // default), so the per-registration budget rides on the request.
-        let ceiling = 8_000 * crate::state::slow_factor();
-        let deadline: u32 = reg.timeout_ms.map_or(ceiling, |t| t.min(ceiling)) as u32;
+        let deadline = deadline_ms(reg);
         #[cfg(not(target_arch = "wasm32"))]
         let req = req.timeout(std::time::Duration::from_millis(deadline as u64));
         let sent = antares_jsonld::io_deadline(req.send(), deadline).await;
@@ -1281,12 +1613,27 @@ fn scope_attrs(reg: &FedReg, ctx: &Context) -> Option<(String, String)> {
 /// winner would be arrival order.
 fn temporal_window(params: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut query: Vec<(String, String)> = vec![("options".into(), "sysAttrs".into())];
-    for k in ["timerel", "timeAt", "endTimeAt", "timeproperty", "lastN"] {
+    for k in ["timerel", "timeAt", "endTimeAt", "timeproperty"] {
         if let Some(v) = params.get(k) {
             query.push((k.into(), v.clone()));
         }
     }
+    query.extend(instance_cap(params));
     query
+}
+
+/// firstN/lastN forwarded to a peer: every instance up to the end of the
+/// asked page, never offsetN. The merged evolution is paged here, so a peer
+/// that skipped offsetN itself would have this broker skip them twice.
+fn instance_cap(params: &HashMap<String, String>) -> Option<(String, String)> {
+    let offset: usize = params
+        .get("offsetN")
+        .and_then(|o| o.parse().ok())
+        .unwrap_or(0);
+    ["firstN", "lastN"].into_iter().find_map(|k| {
+        let n: usize = params.get(k)?.parse().ok()?;
+        Some((k.to_owned(), n.saturating_add(offset).to_string()))
+    })
 }
 
 /// 5.2.9 `attrs` again, on the way back: the scope narrows ATTRIBUTES, so the
@@ -1375,29 +1722,21 @@ fn local_only_of(reg: &Value) -> bool {
 /// `forward` (endpoint/tenant/csi/alias) and `supports`.
 /// 4.3.6.6 contextSourceInfo, as the key/value pairs a forward applies.
 fn csi_of(reg: &Value) -> Vec<(String, String)> {
-    reg.get("contextSourceInfo")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|kv| {
-                    Some((
-                        kv.get("key")?.as_str()?.to_owned(),
-                        kv.get("value")?.as_str()?.to_owned(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::notify::kv_pairs(reg.get("contextSourceInfo"))
+}
+
+/// A registration's endpoint without a trailing `/` or the API root it may name
+/// (`…/ngsi-ld/v1`), so a forward URL never doubles the prefix (IOP fixtures).
+pub(crate) fn endpoint_base(endpoint: &str) -> String {
+    let e = endpoint.trim_end_matches('/');
+    e.strip_suffix("/ngsi-ld/v1").unwrap_or(e).to_owned()
 }
 
 pub(crate) fn fed_reg_of(reg_id: &str, reg: &Value) -> FedReg {
     let endpoint = reg
         .get("endpoint")
         .and_then(Value::as_str)
-        .map(|e| {
-            let e = e.trim_end_matches('/');
-            e.strip_suffix("/ngsi-ld/v1").unwrap_or(e).to_owned()
-        })
+        .map(endpoint_base)
         .unwrap_or_default();
     FedReg {
         reg_id: reg_id.to_owned(),
@@ -1479,6 +1818,7 @@ pub async fn fed_retrieve_temporal(
     params: &HashMap<String, String>,
     map: Option<&Value>,
     warnings: &mut Vec<String>,
+    proxies: &mut Vec<FedReg>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
     let spec = crate::registry::CsrSpec {
         ids: Some(vec![id.to_owned()]),
@@ -1489,8 +1829,9 @@ pub async fn fed_retrieve_temporal(
     };
     let ctx_url = ctx_link_url(headers, &ctx.source);
     let ctx_url = &ctx_url;
-    let regs: Vec<FedReg> = matching_regs(st, tenant, &spec, ctx, headers)
-        .await?
+    let matched = matching_regs(st, tenant, &spec, ctx, headers).await?;
+    proxies.extend(matched.iter().filter(|r| r.is_proxy()).cloned());
+    let regs: Vec<FedReg> = matched
         .into_iter()
         // 5.7.3.4: a live EntityMap in use is the ONLY source of matching
         // registrations; its linked map location travels with the forward.
@@ -1541,16 +1882,18 @@ pub async fn fed_retrieve_temporal(
     Ok(out)
 }
 
-/// The DateTime 4.5.5.3 arbitrates on, as a comparable key: 4.6.3 admits the
+/// The rank 4.5.5.3 arbitrates on: TS 104 175 8.5.3 has any instance with
+/// an observedAt take precedence over every instance without one, the most
+/// recent observedAt among them; modifiedAt decides only between instances
+/// that observed nothing. The DateTime is a comparable key: 4.6.3 admits the
 /// same instant with or without a fraction, so a raw string compare would
 /// rank `…:01.500Z` below `…:01Z`.
-fn recency(inst: &Value) -> String {
-    antares_model::dt_key(
-        inst.get("observedAt")
-            .or_else(|| inst.get("modifiedAt"))
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    )
+fn recency(inst: &Value) -> (bool, String) {
+    let at = |k| inst.get(k).and_then(Value::as_str);
+    match at("observedAt") {
+        Some(observed) => (true, antares_model::dt_key(observed)),
+        None => (false, antares_model::dt_key(at("modifiedAt").unwrap_or(""))),
+    }
 }
 
 /// 4.5.5.2 Processing of Conflicting Transient Entities: for each received
@@ -1665,7 +2008,9 @@ pub fn merge_docs(base: &mut Value, add: &Value, aux: bool) {
 // ---------- distributed reads ----------
 
 /// Federated retrieve: internal docs from every matching registration,
-/// (aux, doc) pairs so callers can order the merge.
+/// (aux, doc) pairs so callers can order the merge. `sole_failure` receives
+/// the failed answer when the one registration asked is exclusive or
+/// redirect: 6.3.17 p.278 gives that single source its own error statuses.
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 pub async fn fed_retrieve(
     st: &AppState,
@@ -1676,6 +2021,7 @@ pub async fn fed_retrieve(
     map: Option<&Value>,
     except_reg: Option<&str>,
     warnings: &mut Vec<String>,
+    sole_failure: &mut Option<Part>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
     let spec = crate::registry::CsrSpec {
         ids: Some(vec![id.to_owned()]),
@@ -1764,8 +2110,22 @@ pub async fn fed_retrieve(
     })
     .await;
     let mut out = Vec::new();
+    let single = fetched.len() == 1;
     for (reg, status, body, peer_warns) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
+            if single && reg.is_proxy() {
+                *sole_failure = Some(Part {
+                    status,
+                    detail: format!(
+                        "distributed operation to registration {} returned {status}",
+                        reg.reg_id
+                    ),
+                    registration: Some(reg.reg_id.clone()),
+                    proxy: true,
+                    update: None,
+                    conflict: false,
+                });
+            }
             continue;
         }
         let candidates: Vec<&Value> = match &body {
@@ -1877,6 +2237,19 @@ fn admits_import(reg: &FedReg, spec: &crate::registry::CsrSpec, id: &str) -> boo
             .is_some_and(|p| antares_ql::regex::compile(p).is_ok_and(|re| re.find(id).is_some()))
 }
 
+/// Whether a query parameter travels on a forward. A narrowed `q` (the
+/// caller's joined with a policy's, `antares_ql::parse_narrowed_q`) can be
+/// past the caps a peer counts it with, `antares_ql::parse_q`'s; the peer's
+/// TooComplexQuery would then tell the caller that a policy predicate is
+/// there and how large (threat V23). Such a `q` stays home: the
+/// local re-check applies it to the aggregate (5.7.2.4, 5.7.4.4), as it
+/// does for split entities.
+// The peer is modelled with our own caps; a peer with smaller ones
+// can still refuse the conjunction. Forward only the caller's own q then.
+fn forwardable(k: &str, v: &str) -> bool {
+    k != "q" || antares_ql::parse_q(v).is_ok()
+}
+
 pub async fn fed_query(
     st: &AppState,
     tenant: &TenantId,
@@ -1943,6 +2316,7 @@ pub async fn fed_query(
             push_filters
                 .then(|| params.get(k))
                 .flatten()
+                .filter(|v| forwardable(k, v))
                 .map(String::to_owned)
         };
         let (status, body, peer_warns) = if op == "queryBatch" {
@@ -2067,9 +2441,12 @@ pub async fn fed_query(
         if let Value::Array(a) = &body {
             // Scope gate — see admits_import.
             for c in a.iter().filter(|c| {
-                c.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|i| admits_import(&reg, &spec, i))
+                // 4.3.6.1: a type outside the registration's EntityInfo is
+                // not this source's data, whatever the client asked for
+                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+                    && c.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| admits_import(&reg, &spec, i))
             }) {
                 match import_entity(c, &reg, ctx) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
@@ -2109,6 +2486,14 @@ pub(crate) async fn fed_entity_maps(
         .into_iter()
         .filter(|reg| reg.supports(op))
         .collect();
+    // a narrowed q the peer's caps refuse stays home, and the map the peer
+    // answers without it is narrowed here
+    let held_back = params
+        .get("q")
+        .filter(|q| !split && !forwardable("q", q))
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?;
+    let held_back = &held_back;
     let fetched = fan_out(regs, move |reg| async move {
         let mut query: Vec<(String, String)> = Vec::new();
         for k in [
@@ -2119,12 +2504,12 @@ pub(crate) async fn fed_entity_maps(
             "timeAt",
             "endTimeAt",
             "timeproperty",
-            "lastN",
         ] {
             if let Some(v) = params.get(k) {
                 query.push((k.to_owned(), v.clone()));
             }
         }
+        query.extend(instance_cap(params));
         if !split {
             for k in [
                 "attrs",
@@ -2136,12 +2521,12 @@ pub(crate) async fn fed_entity_maps(
                 "scopeQ",
                 "lang",
             ] {
-                if let Some(v) = params.get(k) {
+                if let Some(v) = params.get(k).filter(|v| forwardable(k, v)) {
                     query.push((k.to_owned(), v.clone()));
                 }
             }
         }
-        let (status, body, _) = forward(
+        let (status, mut body, _) = forward(
             st,
             reqwest::Method::GET,
             format!("{}/ngsi-ld/v1/{path}", reg.endpoint),
@@ -2153,6 +2538,16 @@ pub(crate) async fn fed_entity_maps(
             None,
         )
         .await;
+        if let Some(q) = held_back.as_ref().filter(|_| (200..300).contains(&status)) {
+            let peer = Peer {
+                st,
+                tenant,
+                headers,
+                ctx_url,
+                reg: &reg,
+            };
+            narrow_map_ids(peer, ctx, params.get("type"), q, &mut body).await;
+        }
         (reg, status, body)
     })
     .await;
@@ -2165,6 +2560,83 @@ pub(crate) async fn fed_entity_maps(
     Ok(out)
 }
 
+/// What every forward to one registered peer shares.
+struct Peer<'a> {
+    st: &'a AppState,
+    tenant: &'a TenantId,
+    headers: &'a HeaderMap,
+    ctx_url: &'a str,
+    reg: &'a FedReg,
+}
+
+/// A peer's EntityMap asked without a narrowed `q` its caps refuse (
+/// threat V23): the ids it lists are a superset of the narrowing's, and the
+/// map is served to the caller, so each id stays only when the peer's own
+/// Entity is selected by `q` here. The Entities are read from the same peer
+/// by id, as Query Entities forwards them; a linked path does not resolve,
+/// so it never holds, and a peer that cannot be read contributes no id.
+async fn narrow_map_ids(
+    peer: Peer<'_>,
+    ctx: &Context,
+    type_param: Option<&String>,
+    q: &antares_ql::QNode,
+    body: &mut Value,
+) {
+    let Peer {
+        st,
+        tenant,
+        headers,
+        ctx_url,
+        reg,
+    } = peer;
+    // One read per 100 ids, sequential; a peer map is capped at
+    // the broker's limit, so this is a few reads at most
+    const CHUNK: usize = 100;
+    let Some(map) = body.get_mut("entityMap").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let listed: Vec<String> = map.keys().cloned().collect();
+    let mut kept = std::collections::HashSet::new();
+    if reg.query_op().is_some() {
+        for ids in listed.chunks(CHUNK) {
+            let mut query = vec![
+                ("id".to_owned(), ids.join(",")),
+                ("limit".to_owned(), ids.len().to_string()),
+            ];
+            if let Some(t) = type_param {
+                query.push(("type".to_owned(), t.clone()));
+            }
+            let (status, found, _) = forward(
+                st,
+                reqwest::Method::GET,
+                format!("{}/ngsi-ld/v1/entities", reg.endpoint),
+                &query,
+                headers,
+                tenant,
+                reg,
+                ctx_url,
+                None,
+            )
+            .await;
+            if !(200..300).contains(&status) {
+                continue;
+            }
+            for e in found.as_array().into_iter().flatten() {
+                let Some(id) = e.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if ids.iter().any(|i| i == id)
+                    && import_entity(e, reg, ctx)
+                        .is_some_and(|doc| antares_ql::eval::eval_q(q, &doc, ctx, &|_| None))
+                {
+                    kept.insert(id.to_owned());
+                }
+            }
+        }
+    }
+    map.retain(|id, _| kept.contains(id));
+}
+
 /// 5.7.4.4: forward the temporal query to matching registrations that
 /// support the queryTemporal operation; registrations without it are not
 /// contacted. Returns (auxiliary, expanded doc) pairs.
@@ -2175,6 +2647,7 @@ pub async fn fed_query_temporal(
     ctx: &Context,
     params: &HashMap<String, String>,
     warnings: &mut Vec<String>,
+    proxies: &mut Vec<FedReg>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
     let mut spec = query_spec(ctx, params);
     spec.temporal = crate::temporalq::TemporalQ::from_params(params, false)
@@ -2182,8 +2655,9 @@ pub async fn fed_query_temporal(
         .flatten();
     let ctx_url = ctx_link_url(headers, &ctx.source);
     let ctx_url = &ctx_url;
-    let regs: Vec<FedReg> = matching_regs(st, tenant, &spec, ctx, headers)
-        .await?
+    let matched = matching_regs(st, tenant, &spec, ctx, headers).await?;
+    proxies.extend(matched.iter().filter(|r| r.is_proxy()).cloned());
+    let regs: Vec<FedReg> = matched
         .into_iter()
         .filter(|reg| reg.supports("queryTemporal"))
         .collect();
@@ -2207,7 +2681,7 @@ pub async fn fed_query_temporal(
                 "geoproperty",
                 "scopeQ",
             ] {
-                if let Some(v) = params.get(k) {
+                if let Some(v) = params.get(k).filter(|v| forwardable(k, v)) {
                     query.push((k.into(), v.clone()));
                 }
             }
@@ -2240,9 +2714,12 @@ pub async fn fed_query_temporal(
         if let Value::Array(a) = &body {
             // Same scope gate as the non-temporal query fan-out.
             for c in a.iter().filter(|c| {
-                c.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|i| admits_import(&reg, &spec, i))
+                // 4.3.6.1: a type outside the registration's EntityInfo is
+                // not this source's data, whatever the client asked for
+                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+                    && c.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| admits_import(&reg, &spec, i))
             }) {
                 match import_temporal(c, &reg, ctx) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
@@ -2295,71 +2772,170 @@ pub fn merge_candidates(local: Vec<Value>, fed: Vec<(bool, Value)>) -> Vec<Value
 // ---------- distributed writes ----------
 
 /// Outcome of one part of a distributed write.
+#[derive(Clone, Debug, Default)]
 pub struct Part {
+    /// The status the local write or the source answered.
     pub status: u16,
     pub detail: String,
+    /// 5.2.17 BatchEntityError registrationId: the Context Source
+    /// Registration a forwarded part went to; `None` for the local part.
+    pub registration: Option<String>,
+    /// The part went to an exclusive or redirect registration (6.3.17).
+    pub proxy: bool,
+    /// A source's 207 UpdateResult (5.2.18), Attribute names expanded.
+    pub update: Option<RemoteUpdate>,
+    /// An exclusive registration refused the operation ([`conflict_part`]): a 409 Conflict, not
+    /// AlreadyExists.
+    pub conflict: bool,
+}
+
+/// 5.2.18 UpdateResult a source answered for a forwarded attribute write.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteUpdate {
+    pub updated: Vec<String>,
+    /// (Attribute IRI, reason)
+    pub not_updated: Vec<(String, String)>,
 }
 
 impl Part {
+    /// A part decided by this broker itself.
+    pub fn local(status: u16, detail: impl Into<String>) -> Self {
+        Part {
+            status,
+            detail: detail.into(),
+            ..Part::default()
+        }
+    }
     pub fn ok(&self) -> bool {
         // 207 from a forwarded source is a partial failure, not a success
         (200..300).contains(&self.status) && self.status != 207
     }
-}
-
-/// Combine local + forwarded parts (6.3.17/6.4.3.1): all-success ⇒ `ok`,
-/// single failing part ⇒ its own error, mixed ⇒ 207 Multi-Status.
-pub fn combine(parts: Vec<Part>, ok: Response, tenant: &TenantId) -> Response {
-    if parts.iter().all(Part::ok) {
-        return ok;
+    /// The status this part answers alone. 6.3.17 p.278: for a proxied
+    /// (exclusive/redirect) source the error vocabulary is fixed: 508 loop,
+    /// 504 timeout, 404 not found, and "502 Bad Gateway - if the single
+    /// forwarded request fails for any other reason such as the Context
+    /// Broker itself having insufficient access rights". 409 keeps
+    /// AlreadyExists semantics (the peer speaks NGSI-LD) and a 207 stays the
+    /// partial verdict it is; a 401/403, a peer's 500/503 or a 400 on the
+    /// inter-broker request surfaces as 502. Inside a 207 each error keeps
+    /// the source's own status, the most informative one.
+    pub fn alone_status(&self) -> u16 {
+        if self.proxy
+            && !(200..300).contains(&self.status)
+            && !matches!(self.status, 207 | 404 | 409 | 504 | 508)
+        {
+            502
+        } else {
+            self.status
+        }
     }
-    if parts.len() == 1 {
-        let p = &parts[0];
-        let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let (etype, title) = match p.status {
-            // 5.6.1.4/5.6.2…: an unsupported-operation part is the Conflict
-            // error type; an entity-exists part stays AlreadyExists.
-            409 if p.detail.contains("does not accept") => ("Conflict", "Conflict"),
+    /// The ProblemDetails type and title of a failed part. 5.6.1.4/5.6.2…:
+    /// an unsupported-operation part is the Conflict error type; an
+    /// entity-exists part stays AlreadyExists.
+    fn problem(&self, status: u16) -> (&'static str, &'static str) {
+        match status {
+            409 if self.conflict => ("Conflict", "Conflict"),
             409 => ("AlreadyExists", "Conflict"),
             404 => ("ResourceNotFound", "Not Found"),
             _ => ("InternalError", "Error"),
-        };
-        let body = json!({
-            "type": format!("https://uri.etsi.org/ngsi-ld/errors/{etype}"),
-            "title": title,
-            "detail": p.detail,
-            "status": p.status,
-        });
-        let mut resp = (
-            status,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            axum::Json(body),
-        )
-            .into_response();
-        echo_tenant(tenant, &mut resp);
-        return resp;
+        }
     }
+}
+
+/// One failed part answered alone, as the ProblemDetails of its status.
+pub fn part_error(p: &Part, tenant: &TenantId) -> Response {
+    problem_response(p, tenant, false)
+}
+
+/// The failure of the single registered source of a distributed read (6.3.17
+/// p.278), naming the Context Source Registration it was asked through.
+pub fn source_error(p: &Part, tenant: &TenantId) -> Response {
+    problem_response(p, tenant, true)
+}
+
+fn problem_response(p: &Part, tenant: &TenantId, name_registration: bool) -> Response {
+    let code = p.alone_status();
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let (etype, title) = p.problem(code);
+    let mut body = json!({
+        "type": format!("https://uri.etsi.org/ngsi-ld/errors/{etype}"),
+        "title": title,
+        "detail": p.detail,
+        "status": code,
+    });
+    if let (true, Some(rid), Some(o)) = (name_registration, &p.registration, body.as_object_mut()) {
+        o.insert("registrationId".into(), Value::String(rid.clone()));
+    }
+    let mut resp = (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::Json(body),
+    )
+        .into_response();
+    echo_tenant(tenant, &mut resp);
+    resp
+}
+
+/// Combine local + forwarded parts of a write on Entity `id` (`None` for a
+/// set operation such as Purge) (6.3.17/6.4.3.1): all-success ⇒ `ok`, single failing part ⇒ its own
+/// error, mixed ⇒ 207 Multi-Status with a BatchOperationResult.
+pub fn combine(
+    profile: crate::Profile,
+    id: Option<&str>,
+    mut parts: Vec<Part>,
+    ok: Response,
+    tenant: &TenantId,
+) -> Response {
+    // 6.3.17 calls a source's 404 not abnormal only for HTTP GET; every
+    // part here is an unsafe write, whose error response "should be as
+    // informative as possible": a 404 beside a success stays in the 207
+    // (ETSI D002_02_01_inc, D002_02_02_inc). 404 everywhere is the one 404.
+    // ANTARES_FED_WRITE_SOURCE_404=ignore reads the 404 as "no data" for
+    // writes too (forge all-fixes, Coraine): beside a success it drops out.
+    if profile.fed_write_ignore_404 && parts.iter().any(Part::ok) {
+        parts.retain(|p| p.status != 404);
+    }
+    if parts.iter().all(Part::ok) {
+        return ok;
+    }
+    if parts.len() == 1 || parts.iter().all(|p| p.status == 404) {
+        let Some(p) = parts.first() else {
+            return ok;
+        };
+        return part_error(p, tenant);
+    }
+    // TS 104 176 7.2.3.2: the 207 body is a BatchOperationResult. 5.2.16
+    // success: "Array of Entity IDs corresponding to the Elements that were
+    // successfully treated"; 5.2.17 BatchEntityError: entityId "Entity ID
+    // corresponding to the Entity in error", registrationId "Registration Id
+    // corresponding to a failed distributed operation".
     let errors: Vec<Value> = parts
         .iter()
         .filter(|p| !p.ok())
         .map(|p| {
-            json!({
+            let (etype, title) = p.problem(p.status);
+            let mut e = json!({
                 "error": {
                     "status": p.status,
-                    "type": "https://uri.etsi.org/ngsi-ld/errors/InternalError",
-                    "title": "distributed operation failed",
+                    "type": format!("https://uri.etsi.org/ngsi-ld/errors/{etype}"),
+                    "title": title,
                     "detail": p.detail,
                 }
-            })
+            });
+            if let Some(o) = e.as_object_mut() {
+                if let Some(id) = id {
+                    o.insert("entityId".into(), Value::String(id.to_owned()));
+                }
+                if let Some(rid) = &p.registration {
+                    o.insert("registrationId".into(), Value::String(rid.clone()));
+                }
+            }
+            e
         })
         .collect();
-    // 6.3.17: "the error response should be as informative as possible" — a
-    // 207 that hides the succeeded halves (did my local delete happen?)
-    // isn't. Parts carry no entity id, so success entries are the details.
-    let success: Vec<&str> = parts
-        .iter()
-        .filter(|p| p.ok())
-        .map(|p| p.detail.as_str())
+    let success: Vec<&str> = id
+        .filter(|_| parts.iter().any(Part::ok))
+        .into_iter()
         .collect();
     let body = json!({"success": success, "errors": errors});
     let mut resp = (
@@ -2404,6 +2980,12 @@ pub fn reduce_to_scope(obj: &Map<String, Value>, reg: &FedReg, ctx: &Context) ->
         }
     }
     any.then_some(Value::Object(out))
+}
+
+fn without_id(obj: &Map<String, Value>) -> Map<String, Value> {
+    let mut o = obj.clone();
+    o.remove("id");
+    o
 }
 
 /// 508 Loop Detected (6.3.17): the inbound Via chain already names us and a
@@ -2462,6 +3044,47 @@ pub async fn write_plan(
     )
 }
 
+/// [`write_plan`] for the registrations of one Entity id.
+pub async fn write_plan_for_id(
+    st: &AppState,
+    tenant: &TenantId,
+    id: &str,
+    ctx: &Context,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<WritePlan, NgsiError> {
+    let spec = crate::registry::CsrSpec {
+        ids: Some(vec![id.to_owned()]),
+        ..Default::default()
+    };
+    write_plan(st, tenant, &spec, ctx, params, headers).await
+}
+
+/// Where a fragment write `op` goes: every registration that supports it,
+/// with the share of `obj` its scope covers, and the Conflict part of each
+/// proxy registration that does not (an inclusive one is not forwarded).
+pub fn scoped_fragments(
+    regs: &[FedReg],
+    op: &str,
+    obj: &Map<String, Value>,
+    ctx: &Context,
+) -> (Vec<Part>, Vec<(FedReg, Value)>) {
+    let mut conflicts = Vec::new();
+    let mut fwd = Vec::new();
+    for reg in regs {
+        if !reg.supports(op) {
+            if reg.is_proxy() {
+                conflicts.push(conflict_part(op, reg));
+            }
+            continue;
+        }
+        if let Some(frag) = reduce_to_scope(obj, reg, ctx) {
+            fwd.push((reg.clone(), frag));
+        }
+    }
+    (conflicts, fwd)
+}
+
 /// 4.3.6.2: "Auxiliary distributed operations are limited to context
 /// information consumption operations (see clause 5.7)" — so a write op
 /// only ever considers non-auxiliary matching registrations.
@@ -2496,7 +3119,7 @@ pub async fn forward_part(
     ctx_url: &str,
     body: Option<Value>,
 ) -> Part {
-    let (status, _, _) = forward(
+    let (status, answer, _) = forward(
         st,
         method,
         url.clone(),
@@ -2522,41 +3145,66 @@ pub async fn forward_part(
         "distributed operation to registration {} returned {status}",
         reg.reg_id
     );
-    // 6.3.17 p.278: for a proxied (exclusive/redirect) source the error
-    // vocabulary is fixed — 508 loop, 504 timeout, 404 not found, and
-    // "502 Bad Gateway — if the single forwarded request fails for any other
-    // reason such as the Context Broker itself having insufficient access
-    // rights". 404/504/508 pass through, 409 keeps AlreadyExists semantics
-    // (the peer speaks NGSI-LD) and a 207 stays the partial verdict it is;
-    // every other failure — auth-class 401/403, a peer's 500/503, a 400 on
-    // the inter-broker request — surfaces as 502. The original status stays
-    // in `detail` for diagnosis.
-    let status = if reg.is_proxy()
-        && !(200..300).contains(&status)
-        && !matches!(status, 207 | 404 | 409 | 504 | 508)
-    {
-        502
-    } else {
-        status
-    };
-    Part { status, detail }
+    Part {
+        status,
+        detail,
+        registration: Some(reg.reg_id.clone()),
+        proxy: reg.is_proxy(),
+        update: (status == 207).then(|| remote_update(&answer)).flatten(),
+        conflict: false,
+    }
 }
 
-/// Forward one attribute-level write to every matching registration.
+/// A source's 207 body read as a 5.2.18 UpdateResult, names as the source
+/// wrote them; `None` when it is not one.
+fn remote_update(body: &Value) -> Option<RemoteUpdate> {
+    let o = body.as_object()?;
+    let names = |v: Option<&Value>| -> Option<Vec<Value>> {
+        match v {
+            None => Some(Vec::new()),
+            Some(Value::Array(a)) => Some(a.clone()),
+            Some(_) => None,
+        }
+    };
+    let updated = names(o.get("updated"))?
+        .iter()
+        .map(|n| n.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let not_updated = names(o.get("notUpdated"))?
+        .iter()
+        .map(|d| {
+            let name = d.get("attributeName")?.as_str()?.to_owned();
+            let reason = d.get("reason").and_then(Value::as_str).unwrap_or_default();
+            Some((name, reason.to_owned()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(RemoteUpdate {
+        updated,
+        not_updated,
+    })
+}
+
+/// Forward one attribute-level write to every matching registration. A
+/// `fragment` body (Append, Update Attributes) is an Attribute map, reduced
+/// per registration to the Attributes it covers: 5.6.3.4 "If an exclusive or
+/// redirect Context Source Registration matches against the input data, the
+/// Attributes from matching input data are forwarded", and 4.3.6.1 "all
+/// constraints specified in the registration shall be respected".
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 pub async fn fed_attr_parts(
     st: &AppState,
     headers: &HeaderMap,
     tenant: &TenantId,
-    ctx_source: &Value,
+    ctx: &Context,
     regs: &[FedReg],
     op: &str,
     method: reqwest::Method,
     path: &str,
     query: &[(String, String)],
     body: Option<Value>,
+    fragment: bool,
 ) -> Vec<Part> {
-    let ctx_url = ctx_link_url(headers, ctx_source);
+    let ctx_url = ctx_link_url(headers, &ctx.source);
     let mut parts = Vec::new();
     for reg in regs {
         // 5.6.2.4 (and the sibling attribute operations): a proxy-mode
@@ -2565,41 +3213,67 @@ pub async fn fed_attr_parts(
         // forwarded.
         if !reg.supports(op) {
             if reg.is_proxy() {
-                parts.push(conflict_part(op));
+                parts.push(conflict_part(op, reg));
             } else {
-                // status 0 = "not forwarded" sentinel: keeps the parts list
-                // 1:1 with regs (combine_attr_parts zips them) without
-                // counting as success or failure.
-                parts.push(Part {
-                    status: 0,
-                    detail: format!("not forwarded: {op} not supported"),
-                });
+                parts.push(not_forwarded(format!("{op} not supported")));
             }
             continue;
         }
-        parts.push(
-            forward_part(
-                st,
-                method.clone(),
-                format!("{}/ngsi-ld/v1{path}", reg.endpoint),
-                query,
-                headers,
-                tenant,
-                reg,
-                &ctx_url,
-                body.clone(),
-            )
-            .await,
-        );
+        let body = match (&body, fragment) {
+            // The path names the Entity, and `write_plan` matched the
+            // registrations on it; an `id` inside the fragment names
+            // nothing (the ETSI payloads carry "urn:ngsi-ld:Vehicle:randomUUID"),
+            // so it neither decides the scope nor goes to the source.
+            (Some(Value::Object(o)), true) => match reduce_to_scope(&without_id(o), reg, ctx) {
+                Some(b) => Some(b),
+                None => {
+                    parts.push(not_forwarded("no Attribute of the registration".into()));
+                    continue;
+                }
+            },
+            _ => body.clone(),
+        };
+        let mut part = forward_part(
+            st,
+            method.clone(),
+            format!("{}/ngsi-ld/v1{path}", reg.endpoint),
+            query,
+            headers,
+            tenant,
+            reg,
+            &ctx_url,
+            body,
+        )
+        .await;
+        // the source answered in the Context it was sent (ctx_url)
+        if let Some(u) = part.update.as_mut() {
+            for n in u.updated.iter_mut() {
+                *n = ctx.expand_key(n);
+            }
+            for (n, _) in u.not_updated.iter_mut() {
+                *n = ctx.expand_key(n);
+            }
+        }
+        parts.push(part);
     }
     parts
 }
 
+/// status 0 = "not forwarded" sentinel: keeps the parts list 1:1 with regs
+/// (combine_attr_parts zips them) without counting as success or failure.
+fn not_forwarded(why: String) -> Part {
+    Part::local(0, format!("not forwarded: {why}"))
+}
+
 /// Conflict part for an exclusive registration that does not accept the op.
-pub fn conflict_part(op: &str) -> Part {
+pub fn conflict_part(op: &str, reg: &FedReg) -> Part {
     Part {
         status: 409,
         detail: format!("exclusive registration does not accept {op}"),
+        registration: Some(reg.reg_id.clone()),
+        proxy: true,
+        update: None,
+        conflict: true,
     }
 }
 
@@ -2623,6 +3297,25 @@ pub fn strip_covered_expanded(fragment: &Value, regs: &[FedReg]) -> Value {
         }
     }
     f
+}
+
+/// 4.3.6.3 (TS 104 175 9.3.3): with an exclusive or redirect registration
+/// the "Context Broker itself is not permitted to hold context data about the
+/// registered Entities and Attributes locally (thus all registered context
+/// data is obtained from the external registered sources)". Drop from a
+/// local EXPANDED document the Attributes such a registration claims for it.
+pub fn drop_proxied_local(doc: &mut Value, proxies: &[FedReg], ctx: &Context) {
+    let Some(o) = doc.as_object() else {
+        return;
+    };
+    let claims: Vec<FedReg> = proxies
+        .iter()
+        .filter(|r| r.is_proxy() && r.covers_item(o, ctx))
+        .cloned()
+        .collect();
+    if !claims.is_empty() {
+        *doc = strip_covered_expanded(doc, &claims);
+    }
 }
 
 /// Strip the members proxied registrations cover from a compacted object;
@@ -2669,6 +3362,119 @@ mod tests {
             h.insert("via", v.parse().expect("via"));
         }
         h
+    }
+
+    /// 6.3.17: on a write a 404 beside a success is reported in the 207
+    /// (ETSI D002_02_01_inc local 204 + source 404, D002_02_02_inc local 404
+    /// + source 204); 404 on every part is one 404.
+    #[test]
+    fn a_404_beside_a_success_is_a_multi_status_on_a_write() {
+        let t = antares_model::TenantId::new(TenantId::DEFAULT).expect("tenant");
+        let part = |status: u16| Part::local(status, String::new());
+        let ok = || StatusCode::NO_CONTENT.into_response();
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(204), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(404), part(204)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(404), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
+            404
+        );
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(204), part(500)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
+    }
+
+    /// ANTARES_FED_WRITE_SOURCE_404=ignore: a 404 beside a success
+    /// drops out (forge all-fixes D002_02_01_inc/D002_02_02_inc, Coraine
+    /// distop_delete_inclusive_source_404 step 03); 404 everywhere stays
+    /// one 404 and any other failure stays in the 207.
+    #[test]
+    fn ignore_profile_reads_a_404_beside_a_success_as_no_data() {
+        let t = antares_model::TenantId::new(TenantId::DEFAULT).expect("tenant");
+        let part = |status: u16| Part::local(status, String::new());
+        let ok = || StatusCode::NO_CONTENT.into_response();
+        let p = crate::Profile {
+            fed_write_ignore_404: true,
+            ..crate::Profile::default()
+        };
+        assert_eq!(
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(204), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
+            204
+        );
+        assert_eq!(
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(404), part(204)],
+                ok(),
+                &t
+            )
+            .status(),
+            204
+        );
+        assert_eq!(
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(404), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
+            404
+        );
+        assert_eq!(
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(204), part(404), part(500)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
     }
 
     /// 4.3.6.6: contextSourceInfo carries the headers a source needs to
@@ -2983,27 +3789,68 @@ mod tests {
         );
     }
 
-    /// 6.3.17 p.278 scopes 508 to "an exclusive or redirect registration,
-    /// where all of the data is held ... in a single registered source";
-    /// any other loop clears the forward set and proceeds locally
-    /// (Table 6.3.18-2: the Via listing amends registration matching).
+    /// the registration mirror (hash order) and the store yield the
+    /// matching registrations in one order, by id, so a 207 names the same
+    /// registration whichever of the two answered.
+    #[tokio::test]
+    async fn matching_registrations_come_in_id_order_from_mirror_and_store() {
+        let mut st = AppState::new("me".into());
+        let tenant = antares_model::TenantId::new("default").expect("tenant");
+        let ctx = st.loader.core();
+        let mirror = crate::mirror::DocMirror::default();
+        for n in (0..12).rev() {
+            let id = format!("urn:ngsi-ld:ContextSourceRegistration:r{n:02}");
+            let doc = json!({
+                "id": id,
+                "type": "ContextSourceRegistration",
+                "endpoint": format!("http://peer{n}:9090"),
+                "information": [{"entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"}]}],
+            });
+            mirror.apply("default", &id, Some(doc.clone()));
+            st.store
+                .create(&tenant, Kind::Registration, &id, doc)
+                .await
+                .expect("seed registration");
+        }
+        let spec = crate::registry::CsrSpec::default();
+        let want: Vec<String> = (0..12)
+            .map(|n| format!("urn:ngsi-ld:ContextSourceRegistration:r{n:02}"))
+            .collect();
+        let from_store: Vec<String> = matching_regs(&st, &tenant, &spec, &ctx, &hdrs(None))
+            .await
+            .expect("store")
+            .into_iter()
+            .map(|r| r.reg_id)
+            .collect();
+        assert_eq!(from_store, want, "the store answers by id");
+        st.reg_mirror = Some(std::sync::Arc::new(mirror));
+        let from_mirror: Vec<String> = matching_regs(&st, &tenant, &spec, &ctx, &hdrs(None))
+            .await
+            .expect("mirror")
+            .into_iter()
+            .map(|r| r.reg_id)
+            .collect();
+        assert_eq!(from_mirror, want, "the mirror answers in the store's order");
+    }
+
+    /// TS 104 175 9.7: a write whose Via names this broker is a
+    /// detected loop whatever its registrations; nothing is forwarded.
     #[test]
-    fn loop_508_only_for_a_single_proxy_registration() {
+    fn a_write_looping_back_is_508_whatever_its_registrations() {
         let t = antares_model::TenantId::new("default").expect("tenant");
         let h = hdrs(Some("1.1 me"));
-        // single exclusive source looping back → 508
-        let mut regs = vec![reg("exclusive")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_some());
-        let mut regs = vec![reg("redirect")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_some());
-        // inclusive loop → no 508, forwards cleared, local execution proceeds
-        let mut regs = vec![reg("inclusive")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_none());
-        assert!(regs.is_empty(), "looping forwards must be dropped");
-        // a mixed set is not "a single registered source"
-        let mut regs = vec![reg("exclusive"), reg("inclusive")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_none());
-        assert!(regs.is_empty());
+        for set in [
+            vec![reg("exclusive")],
+            vec![reg("redirect")],
+            vec![reg("inclusive")],
+            vec![reg("exclusive"), reg("inclusive")],
+            Vec::new(),
+        ] {
+            let mut regs = set;
+            let resp = handle_via_loop(&h, "me", &t, &mut regs).expect("a loop");
+            assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
+            assert!(regs.is_empty(), "looping forwards must be dropped");
+        }
         // no loop → untouched
         let mut regs = vec![reg("exclusive")];
         assert!(handle_via_loop(&hdrs(None), "me", &t, &mut regs).is_none());
@@ -3402,6 +4249,46 @@ mod tests {
         assert_eq!(base2[attr][0]["value"], 2, "live instance replaces expired");
     }
 
+    /// TS 104 175 8.5.3: "any attribute data where an observedAt DateTime is
+    /// present shall take precedence ... If no observedAt is present, the
+    /// attribute data with the most recent modifiedAt DateTime shall be
+    /// provided": an old observation beats a newer write that observed
+    /// nothing, whichever source answered first.
+    #[test]
+    fn merge_prefers_an_observed_instance_over_a_newer_unobserved_one() {
+        let attr = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+        let observed = json!({
+            "id": "urn:x", "type": ["T"],
+            attr: [{"type": "Property", "value": "observed",
+                    "observedAt": "2020-01-01T00:00:00Z",
+                    "modifiedAt": "2020-01-01T00:00:00Z"}]
+        });
+        let unobserved = json!({
+            "id": "urn:x", "type": ["T"],
+            attr: [{"type": "Property", "value": "unobserved",
+                    "modifiedAt": "2026-01-01T00:00:00Z"}]
+        });
+        for (first, second) in [(&observed, &unobserved), (&unobserved, &observed)] {
+            let mut base = first.clone();
+            merge_docs(&mut base, second, false);
+            assert_eq!(base[attr][0]["value"], "observed", "{first} then {second}");
+        }
+        // between two observations the later one wins, between two
+        // unobserved instances the later write
+        let mut later = observed.clone();
+        later[attr][0]["observedAt"] = json!("2021-01-01T00:00:00Z");
+        later[attr][0]["value"] = json!("later");
+        let mut base = observed.clone();
+        merge_docs(&mut base, &later, false);
+        assert_eq!(base[attr][0]["value"], "later");
+        let mut newer = unobserved.clone();
+        newer[attr][0]["modifiedAt"] = json!("2027-01-01T00:00:00Z");
+        newer[attr][0]["value"] = json!("newer");
+        let mut base = unobserved.clone();
+        merge_docs(&mut base, &newer, false);
+        assert_eq!(base[attr][0]["value"], "newer");
+    }
+
     /// 4.5.5.3: entity-level expiresAt — missing from at least one received
     /// version → removed; present in all versions → furthest in the future.
     #[test]
@@ -3567,11 +4454,10 @@ mod tests {
         .await;
         assert_eq!(part.status, 400, "the peer refused the write");
         // one failed forward + one succeeded local part ⇒ 207 Multi-Status
-        let local = Part {
-            status: 204,
-            detail: "local write applied".into(),
-        };
+        let local = Part::local(204, "local write applied");
         let resp = combine(
+            crate::Profile::default(),
+            Some("urn:ngsi-ld:V:1"),
             vec![local, part],
             StatusCode::NO_CONTENT.into_response(),
             &tenant,
@@ -3797,6 +4683,8 @@ mod same_source_merge {
             ops: vec!["federationOps".into()],
             attrs: attrs.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
             ent_types: types.iter().map(|s| (*s).to_owned()).collect(),
+            // type-only EntityInfo, as the registration builder reads it
+            ent_unrestricted: true,
             ..FedReg::default()
         }
     }
@@ -3811,7 +4699,7 @@ mod same_source_merge {
                 "urn:r:2",
                 "http://a",
                 Some(&["heading", "speed"]),
-                &["Bike"],
+                &["Vehicle"],
             ),
             reg("urn:r:3", "http://b", Some(&["speed"]), &["Vehicle"]),
         ]);
@@ -3821,8 +4709,23 @@ mod same_source_merge {
             merged[0].attrs.as_deref(),
             Some(&["speed".to_owned(), "heading".to_owned()][..])
         );
-        assert_eq!(merged[0].ent_types, ["Vehicle", "Bike"]);
         assert_eq!(merged[1].endpoint, "http://b");
+
+        // equal attribute scopes: the types union
+        let merged = merge_same_source(vec![
+            reg("urn:r:1", "http://a", Some(&["speed"]), &["Vehicle"]),
+            reg("urn:r:2", "http://a", Some(&["speed"]), &["Bike"]),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].ent_types, ["Vehicle", "Bike"]);
+
+        // 4.3.6.1, ETSI IOP_003_02_02: (Vehicle × all) and (Bike × speed)
+        // folded would be (both × all), a scope neither registration declared
+        let merged = merge_same_source(vec![
+            reg("urn:r:1", "http://a", None, &["Vehicle"]),
+            reg("urn:r:2", "http://a", Some(&["speed"]), &["Bike"]),
+        ]);
+        assert_eq!(merged.len(), 2, "an inexact union stays two forwards");
 
         // an unscoped registration widens the merged one to everything
         let merged = merge_same_source(vec![
@@ -3831,6 +4734,7 @@ mod same_source_merge {
         ]);
         assert_eq!(merged.len(), 1);
         assert!(merged[0].attrs.is_none());
+        assert!(merged[0].ent_types.is_empty(), "and to every type");
 
         let mut other_mode = reg("urn:r:2", "http://a", None, &[]);
         other_mode.mode = "exclusive".into();

@@ -12,6 +12,8 @@ export default function TopBar({ health, onApi }) {
   const [tpl, setTpl] = useState(null); // template dialog text or null
   const [pipeDlg, setPipeDlg] = useState(false);
   const [csrDlg, setCsrDlg] = useState(false);
+  const [spaceDlg, setSpaceDlg] = useState(null); // new space name or null
+  const [menu, setMenu] = useState(false); // phones: the actions fold behind ☰
   const genRef = useRef(); const kindRef = useRef(); const fromRef = useRef();
   const typeRef = useRef(); const intoRef = useRef(); const secsRef = useRef();
   const readerRef = useRef(); const peerRef = useRef(); const ctypeRef = useRef();
@@ -24,29 +26,25 @@ export default function TopBar({ health, onApi }) {
   return (
     <header className="topbar">
       <h1>⭐ Antares <span className="accent">NGSI-LD</span> playground</h1>
-      <span className="pill" title="ETSI CIM 009 — NGSI-LD API as WebAssembly in this tab">
+      <span className="pill wide-only" title="ETSI CIM 009 — NGSI-LD API as WebAssembly in this tab">
         in-browser wasm broker
       </span>
-      <span
-        className="pill"
-        style={{ fontSize: "1rem", fontWeight: 700, letterSpacing: ".01em" }}
-      >
-        Author: Marek Mráz
+      <span className="pill author">Author: Marek Mráz</span>
+      <span className="pill" data-mode={transport.mode}>
+        mode: <strong>{transport.mode}</strong>{health && ` · ${health.store} ${health.status}`}
       </span>
-      <span className="pill" data-mode={transport.mode}>mode: <strong>{transport.mode}</strong></span>
-      {health && <span className="pill">store: {health.store} · {health.status}</span>}
       <span className="grow" />
+      <button className="menu-btn" aria-expanded={menu} aria-controls="actions" aria-label="menu"
+        data-testid="btn-menu" onClick={() => setMenu(!menu)}>{menu ? "✕" : "☰"}</button>
+      <nav id="actions" className={`actions${menu ? " open" : ""}`} data-testid="actions"
+        onClick={(e) => e.target.closest("button") && setMenu(false)}>
       <button disabled={busy} data-testid="btn-demo"
         onClick={run(() => createDemo({ startPipe }))}>▶ demo</button>
       <button data-testid="btn-arrange" title="deterministic hub-and-spoke re-layout"
         onClick={() => arrangeAll()}>✳ arrange</button>
       <button data-testid="btn-template"
         onClick={() => setTpl(JSON.stringify(boardTemplate("smart-city"), null, 2))}>{"{ } template"}</button>
-      <button onClick={() => {
-        const name = window.prompt("new context space (A-Za-z0-9-)");
-        if (name == null) return;
-        if (!addSpace(name.trim())) toast(`invalid name "${name}" — A-Za-z0-9 and - only`);
-      }}>＋ space</button>
+      <button data-testid="btn-space" onClick={() => setSpaceDlg("")}>＋ space</button>
       <button data-testid="btn-api" title="ETSI OpenAPI docs — try any NGSI-LD request against the in-tab broker"
         onClick={onApi}>📖 API</button>
       <button onClick={() => setPipeDlg(true)}>＋ pipeline</button>
@@ -56,6 +54,32 @@ export default function TopBar({ health, onApi }) {
           if (window.confirm("Remove EVERYTHING? All data in every space, all CSRs and pipelines."))
             await resetBoard({ deletePipe });
         })}>🧨 reset</button>
+      </nav>
+
+      {spaceDlg !== null && (
+        <div className="modal" onClick={(e) => e.target === e.currentTarget && setSpaceDlg(null)}>
+          <form className="modal-box" data-testid="space-dialog" onSubmit={(e) => {
+            e.preventDefault();
+            const name = spaceDlg.trim();
+            if (TENANT_RE.test(name) && addSpace(name)) setSpaceDlg(null);
+          }}>
+            <h3>＋ context space</h3>
+            <label>name — a tenant of the broker
+              <input autoFocus value={spaceDlg} onChange={(e) => setSpaceDlg(e.target.value)}
+                maxLength={64} placeholder="e.g. harbor" data-testid="space-name"
+                aria-invalid={!!spaceDlg.trim() && !TENANT_RE.test(spaceDlg.trim())} />
+            </label>
+            {!!spaceDlg.trim() && !TENANT_RE.test(spaceDlg.trim()) && (
+              <p className="sub err" role="alert">A-Z, a-z, 0-9 and - only, at most 64</p>
+            )}
+            <div className="row">
+              <button className="primary" type="submit" data-testid="space-add"
+                disabled={!TENANT_RE.test(spaceDlg.trim())}>add</button>
+              <button type="button" onClick={() => setSpaceDlg(null)}>cancel</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {tpl !== null && (
         <div className="modal" onClick={(e) => e.target === e.currentTarget && setTpl(null)}>

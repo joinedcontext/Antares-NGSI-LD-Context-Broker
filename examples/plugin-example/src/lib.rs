@@ -49,6 +49,7 @@ fn slot(kind: Kind) -> u8 {
         Kind::EntityMap => 6,
         Kind::DistSub => 7,
         Kind::DeadLetter => 8,
+        Kind::View => 9,
     }
 }
 
@@ -233,7 +234,14 @@ impl CurrentStateDriver for ExampleStore {
     ) -> Result<Vec<bool>, NgsiError> {
         // Created-flags: the opposite polarity of `upsert`, which answers
         // whether the row was already there. The batch path splits 201 from
-        // 204 (5.6.8) with these.
+        // 204 (5.6.8) with these. Each id once per call: the broker splits
+        // repeats into rounds, so a repeat here is refused before a write.
+        let mut seen = BTreeSet::new();
+        if let Some((id, _)) = items.iter().find(|(id, _)| !seen.insert(id.as_str())) {
+            return Err(NgsiError::InternalError(format!(
+                "batch_upsert names {id} twice"
+            )));
+        }
         let mut out = Vec::with_capacity(items.len());
         for (id, doc) in items {
             out.push(!CurrentStateDriver::upsert(self, tenant, Kind::Entity, &id, doc).await?);
@@ -445,8 +453,9 @@ impl CurrentStateDriver for ExampleStore {
 
     async fn sweep_expired(&self) -> usize {
         // 4.22: the reads above already hide expired context; this is the
-        // memory the sweep gets back — whole entities past their stamp, and
-        // the expired instances still sitting inside live documents.
+        // memory the sweep gets back — whole entities past their stamp with
+        // their history, and the expired instances still sitting inside live
+        // documents.
         let now = now();
         let entity = slot(Kind::Entity);
         let mut docs = self.write();
@@ -455,10 +464,12 @@ impl CurrentStateDriver for ExampleStore {
             .filter(|((_, k, _), d)| *k == entity && filter::expired_at(d, &now))
             .map(|(k, _)| k.clone())
             .collect();
-        for k in &dead {
-            docs.remove(k);
-        }
         let temporal = slot(Kind::Temporal);
+        for (t, _, id) in &dead {
+            docs.remove(&(t.clone(), entity, id.clone()));
+            // the Entity's history goes with it.
+            docs.remove(&(t.clone(), temporal, id.clone()));
+        }
         let mut pruned = 0;
         for ((_, k, _), doc) in docs.iter_mut() {
             if *k != entity && *k != temporal {
@@ -577,6 +588,12 @@ impl CurrentStateDriver for ExampleStore {
                 "@context belongs to another tenant".into(),
             ));
         }
+        // the kind decides who reaches the row (5.13.1), so a row has one
+        if doc.get("kind").and_then(Value::as_str).is_none() {
+            return Err(NgsiError::InternalError(
+                "@context row without a kind".into(),
+            ));
+        }
         rows.insert(id.to_owned(), doc);
         Ok(())
     }
@@ -593,6 +610,36 @@ impl CurrentStateDriver for ExampleStore {
             .get(id)
             .filter(|row| context_row_visible(row, tenant))
             .cloned())
+    }
+
+    /// Under the write lock, so a bump racing a delete or another bump
+    /// neither resurrects the row nor loses a count; the row a closure
+    /// leaves keeps its kind and stays the caller's.
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        let mut rows = self
+            .contexts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(row) = rows
+            .get_mut(id)
+            .filter(|row| context_row_visible(row, tenant))
+        else {
+            return Ok(None);
+        };
+        let mut doc = row.clone();
+        if f(&mut doc).is_err()
+            || doc.get("kind") != row.get("kind")
+            || !context_row_visible(&doc, tenant)
+        {
+            return Ok(Some(Err(())));
+        }
+        *row = doc;
+        Ok(Some(Ok(())))
     }
 
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError> {
@@ -674,7 +721,13 @@ impl TemporalDriver for ExampleStore {
                     return Ok(());
                 };
                 for (attr, instances) in adds {
-                    let incoming: Vec<Value> = instances.as_array().cloned().unwrap_or_default();
+                    let mut incoming: Vec<Value> =
+                        instances.as_array().cloned().unwrap_or_default();
+                    // provenance rides in from the API; this store
+                    // keeps none, so no read answers it as data.
+                    incoming.iter_mut().for_each(|i| {
+                        antares_store::take_provenance(i);
+                    });
                     match target.get_mut(attr).and_then(Value::as_array_mut) {
                         // Same instanceId = the same instance corrected.
                         Some(kept) => {
@@ -750,7 +803,13 @@ impl TemporalDriver for ExampleStore {
         id: &str,
         f: MutateFn<'a>,
     ) -> Result<Option<Result<(), ()>>, NgsiError> {
-        CurrentStateDriver::mutate_boxed(self, tenant, Kind::Temporal, id, f).await
+        // A rewrite (a delete's null instance) carries provenance too.
+        let strip: MutateFn<'a> = Box::new(move |doc| {
+            let done = f(doc);
+            antares_store::strip_provenance(doc);
+            done
+        });
+        CurrentStateDriver::mutate_boxed(self, tenant, Kind::Temporal, id, strip).await
     }
 
     async fn attr_instance_count(&self, tenant: &TenantId) -> Result<u64, NgsiError> {

@@ -49,12 +49,37 @@ fi
 # Restore the sed-ed file on exit: a dirty suite tree should mean a real
 # change, not a leftover run configuration.
 trap 'git -C "$SUITE" checkout -- resources/variables.py 2>/dev/null || true' EXIT
+# The suite's @contexts from this checkout: the pipeline serves them
+# and exports SUITE_CONTEXT; a caller that runs this script alone (examples,
+# etsi-coverage, a dev box on the vendored suite) gets the same server here,
+# so no run reads them from GitHub or forge at run time.
+own_context=0
+if [ -z "${SUITE_CONTEXT:-}" ] && [ "$SUITE" -ef ./ngsi-ld-test-suite ]; then
+  SUITE_CONTEXT=$(RESULTS="$RESULTS_DIR" dev/etsi-local-context.sh start) \
+    || { echo "could not serve the suite context locally"; exit 1; }
+  own_context=1
+  trap 'RESULTS="$RESULTS_DIR" dev/etsi-local-context.sh stop || true
+        git -C "$SUITE" checkout -- resources/variables.py 2>/dev/null || true' EXIT
+fi
+# FederationReset.py reads it from the environment (its Link header)
+export SUITE_CONTEXT="${SUITE_CONTEXT:-}"
 ( cd "$SUITE/resources"
-  sed -i "s|^url = .*|url = '$BROKER_URL'|" variables.py
-  sed -i "s|^temporal_api_url = .*|temporal_api_url = '$BROKER_URL'|" variables.py
+  # A suite whose own `url` names no /ngsi-ld/v1 adds the path itself (forge's later commits):
+  # it gets the broker's root, or every request went to /ngsi-ld/v1/ngsi-ld/v1.
+  api_url=$BROKER_URL
+  grep -q "^url = '.*/ngsi-ld/v1/\?'" variables.py || api_url=${BROKER_URL%/ngsi-ld/v1}
+  sed -i "s|^url = .*|url = '$api_url'|" variables.py
+  sed -i "s|^temporal_api_url = .*|temporal_api_url = '$api_url'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '$CALLBACK_HOST'|" variables.py
-  sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py )
+  sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py
+  # the 058 TPs reach the mosquitto the pipeline starts by its container name, as the vendored
+  # suite names it; forge's later commits say 127.0.0.1, where nothing listens
+  sed -i "s|^mqtt_broker_host = .*|mqtt_broker_host = 'ngsi-ld-test-suite-mosquitto-container'|" variables.py
+  # the suite context the pipeline serves from this checkout, appended: the last
+  # assignment wins, and forge integration/all-fixes spells the default over three lines
+  [ -z "${SUITE_CONTEXT:-}" ] \
+    || printf "\nngsild_test_suite_context = '%s'\n" "$SUITE_CONTEXT" >> variables.py )
 
 mkdir -p "$RESULTS_DIR"
 EXTRA=()
@@ -66,6 +91,11 @@ EXTRA=()
 # TPs needing a specially-configured broker (ANTARES_TEMPORAL=none) never
 # belong in a default conformance run — they get their own harness.
 EXTRA+=(--exclude config_no_temporal)
+# 019_31 spells the root's path into the Link headers it expects.
+hostpath="${BROKER_URL#*://}"
+root_path=""
+[ "$hostpath" = "${hostpath#*/}" ] || root_path="/${hostpath#*/}"
+EXTRA+=(--variable "entities_path:${root_path%/}/entities")
 
 status=0
 for s in $SUITES; do
@@ -83,4 +113,8 @@ for s in $SUITES; do
       "TP/NGSI-LD/$s") 2>&1 | tee "$RESULTS_DIR/$name-console.log" \
     || { status=$?; [ "$STOP_ON_ERROR" = 1 ] && break; }
 done
+if [ "$own_context" = 1 ]; then
+  RESULTS="$RESULTS_DIR" dev/etsi-local-context.sh check | tee "$RESULTS_DIR/local-context-check.txt" \
+    || status=1
+fi
 exit $status

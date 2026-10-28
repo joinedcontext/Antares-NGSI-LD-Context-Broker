@@ -9,11 +9,12 @@
 //! counting every tenant to read one is the wrong shape.
 
 use antares_api::AppState;
-use antares_model::TenantId;
-use antares_store::Kind;
+use antares_model::{NgsiError, TenantId};
+use antares_store::{filter, Kind, MutateFn, TemporalDriver};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tower::ServiceExt;
 
 async fn send(
@@ -723,4 +724,165 @@ async fn purge_goes_ahead_when_no_copy_lives_at_a_context_source() {
             .is_none(),
         "the purge took the Subscription with it"
     );
+}
+
+async fn put(st: &AppState, doc: Value, tenant: &str) {
+    let (s, b) = send(st, "POST", "/ngsi-ld/v1/entities", Some(doc), Some(tenant)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+}
+
+/// one tenant answers its size in bytes beside its counts, measured
+/// in the store by the Entity's first type, reused for a while (it is a scan)
+/// and measured afresh once a purge removed what it measured.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_tenant_answers_its_size_by_type_and_a_purge_measures_it_again() {
+    let st = state().await;
+    seed(&st, "sizea", "urn:ngsi-ld:Room:1").await;
+    put(&st, entity("urn:ngsi-ld:Room:2"), "sizea").await;
+    put(
+        &st,
+        json!({"id": "urn:ngsi-ld:Bridge:1", "type": ["Bridge", "Room"]}),
+        "sizea",
+    )
+    .await;
+    seed(&st, "sizeb", "urn:ngsi-ld:Room:3").await;
+
+    let (s, one) = send(&st, "GET", "/q/tenants/sizea", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{one}");
+    let bytes = &one["bytes"];
+    let by_type = bytes["byType"].as_object().expect("byType");
+    assert_eq!(by_type.len(), 2, "one key per first type: {one}");
+    let sum: u64 = by_type.values().filter_map(Value::as_u64).sum();
+    assert_eq!(
+        bytes["entities"].as_u64(),
+        Some(sum),
+        "the types sum to the whole: {one}"
+    );
+    let room = by_type
+        .iter()
+        .find(|(k, _)| k.ends_with("Room"))
+        .expect("Room")
+        .1;
+    let bridge = by_type
+        .iter()
+        .find(|(k, _)| k.ends_with("Bridge"))
+        .expect("Bridge")
+        .1;
+    assert!(
+        room.as_u64() > bridge.as_u64(),
+        "two Rooms outweigh one Bridge: {one}"
+    );
+    assert!(
+        bytes["attrInstances"].as_u64().is_some_and(|n| n > 0),
+        "{one}"
+    );
+
+    // a scan, so a second read within the TTL answers the measured size
+    put(&st, entity("urn:ngsi-ld:Room:4"), "sizea").await;
+    let (_, again) = send(&st, "GET", "/q/tenants/sizea", None, None).await;
+    assert_eq!(again["bytes"], *bytes, "reused within the TTL");
+    assert_eq!(
+        again["counts"]["entities"], 4,
+        "the counts are never cached: {again}"
+    );
+
+    // the other tenant is measured on its own rows
+    let (_, other) = send(&st, "GET", "/q/tenants/sizeb", None, None).await;
+    assert_eq!(
+        other["bytes"]["byType"].as_object().map(|m| m.len()),
+        Some(1),
+        "{other}"
+    );
+
+    let (s, _) = send(&st, "DELETE", "/q/tenants/sizea", None, None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    put(&st, entity("urn:ngsi-ld:Room:5"), "sizea").await;
+    let (_, after) = send(&st, "GET", "/q/tenants/sizea", None, None).await;
+    assert_eq!(
+        after["bytes"]["byType"].as_object().map(|m| m.len()),
+        Some(1),
+        "measured again: {after}"
+    );
+    assert!(
+        after["bytes"]["entities"].as_u64() < bytes["entities"].as_u64(),
+        "{after}"
+    );
+}
+
+/// A history store whose bounded count runs out of time, as a Postgres
+/// tenant with a long history does; everything else forwards.
+struct SlowCount(Arc<dyn TemporalDriver>);
+
+#[async_trait::async_trait]
+impl TemporalDriver for SlowCount {
+    async fn attr_instance_count_within(
+        &self,
+        _t: &TenantId,
+        _bound: std::time::Duration,
+    ) -> Result<u64, NgsiError> {
+        Err(NgsiError::InternalError(
+            "database statement timeout".into(),
+        ))
+    }
+    async fn temporal_append(
+        &self,
+        t: &TenantId,
+        id: &str,
+        shell: &Value,
+        additions: &Value,
+    ) -> Result<(), NgsiError> {
+        self.0.temporal_append(t, id, shell, additions).await
+    }
+    async fn query_temporal(
+        &self,
+        t: &TenantId,
+        f: &filter::TemporalFilter<'_>,
+    ) -> Result<filter::TemporalOutcome, NgsiError> {
+        self.0.query_temporal(t, f).await
+    }
+    async fn get_temporal(
+        &self,
+        t: &TenantId,
+        id: &str,
+        f: &filter::TemporalFilter<'_>,
+    ) -> Result<Option<Value>, NgsiError> {
+        self.0.get_temporal(t, id, f).await
+    }
+    async fn get(&self, t: &TenantId, id: &str) -> Result<Option<Value>, NgsiError> {
+        self.0.get(t, id).await
+    }
+    async fn create(&self, t: &TenantId, id: &str, doc: Value) -> Result<bool, NgsiError> {
+        self.0.create(t, id, doc).await
+    }
+    async fn upsert(&self, t: &TenantId, id: &str, doc: Value) -> Result<bool, NgsiError> {
+        self.0.upsert(t, id, doc).await
+    }
+    async fn delete(&self, t: &TenantId, id: &str) -> Result<bool, NgsiError> {
+        self.0.delete(t, id).await
+    }
+    async fn list(&self, t: &TenantId) -> Result<Vec<Value>, NgsiError> {
+        self.0.list(t).await
+    }
+    async fn mutate_boxed<'a>(
+        &self,
+        t: &TenantId,
+        id: &str,
+        f: MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        self.0.mutate_boxed(t, id, f).await
+    }
+}
+
+/// A history count cut off by its bound leaves `attrInstances` out of the
+/// answer: the other counts still answer 200, and no reader takes a count
+/// that never finished for an empty history (it read 0).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_count_out_of_time_is_left_out_not_zero() {
+    let mut st = state().await;
+    seed(&st, "slowh", "urn:ngsi-ld:Room:1").await;
+    st.temporal = Arc::new(SlowCount(st.temporal.clone()));
+    let (s, one) = send(&st, "GET", "/q/tenants/slowh", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{one}");
+    assert_eq!(one["counts"]["entities"], 1, "{one}");
+    assert_eq!(one["counts"].get("attrInstances"), None, "{one}");
 }
