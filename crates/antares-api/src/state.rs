@@ -26,6 +26,11 @@ pub enum TemporalRecord {
     /// what the temporal API was given directly (unlike ANTARES_TEMPORAL=none,
     /// which turns the temporal seam off entirely).
     None,
+    /// `ruled`: history is opt-in. An Entity records only
+    /// when its own `historyRetention`, the retention rule of one of its
+    /// types or its Tenant's `*` rule gives a duration or `forever`; a type
+    /// no rule names keeps its current state only.
+    Ruled,
 }
 
 impl std::str::FromStr for TemporalRecord {
@@ -35,10 +40,215 @@ impl std::str::FromStr for TemporalRecord {
             "all" => Ok(Self::All),
             "observed" => Ok(Self::Observed),
             "none" => Ok(Self::None),
+            "ruled" => Ok(Self::Ruled),
             other => Err(format!(
-                "ANTARES_TEMPORAL_RECORD: unknown mode {other} (all|observed|none)"
+                "ANTARES_TEMPORAL_RECORD: unknown mode {other} (all|observed|none|ruled)"
             )),
         }
+    }
+}
+
+/// Behaviour profile (docs/conformance/profiles.md): where the two
+/// spec versions or the conformance suites accept two answers, the one this
+/// deployment gives. Startup configuration only, never per request; the
+/// default of every member is the behaviour the pinned ETSI suite asserts.
+/// No member relaxes authorization, tenant isolation or an input limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// `ANTARES_NON_OBJECT_BODY=bad-request-data`: a JSON body that is no
+    /// object (`[]`, `[1,2,3]`) where an object is expected answers
+    /// BadRequestData (TS 104 175 8.2.3 second bullet, forge all-fixes,
+    /// Coraine) instead of InvalidRequest (ETSI 001_02_02).
+    pub non_object_bad_request_data: bool,
+    /// `ANTARES_FED_WRITE_SOURCE_404=ignore`: on a distributed write, a
+    /// source's 404 beside a success counts as "no data" (204, forge
+    /// all-fixes, Coraine) instead of a part of the 207 (ETSI D002_02_*_inc).
+    pub fed_write_ignore_404: bool,
+    /// `ANTARES_IMPLICIT_TENANTS=listed`: only the operations TS 104 175
+    /// 7.8.2 lists create a Tenant; Batch Upsert on an unknown Tenant
+    /// answers NonexistentTenant (Coraine tenant_implicit_create).
+    pub implicit_tenants_listed_only: bool,
+}
+
+impl Profile {
+    /// Reads the profile keys; an unknown value is a startup error.
+    pub fn from_env() -> Result<Self, String> {
+        let get = |k: &str| std::env::var(k).ok();
+        Self::from_vars(
+            get("ANTARES_NON_OBJECT_BODY"),
+            get("ANTARES_FED_WRITE_SOURCE_404"),
+            get("ANTARES_IMPLICIT_TENANTS"),
+        )
+    }
+
+    /// [`Profile::from_env`] over given values (unset = `None`).
+    pub fn from_vars(
+        non_object_body: Option<String>,
+        fed_write_source_404: Option<String>,
+        implicit_tenants: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            non_object_bad_request_data: profile_choice(
+                "ANTARES_NON_OBJECT_BODY",
+                non_object_body,
+                ["invalid-request", "bad-request-data"],
+            )?,
+            fed_write_ignore_404: profile_choice(
+                "ANTARES_FED_WRITE_SOURCE_404",
+                fed_write_source_404,
+                ["report", "ignore"],
+            )?,
+            implicit_tenants_listed_only: profile_choice(
+                "ANTARES_IMPLICIT_TENANTS",
+                implicit_tenants,
+                ["with-upsert", "listed"],
+            )?,
+        })
+    }
+}
+
+/// `false` for the default value (or unset/empty), `true` for the other.
+fn profile_choice(
+    key: &str,
+    value: Option<String>,
+    [default, other]: [&str; 2],
+) -> Result<bool, String> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(v) if v == default => Ok(false),
+        Some(v) if v == other => Ok(true),
+        Some(v) => Err(format!("{key}: unknown value {v:?} ({default}|{other})")),
+    }
+}
+
+/// History gate 3's set: the (Tenant, expanded type) pairs that
+/// record no history, shared by every clone of the state.
+pub type HistoryOff = Arc<std::sync::RwLock<HistoryRules>>;
+
+/// When an attribute recorded `onChange` writes a row: when its value moved past `deadband` (a number) or
+/// `min_distance` metres (a Point), or differs at all (anything else), or
+/// `heartbeat` passed since its last row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OnChange {
+    pub heartbeat: std::time::Duration,
+    pub deadband: Option<f64>,
+    pub min_distance: Option<f64>,
+}
+
+/// How an attribute records history. Unset, it is `every` (a row per
+/// changed instance), and `observed` under `ANTARES_TEMPORAL_RECORD=ruled`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RecordMode {
+    /// `every`: a row per changed instance.
+    Every,
+    /// `never`: no row, for a bookkeeping attribute such as
+    /// `dateModified`.
+    Never,
+    /// `onChange`: a row when the value moved or the heartbeat passed.
+    OnChange(OnChange),
+    /// `observed`: a row only for an instance whose `observedAt` is
+    /// newer than the attribute's last row, so a value re-sent with its old
+    /// `observedAt`, or sent with none, adds nothing.
+    Observed,
+}
+
+/// How one type records history, for the type and per expanded attribute:
+/// `None` takes the broker's default ([`RecordMode`]).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Recording {
+    pub default: Option<RecordMode>,
+    pub attributes: std::collections::HashMap<String, Option<RecordMode>>,
+}
+
+impl Recording {
+    /// How `attr` records: its own setting, else the type's.
+    #[must_use]
+    pub fn of(&self, attr: &str) -> Option<RecordMode> {
+        self.attributes.get(attr).copied().unwrap_or(self.default)
+    }
+
+    /// Whether some attribute records `onChange`.
+    #[must_use]
+    pub fn has_on_change(&self) -> bool {
+        std::iter::once(&self.default)
+            .chain(self.attributes.values())
+            .any(|m| matches!(m, Some(RecordMode::OnChange(_))))
+    }
+}
+
+/// What the write path needs of the Tenants' history retention: which writes record none.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HistoryRules {
+    /// (Tenant, type) pairs whose rule says `history: "off"`.
+    pub off: std::collections::HashSet<(String, String)>,
+    /// (Tenant, type) pairs with a history rule of their own (a duration,
+    /// `off` or `forever`), which their Tenant's `*` rule does not reach.
+    pub ruled: std::collections::HashSet<(String, String)>,
+    /// Tenants whose `*` rule says `history: "off"`.
+    pub space_off: std::collections::HashSet<String>,
+    /// Tenants whose `*` rule gives a duration or `forever`: under
+    /// `ANTARES_TEMPORAL_RECORD=ruled` every type without a rule of its own
+    /// records.
+    pub space_on: std::collections::HashSet<String>,
+    /// (Tenant, type) pairs whose rule records some attribute other than
+    /// `every`.
+    pub recording: std::collections::HashMap<(String, String), Recording>,
+}
+
+impl HistoryRules {
+    /// No rule turns any history off.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.off.is_empty() && self.space_off.is_empty()
+    }
+}
+
+/// The Tenants the store recently answered "exists" for. The 5.5.10
+/// wall asks about the request's Tenant ahead of every operation that
+/// names one, and nearly every answer is "exists", so a name it holds skips
+/// the store for [`KnownTenants::TTL`]. It keeps positive answers only: a
+/// write can create a Tenant at any moment, so a "does not exist" is never
+/// kept. A purge on this process forgets the name at once; a purge on
+/// another process sharing the store is seen once the entry ages out.
+#[derive(Debug, Default)]
+pub struct KnownTenants(std::sync::Mutex<std::collections::HashMap<String, Instant>>);
+
+impl KnownTenants {
+    /// How long a remembered "exists" stands in for the store's answer.
+    pub const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The most names held at once (ADR-0001's 10 000-tenant target): a
+    /// full map takes no new name until its old entries age out.
+    pub const CAP: usize = 10_000;
+
+    fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Did the store say this Tenant exists within the last [`Self::TTL`]?
+    #[must_use]
+    pub fn holds(&self, tenant: &antares_model::TenantId) -> bool {
+        self.map()
+            .get(tenant.as_str())
+            .is_some_and(|at| at.elapsed() < Self::TTL)
+    }
+
+    /// The store just said this Tenant exists.
+    pub fn remember(&self, tenant: &antares_model::TenantId) {
+        let mut map = self.map();
+        if map.len() >= Self::CAP && !map.contains_key(tenant.as_str()) {
+            map.retain(|_, at| at.elapsed() < Self::TTL);
+            if map.len() >= Self::CAP {
+                return;
+            }
+        }
+        map.insert(tenant.as_str().to_owned(), Instant::now());
+    }
+
+    /// The Tenant was purged: the next request asks the store again.
+    pub fn forget(&self, tenant: &antares_model::TenantId) {
+        self.map().remove(tenant.as_str());
     }
 }
 
@@ -66,15 +276,44 @@ static PROPAGATED: [axum::http::HeaderName; 3] = [
     axum::http::HeaderName::from_static("link"),
 ];
 
+/// How many [`AppState::call`] frames the running task is inside: zero
+/// outside an in-process call. A caller that must not reach the router past
+/// [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`] reads it to answer for
+/// itself rather than take the router's 500.
+#[must_use]
+pub fn in_process_depth() -> usize {
+    INPROCESS_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
 tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
     /// façade call, which reads as zero.
-    static INPROCESS_DEPTH: usize;
+    pub(crate) static INPROCESS_DEPTH: usize;
 }
 
+/// The broker's state as every handler and layer receives it. Cloned at
+/// every middleware layer and extractor of every request, so a clone is
+/// three reference counts: the per-process part sits behind one `Arc`
+/// ([`Shared`], read through `Deref`), and only what a narrowed state
+/// changes, the view and its in-process router memo, is held per state.
+/// Writing a shared field (`DerefMut`) copies the shared part when another
+/// state holds it, so a write made before serving is never seen by a state
+/// cloned earlier, as it was when every field was copied.
 #[derive(Clone)]
 pub struct AppState {
+    shared: Arc<Shared>,
+    /// The router [`AppState::call`] serves in-process requests through,
+    /// built on first use. Empty until a façade actually calls: building it
+    /// costs about 1.5 ms, which is worth memoizing per state and not worth
+    /// paying in a host that never makes an in-process call.
+    pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+}
+
+/// The per-process part of [`AppState`]: every handle and setting a state
+/// and its narrowed copies share.
+#[derive(Clone)]
+pub struct Shared {
     pub store: Arc<dyn CurrentStateDriver>,
     /// The temporal driver — by default the same backend instance as
     /// `store`; a deployment may load a different one (or none).
@@ -97,6 +336,16 @@ pub struct AppState {
     pub default_limit: usize,
     /// Hard ceiling on limit (TooManyResults guard).
     pub max_limit: usize,
+    /// 6.3.10: the most instances of one Attribute a temporal response
+    /// serves ([`crate::bounds::temporal_instance_limit`]); the ETSI suite's
+    /// brokers and its unit cases run with 9.
+    pub temporal_instance_limit: usize,
+    /// The instances of one Attribute served when no lastN/firstN is asked
+    /// ([`crate::bounds::temporal_default_instances`]), at most the ceiling.
+    pub temporal_default_instances: usize,
+    /// The most bytes of one in-process answer a handler buffers
+    /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
+    pub max_answer_bytes: usize,
     /// One shared outbound client, timeouts set at construction.
     pub http: antares_jsonld::HttpClient,
     /// Federation-forwarding client — longer deadline: the ETSI mock replies
@@ -109,13 +358,20 @@ pub struct AppState {
     /// own reserved prefix; `with_surface` adds one. The admin surface is
     /// here by default.
     pub surfaces: Arc<Vec<Box<dyn crate::ApiSurface>>>,
-    /// The router [`AppState::call`] serves in-process requests through,
-    /// built on first use. Empty until a façade actually calls: building it
-    /// costs about 1.5 ms, which is worth memoizing per state and not worth
-    /// paying in a host that never makes an in-process call.
-    pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The transport every federation forward asks before the socket:
+    /// shared by every clone, so a state made before the
+    /// transport was registered (the one an `Ops` holds) forwards through it
+    /// too. Empty in vanilla: every forward is HTTP.
+    pub(crate) forward_transport: Arc<std::sync::OnceLock<Arc<dyn crate::ForwardTransport>>>,
     /// Bounds-wall rejection counters (exported by /q/health).
     pub limits: Arc<crate::bounds::LimitStats>,
+    /// `GET /q/tenants/{tenant}` sizes by tenant with the instant they were
+    /// measured: a size is a scan of the tenant, so it is reused for
+    /// [`crate::TENANT_BYTES_TTL`]. One entry per existing tenant
+    /// asked about; a purge drops its entry.
+    pub tenant_bytes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BytesEntry>>>,
+    /// The 5.5.10 wall's memory of Tenants that exist.
+    pub known_tenants: Arc<KnownTenants>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
     pub mem_stats: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Bus state provider for /q/health (`bus: {mode, connected,
@@ -133,6 +389,9 @@ pub struct AppState {
     /// boxing a future or arming a timer, so a broker with no engine pays
     /// nothing for the seam.
     pub policy: Option<Arc<dyn crate::policy::PolicyEngine>>,
+    /// The `/q` admin credential ([`AppState::with_admin_auth`]); `None`
+    /// serves `/q` without one, as the broker did.
+    pub admin_auth: Option<Arc<crate::admin_auth::AdminAuth>>,
     /// Set the moment SIGTERM arrives, BEFORE the listener stops
     /// accepting — `/q/health` then answers 503 DRAINING so the load balancer
     /// takes this instance out while its socket still works.
@@ -160,15 +419,17 @@ pub struct AppState {
     /// layer hands them over after the handler) so the matcher sees a batch
     /// request as one unit. `None` until the local pipeline is wired.
     pub change_flush: Option<Arc<dyn Fn(Vec<crate::mirror::Change>) + Send + Sync>>,
-    /// bus=nats: called after every Registration CUD so the wiring can
-    /// publish the delta on `ANTARES_REGISTRY`. `None` in local mode.
+    /// Called after every Registration CUD: bus=nats publishes the delta on
+    /// `ANTARES_REGISTRY`, bus=local applies it to `reg_mirror` in process.
+    /// `None` while no mirror is wired.
     #[allow(clippy::type_complexity)] // a boxed callback, named where it is installed
     pub reg_sync: Option<
         Arc<dyn Fn(&antares_model::TenantId, &str, Option<&serde_json::Value>) + Send + Sync>,
     >,
-    /// bus=nats: the ONE per-process compiled registration mirror,
-    /// delta-fed from `ANTARES_REGISTRY`; expiry stays filtered at the single
-    /// yield point (`federation::matching_regs`). `None` in local mode.
+    /// The ONE per-process compiled registration mirror, delta-fed from
+    /// `ANTARES_REGISTRY` (bus=nats) or by `reg_sync` (bus=local); expiry
+    /// stays filtered at the single yield point (`federation::matching_regs`).
+    /// `None` until wired or when its hydrate failed: the store is read then.
     pub reg_mirror: Option<Arc<crate::mirror::DocMirror>>,
     /// 5.2.34 (bus=nats): shares a cooldown stamp with the other api pods —
     /// a per-process stamp re-dials a failed source from every pod behind
@@ -197,6 +458,21 @@ pub struct AppState {
     /// instances the write path records into history. Default `All`, which
     /// the ETSI temporal suites assume.
     pub temporal_record: TemporalRecord,
+    /// Behaviour profile keys ([`Profile`]); the broker sets it from the env.
+    pub profile: Profile,
+    /// The mesh identity of the gateway whose provenance headers the broker
+    /// believes, set by an embedding binary; `None` believes nobody.
+    pub provenance_from: Option<String>,
+    /// A request to the NGSI-LD API that carries no subject header is served
+    /// only with the admin bearer token
+    /// ([`crate::admin_auth::subject_or_admin`]). `false` (the default)
+    /// serves it as before; a deployment sets it when it names subject
+    /// headers.
+    pub subject_required: bool,
+    /// History gate 3: the (Tenant, expanded type) pairs whose
+    /// retention rule says `history: "off"`. The views reload replaces the
+    /// set; an Entity with any of these types records no attribute instance.
+    pub history_off: HistoryOff,
     /// The base URL remote Context Sources reach THIS broker at — used as
     /// the notification endpoint of forwarded subscription copies
     /// (5.8.1.4). ANTARES_PUBLIC_URL, defaulting to
@@ -212,7 +488,37 @@ pub struct AppState {
     pub delivery: antares_notifier::DeliveryPolicy,
 }
 
+impl std::ops::Deref for AppState {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Shared {
+        // the memoised in-process router captured the settings about to
+        // change: a later call must build one over the new ones
+        self.inbound = Arc::new(std::sync::OnceLock::new());
+        Arc::make_mut(&mut self.shared)
+    }
+}
+
 impl AppState {
+    /// This state's broker, told apart from the other brokers of the
+    /// process: its narrowed copies share it, and no live broker shares it
+    /// with another.
+    pub(crate) fn broker(&self) -> usize {
+        Arc::as_ptr(&self.shared).addr()
+    }
+
+    /// Whether `other` is this state: the same broker.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        self.broker() == other.broker()
+    }
+
     /// The built-in store: in-memory, or — under the reserved harness
     /// variable `ANTARES_TEST_STORE=file` — a fresh on-disk redb store per
     /// state, so the same test binary proves the durable backend without a
@@ -272,36 +578,41 @@ impl AppState {
                     }
                     let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes());
                     // A refetch (staleness, delete+reload) must keep the row's
-                    // identity and hit counters — only the body is new.
+                    // identity and hit counters — only the body is new — and
+                    // it swaps the body under the row lock, so a bump racing
+                    // it keeps its count. Only a row that is not there is
+                    // written whole.
                     // The row this writes is `Cached` and belongs to no Tenant
                     // (ADR-0021), but the call still acts for the Tenant whose
                     // resolution triggered the fetch: that is what lets the guard
                     // above see this Tenant's own Hosted rows.
-                    let prior = store
-                        .context_get(tenant, &id.to_string())
-                        .await
-                        .ok()
-                        .flatten();
-                    let field = |k: &str| {
-                        prior
-                            .as_ref()
-                            .and_then(|p| p[k].as_str())
-                            .map(str::to_owned)
-                    };
-                    let created = field("createdAt").unwrap_or_else(now_iso);
+                    let id = id.to_string();
+                    let body = serde_json::json!({"@context": ctx_value});
+                    let refetched = store
+                        .context_mutate(
+                            tenant,
+                            &id,
+                            Box::new(|row| {
+                                row.as_object_mut()
+                                    .ok_or(())?
+                                    .insert("body".into(), body.clone());
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    if matches!(refetched, Ok(Some(Ok(())))) {
+                        return;
+                    }
                     let doc = serde_json::json!({
                         "url": url,
-                        "localId": id.to_string(),
+                        "localId": id,
                         "kind": "Cached",
-                        "createdAt": created,
-                        "numberOfHits": prior
-                            .as_ref()
-                            .and_then(|p| p["numberOfHits"].as_u64())
-                            .unwrap_or(0),
-                        "lastUsage": field("lastUsage"),
-                        "body": {"@context": ctx_value},
+                        "createdAt": now_iso(),
+                        "numberOfHits": 0,
+                        "lastUsage": null,
+                        "body": body,
                     });
-                    if let Err(e) = store.context_put(tenant, &id.to_string(), doc).await {
+                    if let Err(e) = store.context_put(tenant, &id, doc).await {
                         // a client-named @context URL may carry userinfo
                         tracing::warn!(
                             "@context write-through failed for {}: {e}",
@@ -325,41 +636,44 @@ impl AppState {
                     if Loader::is_pinned_core(url) {
                         return true;
                     }
-                    // One read, not two: a bump runs on every counted use of a
-                    // non-pinned @context, and the hosted probe already carries
-                    // the row it found.
-                    let held = hosted_row(&*store, tenant, url).await;
-                    let (id, row) = match held {
-                        Some((id, row)) => (id, Ok(Some(row))),
-                        None => {
-                            let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
-                                .to_string();
-                            let row = store.context_get(tenant, &id).await;
-                            (id, row)
-                        }
+                    let id = match hosted_row_id(&*store, tenant, url).await {
+                        Some(id) => id,
+                        None => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
+                            .to_string(),
                     };
-                    match row {
-                        // the row is what the store handed back, and `Value`'s
-                        // index panics on anything that is not an object; a row
-                        // that cannot carry the counters is left uncounted
-                        Ok(Some(mut doc)) if doc.is_object() => {
-                            let hits = doc["numberOfHits"].as_u64().unwrap_or(0) + 1;
-                            doc["numberOfHits"] = serde_json::json!(hits);
-                            doc["lastUsage"] = serde_json::json!(now_iso());
-                            if let Err(e) = store.context_put(tenant, &id, doc).await {
-                                tracing::warn!(
-                                    "@context hit bump failed for {}: {e}",
-                                    antares_notifier::redact_userinfo(url)
-                                );
-                            }
-                            true
-                        }
+                    // under the row lock: a bump racing a delete leaves the row
+                    // deleted, and two racing bumps both count
+                    let bumped = store
+                        .context_mutate(
+                            tenant,
+                            &id,
+                            Box::new(|row| {
+                                let o = row.as_object_mut().ok_or(())?;
+                                let hits = o
+                                    .get("numberOfHits")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    .saturating_add(1);
+                                o.insert("numberOfHits".into(), serde_json::json!(hits));
+                                o.insert("lastUsage".into(), serde_json::json!(now_iso()));
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    match bumped {
+                        Ok(Some(Ok(()))) => true,
                         // a row that cannot carry the counters is left
                         // uncounted, and still exists: it must not be evicted
-                        Ok(Some(_)) => true,
+                        Ok(Some(Err(()))) => true,
                         Ok(None) => false,
                         // a store hiccup must never evict a healthy cache entry
-                        Err(_) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "@context hit bump failed for {}: {e}",
+                                antares_notifier::redact_userinfo(url)
+                            );
+                            true
+                        }
                     }
                 })
             }));
@@ -377,7 +691,18 @@ impl AppState {
             loader.set_local_lookup(Arc::new(move |tenant, url| {
                 let store = store.clone();
                 Box::pin(async move {
-                    let (_, row) = hosted_row(&*store, tenant, url).await?;
+                    // A miss for a named Tenant still asks the DEFAULT one: a
+                    // fetch of this URL would reach the serve endpoint with no
+                    // NGSILD-Tenant, get the default Tenant's row and cache it
+                    // for everyone. Found here, it keeps its owner.
+                    let default = antares_model::TenantId::default();
+                    let (_, row) = match hosted_row(&*store, tenant, url).await {
+                        Some(found) => found,
+                        None if tenant.is_some_and(|t| *t != default) => {
+                            hosted_row(&*store, Some(&default), url).await?
+                        }
+                        None => return None,
+                    };
                     // Ownership is one rule for the whole broker (ADR-0021): a
                     // Cached row is a copy of a public document and belongs to no
                     // Tenant, everything else belongs to its `owner` — with the
@@ -386,7 +711,10 @@ impl AppState {
                     // it.
                     let owner = antares_store::context_row_owner(&row)
                         .and_then(|o| antares_model::TenantId::new_internal(o).ok());
-                    Some((owner, row["body"]["@context"].clone()))
+                    Some((
+                        owner,
+                        row.pointer("/body/@context").cloned().unwrap_or_default(),
+                    ))
                 })
             }));
         }
@@ -406,51 +734,64 @@ impl AppState {
         // notification delivery never names a transport.
         let http = outbound_client(
             egress_policy,
-            std::time::Duration::from_secs(5 * slow_factor()),
+            std::time::Duration::from_secs(slow_factor().saturating_mul(5)),
         );
         let mut sinks = antares_notifier::SinkRegistry::default();
         sinks.register(Box::new(antares_notifier::HttpSink::new(http.clone())));
         #[cfg(feature = "mqtt")]
         sinks.register(Box::new(antares_notifier::mqtt::MqttSink::default()));
         Self {
-            store,
-            temporal,
-            store_name: store_name.to_owned(),
-            temporal_name,
-            loader,
-            started: Instant::now(),
-            started_at: now_iso(),
-            host_alias,
-            default_limit: 1000,
-            max_limit: 1000,
-            http: http.clone(),
-            fed_http: outbound_client(
-                egress_policy,
-                std::time::Duration::from_secs(8 * slow_factor()),
-            ),
-            sinks: Arc::new(sinks),
             inbound: Arc::new(std::sync::OnceLock::new()),
-            surfaces: Arc::new(vec![Box::new(crate::Admin)]),
-            limits: Arc::new(crate::bounds::LimitStats::default()),
-            mem_stats: None,
-            bus_stats: None,
-            egress: Arc::new(crate::egress::Egress::new(egress_policy)),
-            policy: None,
-            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_changes: Arc::default(),
-            sub_sync: None,
-            sub_mirror: None,
-            change_flush: None,
-            reg_sync: None,
-            reg_fail_sync: None,
-            reg_mirror: None,
-            metrics_render: None,
-            csource_notification: None,
-            nats: false,
-            temporal_record: TemporalRecord::All,
-            public_url,
-            snapshot_cap: 1024,
-            delivery: antares_notifier::DeliveryPolicy::default(),
+            shared: Arc::new(Shared {
+                store,
+                temporal,
+                store_name: store_name.to_owned(),
+                temporal_name,
+                loader,
+                started: Instant::now(),
+                started_at: now_iso(),
+                host_alias,
+                default_limit: *crate::bounds::DEFAULT_LIMIT,
+                max_limit: *crate::bounds::MAX_LIMIT,
+                temporal_instance_limit: crate::bounds::temporal_instance_limit(),
+                temporal_default_instances: crate::bounds::temporal_default_instances(),
+                max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
+                http: http.clone(),
+                fed_http: outbound_client(
+                    egress_policy,
+                    std::time::Duration::from_secs(slow_factor().saturating_mul(8)),
+                ),
+                sinks: Arc::new(sinks),
+                forward_transport: Arc::new(std::sync::OnceLock::new()),
+                surfaces: Arc::new(vec![Box::new(crate::Admin)]),
+                limits: Arc::new(crate::bounds::LimitStats::default()),
+                tenant_bytes: Arc::default(),
+                known_tenants: Arc::default(),
+                mem_stats: None,
+                bus_stats: None,
+                egress: Arc::new(crate::egress::Egress::new(egress_policy)),
+                policy: None,
+                admin_auth: None,
+                draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_changes: Arc::default(),
+                sub_sync: None,
+                sub_mirror: None,
+                change_flush: None,
+                reg_sync: None,
+                reg_fail_sync: None,
+                reg_mirror: None,
+                metrics_render: None,
+                csource_notification: None,
+                nats: false,
+                temporal_record: TemporalRecord::All,
+                profile: Profile::default(),
+                provenance_from: None,
+                subject_required: false,
+                history_off: HistoryOff::default(),
+                public_url,
+                snapshot_cap: 1024,
+                delivery: antares_notifier::DeliveryPolicy::default(),
+            }),
         }
     }
 
@@ -461,6 +802,15 @@ impl AppState {
     #[must_use]
     pub fn with_policy(mut self, engine: Arc<dyn crate::policy::PolicyEngine>) -> Self {
         self.policy = Some(engine);
+        self
+    }
+
+    /// Puts every `/q` route except health and readiness (and metrics, when
+    /// `auth` leaves them open) behind `auth`'s bearer secret. Set before
+    /// the router is built: the admin surface reads it when it mounts.
+    #[must_use]
+    pub fn with_admin_auth(mut self, auth: crate::admin_auth::AdminAuth) -> Self {
+        self.admin_auth = Some(Arc::new(auth));
         self
     }
 
@@ -490,6 +840,27 @@ impl AppState {
             None => tracing::warn!("sink registry already shared; binding not registered"),
         }
         self
+    }
+
+    /// Register the transport every federation forward asks before the
+    /// socket. A
+    /// forward it answers `None` for goes over HTTP as before. Every clone
+    /// of this state shares the one slot, before or after this call. The
+    /// transport usually holds such a clone, so it lives as long as the
+    /// state's last clone does: register it in a host that keeps its state
+    /// for the life of the process, as the broker does.
+    ///
+    /// # Errors
+    /// When a transport is already registered: a second one would leave
+    /// the choice between them to registration order.
+    pub fn with_forward_transport(
+        self,
+        transport: Arc<dyn crate::ForwardTransport>,
+    ) -> Result<Self, String> {
+        self.forward_transport
+            .set(transport)
+            .map_err(|_| "a forward transport is already registered".to_owned())?;
+        Ok(self)
     }
 
     /// Mount one more HTTP surface (`/q`, `/x`, or below `/x`). A prefix
@@ -578,7 +949,7 @@ impl AppState {
         // serves would call itself for as long as the stack lasts, and
         // every frame builds a router. The chain is counted per task, so a
         // façade over a façade is served and a loop is not.
-        let depth = INPROCESS_DEPTH.try_with(|d| *d).unwrap_or(0);
+        let depth = in_process_depth();
         if depth >= crate::bounds::MAX_IN_PROCESS_CALL_DEPTH {
             return crate::negotiate::ApiError::from(antares_model::NgsiError::InternalError(
                 format!(
@@ -622,7 +993,10 @@ impl AppState {
         }
         let req = axum::http::Request::from_parts(parts, body);
         match INPROCESS_DEPTH
-            .scope(depth + 1, tower::ServiceExt::oneshot(router.clone(), req))
+            .scope(
+                depth.saturating_add(1),
+                tower::ServiceExt::oneshot(router.clone(), req),
+            )
             .await
         {
             Ok(r) => r,
@@ -633,6 +1007,49 @@ impl AppState {
             ))
             .into_response(),
         }
+    }
+
+    /// [`AppState::call`] on a task of its own, at the caller's in-process
+    /// depth. A chain of calls each awaiting the next polls every frame
+    /// inside the one before it, and a few federation handlers deep that
+    /// is more stack than a worker thread has; on its own task each frame
+    /// is polled from the scheduler, as a request over HTTP is. Dropping
+    /// the returned future (a forward's timeout) aborts the task.
+    ///
+    /// The new task inherits no view: the call runs through `view` when one
+    /// is given ([`crate::policy::through_view`]), so the engine decides a
+    /// forward under a grant's view as a request through that view,
+    /// and never by the view of the request that triggered the forward.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn call_on_task(
+        &self,
+        view: Option<&str>,
+        caller: axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        /// Aborts the task when the forward waiting on it is dropped.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let st = self.clone();
+        let view = view.map(str::to_owned);
+        let task = tokio::spawn(INPROCESS_DEPTH.scope(in_process_depth(), async move {
+            match view {
+                Some(id) => crate::policy::through_view(&id, st.call(&caller, req)).await,
+                None => st.call(&caller, req).await,
+            }
+        }));
+        let _abort = AbortOnDrop(task.abort_handle());
+        task.await.unwrap_or_else(|_| {
+            crate::negotiate::ApiError::from(antares_model::NgsiError::InternalError(
+                "the in-process call failed".into(),
+            ))
+            .into_response()
+        })
     }
 
     /// Temporal auto-recording happens synchronously in the write path in
@@ -708,7 +1125,7 @@ fn outbound_client(
 ) -> antares_jsonld::HttpClient {
     let b = antares_jsonld::with_timeouts(
         antares_jsonld::client_builder(policy),
-        std::time::Duration::from_secs(2 * slow_factor()),
+        std::time::Duration::from_secs(slow_factor().saturating_mul(2)),
         total,
     );
     // the suite's notification receiver asserts header names
@@ -832,6 +1249,135 @@ mod jsonld_context_locality_5_13 {
             serde_json::json!(2),
             "both counted uses land on the shared row (5.13.3.5)"
         );
+    }
+
+    /// the default Tenant's Hosted @context is not fetched for
+    /// another Tenant through the broker's own (tenant-less) serve URL.
+    #[tokio::test]
+    async fn a_default_tenant_context_is_not_fetched_for_another_tenant() {
+        let st = AppState::new("me".into());
+        let owner = antares_model::TenantId::default();
+        let (url, fetches) = context_server("/ngsi-ld/v1/jsonldContexts/local-d");
+        st.store
+            .context_put(
+                Some(&owner),
+                "local-d",
+                serde_json::json!({
+                    "url": url, "localId": "local-d", "kind": "Hosted",
+                    "owner": owner.as_str(), "createdAt": now_iso(),
+                    "body": {"@context": {"peerTemp": "http://example.org/peerTemp"}},
+                }),
+            )
+            .await
+            .expect("seed hosted row");
+        let beta = antares_model::TenantId::new("beta").expect("tenant");
+        let user = serde_json::json!(url);
+        for _ in 0..2 {
+            let e = st.loader.resolve_for(&beta, &user).await;
+            assert!(
+                matches!(e, Err(antares_model::NgsiError::LdContextNotAvailable(_))),
+                "{e:?}"
+            );
+        }
+        assert_eq!(fetch_count(&fetches), 0, "never fetched over HTTP");
+        st.loader
+            .resolve_for(&owner, &user)
+            .await
+            .expect("owner resolves");
+    }
+
+    /// a Cached @context serves every Tenant, so a named Tenant
+    /// may neither delete nor reload it; the default Tenant may.
+    #[tokio::test]
+    async fn only_the_default_tenant_deletes_a_cached_context() {
+        let st = AppState::new("me".into());
+        let (url, _) = context_server("/shared.jsonld");
+        let alpha = antares_model::TenantId::new("alpha").expect("tenant");
+        st.loader
+            .resolve_for(&alpha, &serde_json::json!(url))
+            .await
+            .expect("cached");
+        let path = format!(
+            "/ngsi-ld/v1/jsonldContexts/{}",
+            url.replace(':', "%3A").replace('/', "%2F")
+        );
+        let send = |method: &str, uri: String, tenant: Option<&str>| {
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(t) = tenant {
+                b = b.header("NGSILD-Tenant", t);
+            }
+            let req = b.body(axum::body::Body::empty()).expect("request");
+            tower::ServiceExt::oneshot(crate::router(st.clone()), req)
+        };
+        for uri in [path.clone(), format!("{path}?reload=true")] {
+            let refused = send("DELETE", uri, Some("beta")).await.expect("response");
+            assert_eq!(refused.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        let details = send("GET", format!("{path}?details=true"), None)
+            .await
+            .expect("response");
+        assert_eq!(
+            details.status(),
+            axum::http::StatusCode::OK,
+            "the row is kept"
+        );
+        let deleted = send("DELETE", path, None).await.expect("response");
+        assert_eq!(deleted.status(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    /// a Tenant purge drops its Hosted @context from the loader
+    /// too, so the name recreated is not served the old term mappings.
+    #[tokio::test]
+    async fn a_purged_tenants_hosted_context_resolves_no_more() {
+        let st = AppState::new("me".into());
+        let t = antares_model::TenantId::new("purgectx").expect("tenant");
+        let (url, fetches) = context_server("/ngsi-ld/v1/jsonldContexts/local-p");
+        st.store
+            .context_put(
+                Some(&t),
+                "local-p",
+                serde_json::json!({
+                    "url": url, "localId": "local-p", "kind": "Hosted",
+                    "owner": t.as_str(), "createdAt": now_iso(),
+                    "body": {"@context": {"peerTemp": "http://example.org/peerTemp"}},
+                }),
+            )
+            .await
+            .expect("seed hosted row");
+        let user = serde_json::json!(url);
+        st.loader
+            .resolve_for(&t, &user)
+            .await
+            .expect("owner resolves");
+        let req = |m: &str, uri: &str, body: &str| {
+            axum::http::Request::builder()
+                .method(m)
+                .uri(uri)
+                .header("NGSILD-Tenant", "purgectx")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len())
+                .body(axum::body::Body::from(body.to_owned()))
+                .expect("request")
+        };
+        let entity = r#"{"id": "urn:ngsi-ld:Room:p", "type": "Room"}"#;
+        let made = tower::ServiceExt::oneshot(
+            crate::router(st.clone()),
+            req("POST", "/ngsi-ld/v1/entities", entity),
+        )
+        .await
+        .expect("response");
+        assert_eq!(made.status(), axum::http::StatusCode::CREATED);
+        let purged = tower::ServiceExt::oneshot(
+            crate::router(st.clone()),
+            req("DELETE", "/q/tenants/purgectx", ""),
+        )
+        .await
+        .expect("response");
+        assert_eq!(purged.status(), axum::http::StatusCode::NO_CONTENT);
+        // the purge released the loader's entry for the row while it still
+        // listed it; run after the store purge it listed nothing
+        assert!(st.loader.usage_get(&url).await.is_none());
+        assert_eq!(fetch_count(&fetches), 0);
     }
 
     /// 5.13.3.5 counts uses of an @context this broker hosts on its own
@@ -1027,5 +1573,52 @@ mod jsonld_context_locality_5_13 {
             serde_json::json!("Cached"),
             "the fetched document is this broker's Cached copy (5.13.1)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "test-kit"))]
+mod clone_cost {
+    use super::*;
+
+    /// every middleware layer and extractor of a request clones the
+    /// state; a clone copies no String, no client and no handle.
+    #[test]
+    fn a_clone_shares_the_per_process_part() {
+        let a = AppState::new("antares-test".into());
+        let b = a.clone();
+        assert!(std::ptr::eq(&a.http, &b.http), "the HTTP client is copied");
+        assert!(std::ptr::eq(&a.fed_http, &b.fed_http));
+        assert!(std::ptr::eq(a.public_url.as_ptr(), b.public_url.as_ptr()));
+        assert!(std::ptr::eq(a.store_name.as_ptr(), b.store_name.as_ptr()));
+    }
+
+    /// A setting written before serving is the writer's own: a state cloned
+    /// earlier keeps what it had, as it did when every field was copied.
+    #[test]
+    fn a_write_after_a_clone_is_not_seen_by_the_clone() {
+        let a = AppState::new("antares-test".into());
+        let mut c = a.clone();
+        c.max_limit = 7;
+        assert_eq!((a.max_limit, c.max_limit), (1000, 7));
+        assert!(!std::ptr::eq(&a.http, &c.http));
+    }
+
+    /// a setting written after an in-process call reaches the
+    /// next call; the memoised router of the clone was built over the old
+    /// settings and answered `limit=5` as if `max_limit` were still 1000.
+    #[tokio::test]
+    async fn a_write_after_a_call_reaches_the_next_call() {
+        let call = |st: &AppState| {
+            let req = axum::http::Request::get("/ngsi-ld/v1/entities?type=T&limit=5")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let st = st.clone();
+            async move { st.call(&axum::http::HeaderMap::new(), req).await.status() }
+        };
+        let a = AppState::new("antares-test".into());
+        assert_eq!(call(&a).await, axum::http::StatusCode::OK);
+        let mut c = a.clone();
+        c.max_limit = 1;
+        assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
     }
 }

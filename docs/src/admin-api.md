@@ -10,6 +10,22 @@ deployment mounted. Everything else the broker answers is CIM 009, and the
 pod (`ANTARES_ROLES` without `api`) serves only these routes. Errors use the
 same problem-details shape as the NGSI-LD API.
 
+A deployment can also put `/q/` behind a secret of the broker's own, so a
+network position is not the only thing between a caller and a tenant purge.
+`ANTARES_ADMIN_TOKEN_FILE` names a file holding it (a mounted Secret, at
+least 32 bytes, one trailing line break ignored). With it set, every `/q/`
+route except `GET /q/health` and `GET /q/ready` answers `401` with
+`WWW-Authenticate: Bearer realm="antares-admin"` and the problem type
+`urn:antares:error:Unauthorized` unless the request carries
+`Authorization: Bearer <secret>`; the comparison does not stop at the first
+differing byte. `GET /q/metrics` is guarded too unless
+`ANTARES_ADMIN_METRICS=open`, for a scraper that cannot send a header.
+`ANTARES_METRICS_PORT` moves `GET /q/metrics` to a listener of its own that
+serves nothing else, so the scraper needs no path to the API port. The
+broker reads the file once at start, refuses to start when it is unreadable
+or too short, and never logs the secret. Unset, `/q/` asks for nothing and
+the broker logs one warning at start saying so.
+
 The same routes as an OpenAPI document, with every status code and response
 schema: `docs/openapi/antares-admin.yaml`, rendered at
 <https://antaresbroker.joinedcontext.com/openapi/admin.html> (see the
@@ -48,9 +64,15 @@ progress). A memory-store broker answers:
   "policy": { "engine": "allow-all", "timeoutMs": 250 },
   "surfaces": { "admin": { "prefix": "/q", "routes": 8 } },
   "limits": {
+    "batchInflight": 8,
+    "batchInflightBytes": 4194304,
     "changeQueue": 1024,
+    "defaultLimit": 100,
+    "deliveryLane": 64,
+    "deliveryLaneBytes": 134217728,
     "deliveryWidth": 64,
     "deliveryWidthPerTenant": 8,
+    "maxAnswerBytes": 67108864,
     "maxBatchItems": 1000,
     "maxBodyBytes": 4194304,
     "maxContextFetches": 32,
@@ -62,6 +84,7 @@ progress). A memory-store broker answers:
     "maxInProcessCallDepth": 8,
     "maxJoinLevel": 10,
     "maxJsonDepth": 64,
+    "maxLimit": 1000,
     "maxPeerWarnings": 8,
     "maxQLinkLookups": 512,
     "maxQNodes": 512,
@@ -72,7 +95,9 @@ progress). A memory-store broker answers:
     "maxUriBytes": 8192,
     "rejectedBodyTooDeep": 0,
     "rejectedBodyTooLarge": 0,
-    "rejectedUriTooLong": 0
+    "rejectedUriTooLong": 0,
+    "temporalDefaultInstances": 100,
+    "temporalInstanceLimit": 1000
   },
   "memory": { "allocatedBytes": 5671592, "residentBytes": 24051712 }
 }
@@ -83,7 +108,7 @@ progress). A memory-store broker answers:
 | `status` | `UP`, or `DRAINING` with status 503 once shutdown began. |
 | `store` | The current-state backend: `memory`, `file`, `postgres`, `timescale`. |
 | `temporal` | The history backend: one of the four, or `none` when history is off (`ANTARES_TEMPORAL`). |
-| `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
+| `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolWriteReserve, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
 | `version`, `commit` | Workspace version and the git hash the binary was built from. |
 | `notificationSchemes` | The `notification.endpoint.uri` schemes this build can deliver to — the registered bindings (6.3.8, clause 7, and any a deployment added). A subscription naming a scheme absent here is refused at creation with `BadRequestData`. |
 | `deadLetters` | Dead letters this process wrote since start ([notification delivery](operations.md#notification-delivery)). |
@@ -92,7 +117,7 @@ progress). A memory-store broker answers:
 | `temporalDrainErrors` | Post-response history writes that failed since start; the client's 2xx stands, the counter and a warning record the loss. |
 | `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
-| `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those four — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. |
+| `limits` | The bounds wall: every `max*` cap in force, the page defaults (`defaultLimit`, `temporalDefaultInstances`: what a request naming no `limit` or `lastN` gets) and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
 | `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
 | `commitQueueDepth`, `commitQueuePeak` | Present only for a store with a single committer to queue behind (`file`, and the browser build over OPFS): writers queued now and at peak. |
 | `bus` | `ANTARES_BUS=nats` only: `{mode, connected, reconnects}`. |
@@ -121,6 +146,7 @@ Prometheus text with the `antares_` prefix:
 | `antares_temporal_drain_errors_total` | Failed post-response history writes. |
 | `antares_notifications_sent_total`, `antares_notifications_retried_total`, `antares_notifications_failed_total` | Notification deliveries by outcome. |
 | `antares_notification_changes_dropped_total` | Change events the notifier dropped under back-pressure. |
+| `antares_notification_lane_dropped_total` | Entities a subscription's full delivery lane dropped: that subscriber is slower than its changes (the log line names tenant and subscription). |
 | `antares_claim_check_unresolved_total` | Changes too big for the bus whose kept outbox row was already reaped: the before-image is gone and the change notifies nobody. Non-zero means a matcher lagged past the retention window. |
 | `antares_notification_task_panics_total` | Delivery tasks that panicked (a bug, never expected). |
 | `antares_change_lag_seconds` | Age of the change a notifier is handling. |
@@ -164,7 +190,10 @@ GET /q/tenants/acme
 `200`, `404` for a tenant that does not exist, `400` for a name outside the
 tenant grammar or one of the broker's internal names. `createdAt` is present
 on Postgres, where the `tenants` table records it. The default tenant always
-exists (5.5.10) and is always readable, even when empty.
+exists (5.5.10) and is always readable, even when empty. `attrInstances`
+counts the tenant's history under a 5 s statement bound, the same bound as a
+size scan: when a long history does not count in time, the answer leaves
+`attrInstances` out and the other counts still answer.
 
 ### DELETE /q/tenants/{tenant}
 
@@ -176,6 +205,7 @@ tenant is emptied and keeps existing. The path names the tenant; an
 `NGSILD-Tenant` header is ignored. Background in
 [operations](operations.md#tenants).
 
+
 ## Dead letters
 
 A letter carries the subscription id, tenant, endpoint, headers, body,
@@ -186,8 +216,10 @@ why an egress refusal never does:
 ### GET /q/dead-letters
 
 `?tenant=&subscription=&limit=` — letters of one tenant (the default tenant
-when `tenant` is absent), newest first, `limit` 100 by default; `400` for a
-`limit` that is not a positive integer or a tenant outside the grammar.
+when `tenant` is absent), newest first, `limit` `ANTARES_DEFAULT_LIMIT` (100)
+by default; `400` for a `limit` that is not a positive integer or a tenant
+outside the grammar, `403` TooManyResults for one past `ANTARES_MAX_LIMIT`
+(1000).
 Endpoint userinfo, `receiverInfo`, `notifierInfo` and the rendered `headers`
 of an older letter are shown blanked; the stored letter keeps them so a
 replay still authenticates.
@@ -220,6 +252,11 @@ Subscription id, so a Context Source learns nothing about the subscriber and
 cannot address any other subscription. That key resolves through the stored
 mapping to the tenant and the local subscription; the request's
 `NGSILD-Tenant` header is not read on this route at all.
+
+Who may post: whoever holds a key. Each key is a random UUID minted for one
+subscription copy and sent only to the Context Source that copy went to, so
+the key is the peer's credential for that one subscription. A caller without
+one gets `404` before any store write or delivery (ADR-0019).
 
 `200` when the notification was accepted — including when the mapping
 resolves but nothing was left to deliver. `400` for a body that is not JSON,

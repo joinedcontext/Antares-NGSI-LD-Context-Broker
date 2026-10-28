@@ -59,6 +59,10 @@ function DeviceNode({ data }) {
 
 const nodeTypes = { space: SpaceNode, device: DeviceNode };
 
+// The nodes are rebuilt from the store on every change, so the sizes React
+// Flow measured have to ride along: without them the minimap draws nothing.
+const measured = new Map();
+
 // Center-to-center quadratic edges, trimmed at the bubble borders and aimed
 // at the control point — so edges RADIATE from a node instead of piling
 // into one handle, and parallel edges (a CSR and a copy between the same
@@ -132,6 +136,7 @@ export default function Board({ selected, onSelectSpace }) {
       id: `s:${s.name}`,
       type: "space",
       position: fallbackPos(`s:${s.name}`, i),
+      measured: measured.get(`s:${s.name}`),
       data: {
         name: s.name,
         emoji: avatarOf(s.name),
@@ -149,6 +154,7 @@ export default function Board({ selected, onSelectSpace }) {
           id: `p:${p.id}`,
           type: "device",
           position: fallbackPos(`p:${p.id}`, board.spaces.length + i),
+          measured: measured.get(`p:${p.id}`),
           data: {
             emoji: (p.gen ?? "⚙").slice(0, 2).trim(),
             type: p.type,
@@ -241,6 +247,9 @@ export default function Board({ selected, onSelectSpace }) {
         board.positions[c.id] = { x: c.position.x, y: c.position.y };
         moved = true;
         if (c.dragging === false) save("antares.pos", board.positions);
+      } else if (c.type === "dimensions" && c.dimensions) {
+        measured.set(c.id, c.dimensions);
+        moved = true;
       }
     }
     if (moved) emit();
@@ -276,6 +285,7 @@ export default function Board({ selected, onSelectSpace }) {
         onNodeClick={onNodeClick}
         onEdgeClick={onEdgeClick}
         fitView
+        colorMode="system"
         minZoom={0.2}
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
@@ -284,6 +294,7 @@ export default function Board({ selected, onSelectSpace }) {
         <Controls />
         <MiniMap pannable zoomable nodeColor={(n) => (n.type === "space" ? colorOf(n.data.name) : OK)} />
       </ReactFlow>
+      <p className="board-hint">tap a space to open its data · pinch to zoom</p>
       <div className="legend">
         <span><i className="lg-space" /> context space (tenant)</span>
         <span><i className="lg-device" /> sensor / source</span>

@@ -9,6 +9,10 @@
 //!         ANTARES_TEST_DATABASE_URL=postgresql://antares:antares@localhost:15432/antares \
 //!           cargo test -p antares-sql --test pg
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing.
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use sqlx::Row;
@@ -65,9 +69,11 @@ async fn migrations_apply_and_indexes_exist() {
     // existence).
     for idx in [
         "i_entities_location",
-        "i_entities_jsonb",
         "i_entities_types",
         "i_entities_loc_ambiguous",
+        "i_entities_first_type_id",
+        "i_entities_multi_type_id",
+        "i_entities_types_multi",
     ] {
         let n: i64 = sqlx::query(
             "SELECT count(*) FROM pg_indexes WHERE tablename = 'entities' AND indexname = $1",
@@ -79,6 +85,15 @@ async fn migrations_apply_and_indexes_exist() {
         .get(0);
         assert_eq!(n, 1, "index {idx} missing on entities");
     }
+    // 0019 dropped the whole-document GIN: no jsonb operator is leakproof,
+    // so it never served the broker's role under RLS.
+    let gin: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE tablename = 'entities' AND indexname = 'i_entities_jsonb'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("pg_indexes");
+    assert_eq!(gin, 0, "i_entities_jsonb is back on entities");
 
     // Every schema table exists.
     for table in [
@@ -115,6 +130,155 @@ async fn tenant_upsert_is_idempotent() {
     b.expect("second");
 }
 
+/// `entity_values` (0024) follows every write of an Entity: a
+/// create keys its values, a read-modify-write and a replace re-key them, a
+/// delete drops them, and a q= read finds the Entity by the new value only.
+#[tokio::test]
+async fn entity_values_follow_create_update_replace_and_delete() {
+    use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pg_entity_values").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = PgEntityStore::new(pool.clone());
+    let id = "urn:ngsi-ld:V:1";
+    let _ = store.delete(&t, id).await.expect("clear");
+    let doc = |speed: i64| serde_json::json!({"id": id, "type": "V", "speed": [{"type": "Property", "value": speed}]});
+    assert!(store.create(&t, id, &doc(1)).await.expect("create"));
+    let keyed = || async {
+        let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+            "SELECT attr, f FROM entity_values WHERE tenant_id = $1 AND id = $2 ORDER BY f NULLS FIRST",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        rows
+    };
+    let finds = |q: &'static str| {
+        let (store, t) = (&store, &t);
+        async move {
+            let ast = antares_ql::parse_q(q).expect("q");
+            let expand = |term: &str| term.to_owned();
+            let f = EntityFilter {
+                q: Some(&ast),
+                expand: &expand,
+                ..Default::default()
+            };
+            store.query(t, &f).await.expect("query").rows.len()
+        }
+    };
+    assert_eq!(keyed().await, [("speed".to_owned(), Some(1.0))]);
+    store
+        .mutate(&t, id, |d| {
+            d["speed"][0]["value"] = serde_json::json!(2);
+            Ok::<_, ()>(())
+        })
+        .await
+        .expect("mutate")
+        .expect("present")
+        .expect("applied");
+    assert_eq!(keyed().await, [("speed".to_owned(), Some(2.0))]);
+    assert_eq!((finds("speed==1").await, finds("speed==2").await), (0, 1));
+    store
+        .batch_upsert_replace(&t, &[(id.to_owned(), doc(3))])
+        .await
+        .expect("replace");
+    assert_eq!(keyed().await, [("speed".to_owned(), Some(3.0))]);
+    assert_eq!((finds("speed==2").await, finds("speed>=3").await), (0, 1));
+    assert!(store.delete(&t, id).await.expect("delete").is_some());
+    assert!(keyed().await.is_empty(), "a deleted Entity leaves no row");
+}
+
+/// a term more than 1 000 Entities match probes no id list and the
+/// page reads as before; one that fewer match reads only those. Both count
+/// exactly.
+#[tokio::test]
+async fn a_probe_past_its_cap_leaves_the_page_unnarrowed() {
+    use antares_sql::store::pg::entity::{EntityFilter, Page, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pg_entity_values_cap").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&pool)
+        .await
+        .expect("clear");
+    sqlx::query(
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         SELECT $1, 'urn:ngsi-ld:V:' || g,
+                jsonb_build_object('id', 'urn:ngsi-ld:V:' || g, 'type', 'V',
+                  'speed', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', least(g, 2) - 1))),
+                ARRAY['V'], now(), now()
+           FROM generate_series(1, 1200) g",
+    )
+    .bind(t.as_str())
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let store = PgEntityStore::new(pool.clone());
+    let total = |q: &'static str| {
+        let (store, t) = (&store, &t);
+        async move {
+            let ast = antares_ql::parse_q(q).expect("q");
+            let expand = |term: &str| term.to_owned();
+            let f = EntityFilter {
+                q: Some(&ast),
+                expand: &expand,
+                page: Some(Page {
+                    offset: 0,
+                    limit: 5,
+                    count: true,
+                }),
+                ..Default::default()
+            };
+            let out = store.query(t, &f).await.expect("query");
+            (out.rows.len(), out.total)
+        }
+    };
+    assert_eq!(total("speed==1").await, (5, Some(1199)), "past the cap");
+    assert_eq!(total("speed==0").await, (1, Some(1)), "under the cap");
+    assert_eq!(total("speed==7").await, (0, Some(0)), "no candidate");
+}
+
+/// The non-superuser role the RLS tests connect as (idempotent). Two tests of this binary
+/// run it at once, and two concurrent GRANTs on one schema fail with "tuple concurrently
+/// updated" (strict): one transaction-scoped advisory lock queues them.
+async fn app_role(admin: &sqlx::PgPool) {
+    let mut tx = admin.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(4334)")
+        .execute(&mut *tx)
+        .await
+        .expect("advisory lock");
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+        "GRANT USAGE ON SCHEMA public TO antares_app",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx.commit().await.expect("commit");
+}
+
+/// the RLS tests' role setup holds when every test of the binary runs it at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_app_role_setup_runs_concurrently() {
+    let url = require_db!();
+    let admin = pg::connect(&url, 10).await.expect("connect");
+    let runs: Vec<_> = (0..8)
+        .map(|_| {
+            let admin = admin.clone();
+            tokio::spawn(async move { app_role(&admin).await })
+        })
+        .collect();
+    for run in runs {
+        run.await.expect("a concurrent role setup");
+    }
+}
+
 /// RLS denial: connect as a NON-superuser role (superusers bypass
 /// RLS) and prove a tenant sees zero foreign rows even with tenant-less SQL.
 #[tokio::test]
@@ -123,14 +287,7 @@ async fn rls_denies_cross_tenant_reads_and_writes() {
     let admin = pg::connect(&url, 5).await.expect("connect");
 
     // Non-superuser app role (idempotent), least privilege on the data tables.
-    for stmt in [
-        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
-        "GRANT USAGE ON SCHEMA public TO antares_app",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
-    ] {
-        sqlx::query(stmt).execute(&admin).await.expect(stmt);
-    }
+    app_role(&admin).await;
 
     let app_url = url.replace("antares:antares@", "antares_app:app@");
     assert_ne!(
@@ -216,14 +373,7 @@ async fn rls_denies_cross_tenant_reads_and_writes() {
 async fn rls_scopes_hosted_contexts_and_shares_cached_ones() {
     let url = require_db!();
     let admin = pg::connect(&url, 5).await.expect("connect");
-    for stmt in [
-        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
-        "GRANT USAGE ON SCHEMA public TO antares_app",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
-    ] {
-        sqlx::query(stmt).execute(&admin).await.expect(stmt);
-    }
+    app_role(&admin).await;
     let app_url = url.replace("antares:antares@", "antares_app:app@");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
@@ -378,6 +528,7 @@ async fn purge_tenant_empties_every_tenant_table() {
             Kind::EntityMap,
             Kind::DistSub,
             Kind::DeadLetter,
+            Kind::View,
         ] {
             let id = "urn:x:1";
             let d = if kind == Kind::Registration {
@@ -419,9 +570,37 @@ async fn purge_tenant_empties_every_tenant_table() {
             )
             .await
             .expect("append");
+        // Another value for the same instant: a correction, which keeps v1 in attr_versions.
+        store
+            .temporal_append(
+                t,
+                "urn:x:1",
+                &doc("urn:x:1"),
+                &serde_json::json!({"n": [{"type": "Property", "value": 3,
+                    "observedAt": "2026-08-04T09:01:00Z", "instanceId": "urn:i:1"}]}),
+            )
+            .await
+            .expect("correction");
+        // The keyed history parent (0020) is not written before the cut-over:
+        // seeded by hand, as the cut-over will fill it.
+        for stmt in [
+            "INSERT INTO iri_ids (tenant_id, iri) VALUES ($1, 'urn:x:1') ON CONFLICT DO NOTHING",
+            "INSERT INTO attr_rows (tenant_id, entity_no, attr_no, instance_no, observed_at,
+                                    created_at, modified_at, data)
+             VALUES ($1, iri_no($1, 'urn:x:1'), 1, gen_random_uuid(), now(), now(), now(), '{}')",
+        ] {
+            sqlx::query(stmt)
+                .bind(t.as_str())
+                .execute(&pool)
+                .await
+                .expect(stmt);
+        }
     }
-    const TABLES: [&str; 13] = [
+    const TABLES: [&str; 20] = [
         "entities",
+        "entity_values",
+        "entity_types",
+        "entity_attrs",
         "jsonld_contexts",
         "subscriptions",
         "csource_subscriptions",
@@ -432,8 +611,12 @@ async fn purge_tenant_empties_every_tenant_table() {
         "entity_map_docs",
         "dist_subs",
         "dead_letters",
+        "views",
         "temporal_entities",
         "attr_instances",
+        "attr_versions",
+        "iri_ids",
+        "attr_rows",
     ];
     let count = |table: &'static str, t: &TenantId| {
         let pool = pool.clone();
@@ -609,6 +792,42 @@ async fn the_postgres_store_keeps_the_driver_contract() {
     let prefix = format!("pgctr{run}");
     antares_store::contract::run_current_state_contract(&store, &a, &b, &prefix).await;
     antares_store::contract::run_temporal_contract(&store, &a, &b, &prefix).await;
+}
+
+/// the same isolation walk as the in-process stores, on fresh
+/// Tenants (the purge empties `a`). `_` would be a LIKE wildcard; `x`
+/// extends the other name. The default Tenant is `b`, never purged.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_postgres_store_keeps_tenants_apart() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let t = |s: String| TenantId::new(&s).expect("tenant");
+    let pairs = [
+        (t(format!("iso{run}_b")), t(format!("iso{run}xb"))),
+        (t(format!("isp{run}xb")), t(format!("isp{run}_b"))),
+        (t(format!("isq{run}")), t(format!("isq{run}x"))),
+        (t(format!("isr{run}")), TenantId::default()),
+    ];
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    for (n, (a, b)) in pairs.iter().enumerate() {
+        for t in [a, b] {
+            pg::ensure_tenant(&pool, t).await.expect("tenant row");
+        }
+        antares_store::contract::run_tenant_isolation_contract(
+            &store,
+            &store,
+            a,
+            b,
+            &format!("pgiso{run}{n}"),
+        )
+        .await;
+    }
 }
 
 /// The tenants the broker mints for itself are not customer accounts, and
@@ -793,4 +1012,323 @@ async fn a_purge_waits_for_an_in_flight_write_in_the_same_tenant() {
         .execute(&pool)
         .await
         .expect("cleanup");
+}
+
+/// a tenant's size is measured in its own rows, by the Entity's first
+/// type, so the types sum to the whole; history is measured apart, and
+/// another tenant's rows (RLS and the predicate both) never count.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_bytes_are_the_tenants_own_rows_by_first_type() {
+    use antares_store::{CurrentStateDriver, Kind, TemporalDriver};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let a = TenantId::new(&format!("pgsz{run}")).expect("tenant");
+    let b = TenantId::new(&format!("pgsz{run}x")).expect("tenant");
+    let doc = |id: &str, ty: serde_json::Value| {
+        serde_json::json!({
+            "id": id, "type": ty,
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+            "n": {"type": "Property", "value": 1, "observedAt": "2026-08-04T09:00:00Z"}
+        })
+    };
+    let empty = CurrentStateDriver::tenant_bytes(&store, &a)
+        .await
+        .expect("bytes");
+    assert_eq!(
+        empty,
+        antares_store::TenantBytes::default(),
+        "no rows, no bytes"
+    );
+    for t in [&a, &b] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+    }
+    for (id, ty) in [
+        ("urn:x:1", serde_json::json!("Room")),
+        ("urn:x:2", serde_json::json!("Room")),
+        ("urn:x:3", serde_json::json!(["Bridge", "Room"])),
+    ] {
+        assert!(
+            CurrentStateDriver::create(&store, &a, Kind::Entity, id, doc(id, ty))
+                .await
+                .expect("create")
+        );
+    }
+    let big = serde_json::json!({"id": "urn:x:9", "type": "Room", "pad": {"type": "Property", "value": "x".repeat(4000)}});
+    CurrentStateDriver::create(&store, &b, Kind::Entity, "urn:x:9", big)
+        .await
+        .expect("create in b");
+    let size = CurrentStateDriver::tenant_bytes(&store, &a)
+        .await
+        .expect("bytes");
+    assert_eq!(
+        size.by_type.keys().collect::<Vec<_>>(),
+        ["Bridge", "Room"],
+        "{size:?}"
+    );
+    assert!(
+        size.by_type["Room"] > size.by_type["Bridge"],
+        "two rows outweigh one: {size:?}"
+    );
+    assert_eq!(
+        size.entities,
+        size.by_type.values().sum::<u64>(),
+        "{size:?}"
+    );
+    let other = CurrentStateDriver::tenant_bytes(&store, &b)
+        .await
+        .expect("bytes");
+    assert!(
+        other.entities > 0 && size.entities > 0,
+        "{size:?} {other:?}"
+    );
+    assert_eq!(other.by_type.len(), 1, "{other:?}");
+
+    assert_eq!(
+        TemporalDriver::attr_instance_bytes(&store, &a)
+            .await
+            .expect("n"),
+        0
+    );
+    TemporalDriver::create(
+        &store,
+        &a,
+        "urn:x:1",
+        doc("urn:x:1", serde_json::json!("Room")),
+    )
+    .await
+    .expect("temporal");
+    store
+        .temporal_append(
+            &a,
+            "urn:x:1",
+            &doc("urn:x:1", serde_json::json!("Room")),
+            &serde_json::json!({"n": [{"type": "Property", "value": 2,
+                "observedAt": "2026-08-04T09:01:00Z", "instanceId": "urn:i:1"}]}),
+        )
+        .await
+        .expect("append");
+    assert!(
+        TemporalDriver::attr_instance_bytes(&store, &a)
+            .await
+            .expect("n")
+            > 0
+    );
+    assert_eq!(
+        TemporalDriver::attr_instance_bytes(&store, &b)
+            .await
+            .expect("n"),
+        0
+    );
+    for t in [&a, &b] {
+        CurrentStateDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge");
+        TemporalDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge history");
+    }
+}
+
+/// a size scan is bounded: held behind a lock (as behind a scan of a
+/// history table tens of GB long) it gives up within its statement timeout
+/// instead of holding the connection, and the caller answers without a size.
+/// The lock is taken in a database of the test's own, so the tests sharing
+/// the main one never wait on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_size_scan_gives_up_within_its_bound() {
+    use antares_store::{CurrentStateDriver, TemporalDriver};
+    let url = require_db!();
+    let admin = pg::connect(&url, 2).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("antares_szbound_{run}");
+    let create = format!("CREATE DATABASE {name}");
+    sqlx::query(sqlx::AssertSqlSafe(create))
+        .execute(&admin)
+        .await
+        .expect("own database");
+    let (base, _) = url.rsplit_once('/').expect("a database URL");
+    let pool = pg::connect(&format!("{base}/{name}"), 3)
+        .await
+        .expect("connect+migrate the own database");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let t = TenantId::new("pgszbound").expect("tenant");
+    for (table, lock) in [
+        ("entities", "LOCK TABLE entities IN ACCESS EXCLUSIVE MODE"),
+        (
+            "attr_instances",
+            "LOCK TABLE attr_instances IN ACCESS EXCLUSIVE MODE",
+        ),
+    ] {
+        let mut hold = pool.begin().await.expect("begin");
+        sqlx::query(lock).execute(&mut *hold).await.expect("lock");
+        let started = std::time::Instant::now();
+        let failed = if table == "entities" {
+            CurrentStateDriver::tenant_bytes(&store, &t).await.is_err()
+        } else {
+            TemporalDriver::attr_instance_bytes(&store, &t)
+                .await
+                .is_err()
+        };
+        hold.rollback().await.expect("release");
+        assert!(failed, "{table}: a scan behind the lock must give up");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{table}: {took:?}"
+        );
+    }
+    pool.close().await;
+    let drop = format!("DROP DATABASE {name}");
+    sqlx::query(sqlx::AssertSqlSafe(drop))
+        .execute(&admin)
+        .await
+        .expect("drop the own database");
+}
+
+/// a history append holds `FOR KEY SHARE` on its Entity until it
+/// commits. A write of that Entity goes through (it changes no key), and only
+/// a DELETE waits for the append, which is the one thing the lock is for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_passes_an_in_flight_history_append_and_a_delete_waits() {
+    use antares_store::Kind;
+    use std::time::Duration;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let t = TenantId::new(&format!("pgks{run}")).expect("tenant");
+    let id = "urn:ngsi-ld:BikeHireDockingStation:001";
+    let doc = |n: i64| {
+        serde_json::json!({
+            "id": id, "type": "BikeHireDockingStation",
+            "createdAt": "2026-10-19T09:00:00Z", "modifiedAt": "2026-10-19T09:00:00Z",
+            "n": {"type": "Property", "value": n}
+        })
+    };
+    store
+        .create(&t, Kind::Entity, id, doc(1))
+        .await
+        .expect("create");
+
+    // the append in flight, as `append_in` takes it
+    let mut append = pool.begin().await.expect("begin");
+    pg::set_tenant(&mut append, &t).await.expect("set_tenant");
+    sqlx::query("SELECT 1 FROM entities WHERE tenant_id = $1 AND id = $2 FOR KEY SHARE")
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_optional(&mut *append)
+        .await
+        .expect("key share");
+
+    let upserted = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.batch_upsert(&t, vec![(id.to_owned(), doc(2))]),
+    )
+    .await;
+    assert!(
+        matches!(upserted, Ok(Ok(_))),
+        "a batch upsert waited on the history append: {upserted:?}"
+    );
+    let mutated = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.mutate::<(), ()>(&t, Kind::Entity, id, |e| {
+            e["n"]["value"] = serde_json::json!(3);
+            Ok(())
+        }),
+    )
+    .await;
+    assert!(
+        matches!(mutated, Ok(Ok(Some(Ok(()))))),
+        "a patch waited on the history append: {mutated:?}"
+    );
+
+    let mut delete = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL lock_timeout = '750ms'")
+        .execute(&mut *delete)
+        .await
+        .expect("lock_timeout");
+    pg::set_tenant(&mut delete, &t).await.expect("set_tenant");
+    let blocked = sqlx::query("DELETE FROM entities WHERE tenant_id = $1 AND id = $2")
+        .bind(t.as_str())
+        .bind(id)
+        .execute(&mut *delete)
+        .await;
+    assert!(
+        blocked.is_err(),
+        "a delete stepped over an in-flight history append"
+    );
+    drop(delete);
+    append.commit().await.expect("commit");
+
+    assert!(store.delete(&t, Kind::Entity, id).await.expect("delete"));
+    sqlx::query("DELETE FROM tenants WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
+/// the history count of `GET /q/tenants/{tenant}` holds to its
+/// bound. A table the count must read is held by another session, so the
+/// count waits; with a bound under the session's 5 s lock_timeout it gives
+/// up as a statement timeout, and without the hold it answers what the
+/// unbounded count answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_count_within_gives_up_at_its_bound() {
+    use antares_store::TemporalDriver;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let t = TenantId::new(&format!("pgcount{run}")).expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let bound = std::time::Duration::from_millis(300);
+    assert_eq!(
+        TemporalDriver::attr_instance_count_within(&store, &t, bound)
+            .await
+            .expect("bounded count"),
+        TemporalDriver::attr_instance_count(&store, &t)
+            .await
+            .expect("count"),
+    );
+
+    let mut hold = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE attr_rows IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *hold)
+        .await
+        .expect("hold attr_rows");
+    let started = std::time::Instant::now();
+    let cut = TemporalDriver::attr_instance_count_within(&store, &t, bound).await;
+    let waited = started.elapsed();
+    hold.rollback().await.expect("release");
+    assert_eq!(
+        cut.map_err(|e| e.to_string()),
+        Err(
+            antares_model::NgsiError::InternalError("database statement timeout".into())
+                .to_string()
+        )
+    );
+    assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
 }

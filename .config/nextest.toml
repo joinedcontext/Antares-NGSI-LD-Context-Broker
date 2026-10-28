@@ -26,10 +26,20 @@ store-failure-output = true
 # drain legitimately destroys — it publishes the rows the sigkill drill and
 # the RLS pentest have just seeded, out from under them. One serial group
 # restores the sequencing `cargo test`'s one-binary-at-a-time execution used
-# to provide. Defined on the default profile; ci inherits.
+# to provide. pg_explain and pg_retention join it because they create and
+# drop attr_instances partitions: that ACCESS EXCLUSIVE lock queues every
+# parallel reader behind it into the session's lock_timeout. Defined on the
+# default profile; ci inherits.
 [test-groups]
 db-exclusive = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg)'
+filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg) or binary(pg_explain) or binary(pg_retention)'
 test-group = 'db-exclusive'
+
+# The restart gap is a wall-clock gate (2 s at 10 000 entities): beside the
+# rest of the suite on a loaded host it measures the host, not the boot. It
+# runs alone.
+[[profile.default.overrides]]
+filter = 'test(restart_gap_stays_under_the_gate)'
+threads-required = 'num-test-threads'

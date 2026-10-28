@@ -64,6 +64,10 @@ spec:
           env:
             - { name: ANTARES_STORE, value: file }
             - { name: ANTARES_DATA_DIR, value: /data }
+            - { name: ANTARES_DEFAULT_LIMIT, value: "100" }
+            - { name: ANTARES_MAX_LIMIT, value: "1000" }
+            - { name: ANTARES_TEMPORAL_DEFAULT_INSTANCES, value: "100" }
+            - { name: ANTARES_TEMPORAL_INSTANCE_LIMIT, value: "1000" }
             # Paired with the memory limit below, as in the postgres-mode
             # manifest: one forwarded read in flight measures about 1.8 MiB.
             - { name: ANTARES_MAX_CONNECTIONS, value: "512" }

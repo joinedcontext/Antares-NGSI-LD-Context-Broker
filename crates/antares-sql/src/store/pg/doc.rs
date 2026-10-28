@@ -26,6 +26,7 @@ pub enum DocKind {
     EntityMap,
     DistSub,
     DeadLetter,
+    View,
 }
 
 impl DocKind {
@@ -38,15 +39,18 @@ impl DocKind {
             DocKind::EntityMap => "entity_map_docs",
             DocKind::DistSub => "dist_subs",
             DocKind::DeadLetter => "dead_letters",
+            DocKind::View => "views",
         }
     }
     fn doc_column(self) -> &'static str {
         match self {
             DocKind::Subscription | DocKind::CSourceSubscription => "subscription",
             DocKind::Registration => "registration",
-            DocKind::Snapshot | DocKind::EntityMap | DocKind::DistSub | DocKind::DeadLetter => {
-                "doc"
-            }
+            DocKind::Snapshot
+            | DocKind::EntityMap
+            | DocKind::DistSub
+            | DocKind::DeadLetter
+            | DocKind::View => "doc",
         }
     }
     fn has_bookkeeping(self) -> bool {
@@ -205,8 +209,14 @@ pub fn index_rows(reg: &Value) -> Vec<Value> {
                 })
                 .unwrap_or_default()
         };
-        let props = names("propertyNames");
-        let rels = names("relationshipNames");
+        // TS 104 175 9.4.2: attributeNames, else the deprecated pair. The
+        // table has no column for a name of either kind, so an
+        // attributeNames entry is indexed as a property_name: the index is
+        // a flattened copy, the matchers read the registration itself.
+        let (props, rels) = match info.get("attributeNames") {
+            Some(_) => (names("attributeNames"), Vec::new()),
+            None => (names("propertyNames"), names("relationshipNames")),
+        };
         let entities: Vec<Option<&Value>> = match info.get("entities").and_then(Value::as_array) {
             Some(a) if !a.is_empty() => a.iter().map(Some).collect(),
             _ => vec![None],
@@ -330,8 +340,19 @@ async fn insert_doc(
         .map(|r| r.get::<bool, _>(0)))
 }
 
+/// The row a sealed credential is bound to ([`super::seal::Row`]).
+fn seal_row<'a>(kind: DocKind, tenant: &'a TenantId, id: &'a str) -> super::seal::Row<'a> {
+    super::seal::Row {
+        kind,
+        tenant: tenant.as_str(),
+        id,
+    }
+}
+
 pub struct PgDocStore {
     pool: PgPool,
+    /// `ANTARES_SECRET_KEY`: seals the notification credentials.
+    key: Option<std::sync::Arc<super::seal::SecretKey>>,
 }
 
 /// Arm the Row-Level Security policy on `jsonld_contexts` for one call.
@@ -353,7 +374,51 @@ async fn set_context_tenant(
 
 impl PgDocStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, key: None }
+    }
+
+    /// Seal every notification credential this store writes under `key`
+    /// ([`super::seal`]).
+    pub fn with_secret_key(mut self, key: super::seal::SecretKey) -> Self {
+        self.key = Some(std::sync::Arc::new(key));
+        self
+    }
+
+    fn opened(
+        &self,
+        kind: DocKind,
+        tenant: &TenantId,
+        id: &str,
+        mut doc: Value,
+    ) -> Result<Value, sqlx::Error> {
+        super::seal::open(self.key.as_deref(), seal_row(kind, tenant, id), &mut doc)?;
+        Ok(doc)
+    }
+
+    fn sealed<'a>(
+        &self,
+        kind: DocKind,
+        tenant: &TenantId,
+        id: &str,
+        doc: &'a Value,
+    ) -> Result<std::borrow::Cow<'a, Value>, sqlx::Error> {
+        Ok(super::seal::sealed(
+            self.key.as_deref(),
+            seal_row(kind, tenant, id),
+            doc,
+        )?)
+    }
+
+    /// Rows of `SELECT {doc}, id`, each credential opened for its own row.
+    fn opened_all(
+        &self,
+        kind: DocKind,
+        tenant: &TenantId,
+        rows: Vec<sqlx::postgres::PgRow>,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        rows.into_iter()
+            .map(|r| self.opened(kind, tenant, &r.get::<String, _>(1), r.get::<Value, _>(0)))
+            .collect()
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -381,7 +446,8 @@ impl PgDocStore {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
-        let created = insert_doc(&mut tx, tenant, kind, id, doc, conflict)
+        let stored = self.sealed(kind, tenant, id, doc)?;
+        let created = insert_doc(&mut tx, tenant, kind, id, &stored, conflict)
             .await?
             .is_some();
         // a losing INSERT must not rebuild the winner's index rows
@@ -422,7 +488,8 @@ impl PgDocStore {
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
         // INSERT … ON CONFLICT DO UPDATE … RETURNING always answers with
         // the row; no row means the statement stopped being an upsert.
-        let existed = insert_doc(&mut tx, tenant, kind, id, doc, &conflict)
+        let stored = self.sealed(kind, tenant, id, doc)?;
+        let existed = insert_doc(&mut tx, tenant, kind, id, &stored, &conflict)
             .await?
             .ok_or(sqlx::Error::RowNotFound)?;
         if matches!(kind, DocKind::Registration) {
@@ -451,7 +518,8 @@ impl PgDocStore {
             .fetch_optional(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(row.map(|r| r.get::<Value, _>(0)))
+        row.map(|r| self.opened(kind, tenant, id, r.get::<Value, _>(0)))
+            .transpose()
     }
 
     /// Read-modify-write in ONE transaction under the row lock (the entity
@@ -488,8 +556,27 @@ impl PgDocStore {
         id: &str,
         now: &str,
     ) -> Result<Option<(Value, Option<Value>)>, sqlx::Error> {
+        let mut found = self.record_deliveries(tenant, kind, &[(id, now)]).await?;
+        Ok(found.remove(id))
+    }
+
+    /// [`Self::record_delivery`] for distinct subscriptions in ONE statement:
+    /// the rows are locked in id order, so two batches over
+    /// overlapping subscriptions queue behind each other instead of
+    /// deadlocking, and each pre-image is still the value its own row lock
+    /// re-read. A subscription that is gone has no entry in the answer.
+    pub async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: DocKind,
+        attempts: &[(&str, &str)],
+    ) -> Result<std::collections::HashMap<String, (Value, Option<Value>)>, sqlx::Error> {
+        if attempts.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
         let table = kind.table();
         let col = kind.doc_column();
+        let (ids, stamps): (Vec<&str>, Vec<&str>) = attempts.iter().copied().unzip();
         // literals from DocKind; every value is bound
         let sql = format!(
             "UPDATE {table} AS d SET
@@ -497,38 +584,39 @@ impl PgDocStore {
                    d.{col} - 'status',
                    '{{notification,timesSent}}',
                    to_jsonb(COALESCE((d.{col} #>> '{{notification,timesSent}}')::bigint, 0) + 1)),
-                   '{{notification,lastNotification}}', to_jsonb($3::text)),
-                   '{{notification,lastSuccess}}', to_jsonb($3::text)),
+                   '{{notification,lastNotification}}', to_jsonb(prev.stamp)),
+                   '{{notification,lastSuccess}}', to_jsonb(prev.stamp)),
                    '{{notification,status}}', '\"ok\"'::jsonb),
                times_sent = COALESCE(d.times_sent, 0) + 1,
-               last_notification = $3::timestamptz,
-               last_success = $3::timestamptz
-             FROM (SELECT id AS locked_id,
-                          {col} #> '{{notification,lastSuccess}}' AS ls
-                     FROM {table}
-                    WHERE tenant_id = $1 AND id = $2
-                      FOR UPDATE) AS prev
+               last_notification = prev.stamp::timestamptz,
+               last_success = prev.stamp::timestamptz
+             FROM (SELECT s.id AS locked_id,
+                          s.{col} #> '{{notification,lastSuccess}}' AS ls,
+                          a.stamp
+                     FROM {table} AS s
+                     JOIN unnest($2::text[], $3::text[]) AS a(id, stamp) ON s.id = a.id
+                    WHERE s.tenant_id = $1
+                    ORDER BY s.id
+                      FOR UPDATE OF s) AS prev
              WHERE d.tenant_id = $1 AND d.id = prev.locked_id
-             RETURNING d.{col}, prev.ls"
+             RETURNING d.id, d.{col}, prev.ls"
         );
-        async move {
-            let mut tx = super::begin(&self.pool).await?;
-            crate::store::pg::set_tenant(&mut tx, tenant).await?;
-            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(tenant.as_str())
-                .bind(id)
-                .bind(now)
-                .fetch_optional(&mut *tx)
-                .await?;
-            let Some(row) = row else {
-                return Ok(None);
-            };
-            let doc: Value = row.get(0);
-            let prev: Option<Value> = row.get(1);
-            tx.commit().await?;
-            Ok(Some((doc, prev)))
-        }
-        .await
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(tenant.as_str())
+            .bind(&ids)
+            .bind(&stamps)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        rows.into_iter()
+            .map(|r| {
+                let id = r.get::<String, _>(0);
+                let doc = self.opened(kind, tenant, &id, r.get(1))?;
+                Ok((id, (doc, r.get(2))))
+            })
+            .collect()
     }
 
     pub async fn mutate<T, E>(
@@ -564,7 +652,7 @@ impl PgDocStore {
             let Some(row) = row else {
                 return Ok(None);
             };
-            let mut doc: Value = row.get(0);
+            let mut doc = self.opened(kind, tenant, id, row.get(0))?;
             // The match rows are a pure function of the document, so the
             // rows this write would produce can be compared with the ones
             // already stored before deciding to touch them.
@@ -576,10 +664,11 @@ impl PgDocStore {
                         .cloned()
                         .unwrap_or(Value::Object(Default::default()));
                     let (expires, active, sent, last_n, last_s, last_f) = bookkeeping(&doc);
+                    let stored = self.sealed(kind, tenant, id, &doc)?;
                     let mut q = sqlx::query(sqlx::AssertSqlSafe(update.clone()))
                         .bind(tenant.as_str())
                         .bind(id)
-                        .bind(&doc);
+                        .bind(stored.as_ref());
                     if kind.has_bookkeeping() {
                         q = q
                             .bind(&expires)
@@ -658,7 +747,7 @@ impl PgDocStore {
         limit: i64,
     ) -> Result<Vec<Value>, sqlx::Error> {
         let sql = format!(
-            "SELECT {} FROM {} WHERE tenant_id = $1 AND id > $2 ORDER BY id LIMIT $3",
+            "SELECT {}, id FROM {} WHERE tenant_id = $1 AND id > $2 ORDER BY id LIMIT $3",
             kind.doc_column(),
             kind.table()
         );
@@ -671,7 +760,7 @@ impl PgDocStore {
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(rows.into_iter().map(|r| r.get::<Value, _>(0)).collect())
+        self.opened_all(kind, tenant, rows)
     }
 
     /// One id-ordered window of docs and the size of the whole set:
@@ -691,7 +780,7 @@ impl PgDocStore {
         limit: i64,
     ) -> Result<(Vec<Value>, i64), sqlx::Error> {
         let page_sql = format!(
-            "SELECT {} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
+            "SELECT {}, id FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
             kind.doc_column(),
             kind.table()
         );
@@ -709,35 +798,124 @@ impl PgDocStore {
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok((
-            rows.into_iter().map(|r| r.get::<Value, _>(0)).collect(),
-            total,
-        ))
+        Ok((self.opened_all(kind, tenant, rows)?, total))
+    }
+
+    /// Every doc's id and the first 64 bits of the md5 of its text, under
+    /// `list`'s ceiling: the bodies stay in the database. `views`
+    /// keeps the digest in its generated column (migration 0026);
+    /// the other tables compute it here.
+    pub async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: DocKind,
+    ) -> Result<Vec<(String, u64)>, sqlx::Error> {
+        let select = match kind {
+            DocKind::View => "id, digest".to_owned(),
+            _ => format!("id, left(md5({}::text), 16)", kind.doc_column()),
+        };
+        self.every_row(tenant, kind, &select)
+            .await?
+            .into_iter()
+            .map(|r| {
+                let hex: String = r.get(1);
+                u64::from_str_radix(&hex, 16)
+                    .map(|d| (r.get::<String, _>(0), d))
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+            })
+            .collect()
     }
 
     /// Every doc of one kind for one tenant, id-ordered.
+    pub async fn list(&self, tenant: &TenantId, kind: DocKind) -> Result<Vec<Value>, sqlx::Error> {
+        let select = format!("{}, id", kind.doc_column());
+        let rows = self.every_row(tenant, kind, &select).await?;
+        self.opened_all(kind, tenant, rows)
+    }
+
+    /// Seal every notification credential still stored in plaintext (rows
+    /// written before `ANTARES_SECRET_KEY` was set). Run at boot;
+    /// without a key it seals nothing. Each row is rewritten through
+    /// [`Self::mutate`], under its row lock, so a concurrent write is never
+    /// lost. Answers how many rows it sealed.
+    pub async fn seal_plaintext(&self) -> Result<u64, sqlx::Error> {
+        if self.key.is_none() {
+            return Ok(0);
+        }
+        // every tenant row, the broker's own included, and the default
+        // Tenant, which exists without one (5.5.10)
+        let mut tenants: Vec<String> = sqlx::query_scalar("SELECT tenant_id FROM tenants")
+            .fetch_all(&self.pool)
+            .await?;
+        if !tenants.iter().any(|t| t == TenantId::DEFAULT) {
+            tenants.push(TenantId::DEFAULT.to_owned());
+        }
+        let mut sealed = 0u64;
+        for kind in [
+            DocKind::Subscription,
+            DocKind::CSourceSubscription,
+            DocKind::DeadLetter,
+        ] {
+            let Some(path) = super::seal::plaintext_path(kind) else {
+                continue;
+            };
+            let sql = format!(
+                "SELECT id FROM {} WHERE tenant_id = $1 AND jsonb_path_exists({}, $2::jsonpath)
+                 ORDER BY id",
+                kind.table(),
+                kind.doc_column()
+            );
+            for raw in &tenants {
+                let tenant = TenantId::try_from(raw.clone())
+                    .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+                let mut tx = super::begin(&self.pool).await?;
+                crate::store::pg::set_tenant(&mut tx, &tenant).await?;
+                let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.clone()))
+                    .bind(tenant.as_str())
+                    .bind(path)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                for id in ids {
+                    let written = self
+                        .mutate(&tenant, kind, &id, |_| {
+                            Ok::<(), std::convert::Infallible>(())
+                        })
+                        .await?;
+                    sealed = sealed.saturating_add(u64::from(written.is_some()));
+                }
+            }
+        }
+        Ok(sealed)
+    }
+
+    /// `select` of every row of one kind for one tenant, id-ordered.
     ///
     /// Bounded: without a LIMIT this statement materializes a whole tenant's
     /// subscriptions/registrations into one `Vec`, which at the 100 000-per-
     /// broker target is the broker's memory, not the database's. A tenant that
     /// reaches the ceiling is refused with TooManyResults (5.5.6) rather than
     /// served a silent prefix.
-    pub async fn list(&self, tenant: &TenantId, kind: DocKind) -> Result<Vec<Value>, sqlx::Error> {
+    async fn every_row(
+        &self,
+        tenant: &TenantId,
+        kind: DocKind,
+        select: &str,
+    ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
         let sql = format!(
-            "SELECT {} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",
-            kind.doc_column(),
+            "SELECT {select} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",
             kind.table()
         );
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(tenant.as_str())
             .bind(MAX_UNDECIDED_ROWS)
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
         check_ceiling(false, rows.len(), MAX_UNDECIDED_ROWS)?;
-        Ok(rows.into_iter().map(|r| r.get::<Value, _>(0)).collect())
+        Ok(rows)
     }
 
     /// 5.12: the registrations that may take part in an operation on these
@@ -777,15 +955,15 @@ impl PgDocStore {
         // statement to one — measured as a sequential scan of csource_index,
         // exactly the read this function exists to avoid.
         let mut wheres = String::new();
-        let mut n = 1; // $1 = tenant_id
+        let mut n: usize = 1; // $1 = tenant_id
         if types.is_some() {
-            n += 1;
+            n = n.saturating_add(1);
             wheres.push_str(&format!(
                 " AND (x.entity_type IS NULL OR x.entity_type = ANY(${n}))"
             ));
         }
         if ids.is_some() {
-            n += 1;
+            n = n.saturating_add(1);
             wheres.push_str(&format!(
                 " AND (x.entity_id IS NULL OR x.id_pattern IS NOT NULL \
                    OR x.entity_id = ANY(${n}))"
@@ -799,16 +977,16 @@ impl PgDocStore {
                  ON x.tenant_id = r.tenant_id AND x.registration_id = r.id
               WHERE r.tenant_id = $1{wheres}
               ORDER BY r.id LIMIT ${}",
-            n + 1
+            n.saturating_add(1)
         );
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).bind(tenant.as_str());
         if let Some(types) = types {
-            q = q.bind(types);
+            q = q.bind(super::storable(types));
         }
         if let Some(ids) = ids {
-            q = q.bind(ids);
+            q = q.bind(super::storable(ids));
         }
         let rows = q.bind(MAX_UNDECIDED_ROWS).fetch_all(&mut *tx).await?;
         tx.commit().await?;
@@ -922,6 +1100,40 @@ impl PgDocStore {
         .await?;
         tx.commit().await?;
         Ok(row.map(|r| r.get::<Value, _>(0)))
+    }
+
+    /// Read-modify-write of one row under `FOR UPDATE`: `None` when it is
+    /// absent or another Tenant's, `Some(Err)` when `f` refused (rolled back).
+    pub async fn context_mutate(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: impl FnOnce(&mut Value) -> Result<(), ()> + Send,
+    ) -> Result<Option<Result<(), ()>>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        set_context_tenant(&mut tx, tenant).await?;
+        let row = sqlx::query(
+            "SELECT body FROM jsonld_contexts
+              WHERE id = $1 AND (tenant_id IS NULL OR tenant_id = $2) FOR UPDATE",
+        )
+        .bind(id)
+        .bind(tenant.map(TenantId::as_str))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut doc: Value = row.get(0);
+        if f(&mut doc).is_err() {
+            return Ok(Some(Err(())));
+        }
+        sqlx::query("UPDATE jsonld_contexts SET body = $2 WHERE id = $1")
+            .bind(id)
+            .bind(&doc)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(Ok(())))
     }
 
     pub async fn context_delete(
@@ -1110,5 +1322,24 @@ mod tests {
         let rows = index_rows(&bare);
         assert_eq!(rows.len(), 1);
         assert!(rows[0]["property_name"].is_null() && rows[0]["relationship_name"].is_null());
+    }
+
+    /// TS 104 175 9.4.2: `attributeNames` scopes the rows, and the
+    /// deprecated pair beside it is not indexed.
+    #[test]
+    fn attribute_names_are_indexed_and_the_old_pair_beside_them_is_not() {
+        let reg = json!({
+            "endpoint": "e",
+            "information": [{"entities": [{"type": "T"}],
+                             "attributeNames": ["speed", "owner"],
+                             "propertyNames": ["brand"]}]
+        });
+        let rows = index_rows(&reg);
+        let mut names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["property_name"].as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["owner", "speed"]);
     }
 }

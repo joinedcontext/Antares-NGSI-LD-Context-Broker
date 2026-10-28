@@ -85,6 +85,18 @@ impl Broker {
         {
             state.public_url = url;
         }
+        // 6.3.10 ceiling (ANTARES_TEMPORAL_INSTANCE_LIMIT): the same
+        // variable off `globalThis`, set before construction; the ETSI cells
+        // set 9 for the suite's 206 cases. Absent → the native default.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(n) =
+            js_sys::Reflect::get(&js_sys::global(), &"ANTARES_TEMPORAL_INSTANCE_LIMIT".into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .filter(|n| *n >= 1.0)
+        {
+            state.temporal_instance_limit = n as usize;
+        }
         // 4.22 GC: the native broker sweeps on a tokio interval (main.rs,
         // ANTARES_SWEEP_SECS). The browser has no env, so the SAME variable is
         // read off `globalThis.ANTARES_SWEEP_SECS` (seconds, set before
@@ -95,7 +107,11 @@ impl Broker {
         // would ever delete them.
         #[cfg(target_arch = "wasm32")]
         {
-            let store = state.store.clone();
+            // both sweeps of the native loop: the store's 4.22 GC, then the
+            // documents with their own expiry (Registrations, Snapshots,
+            // EntityMaps). The store sweep was a future never awaited, so
+            // nothing was reaped.
+            let sweeper = state.clone();
             let sweep_ms = js_sys::Reflect::get(&js_sys::global(), &"ANTARES_SWEEP_SECS".into())
                 .ok()
                 .and_then(|v| v.as_f64())
@@ -105,7 +121,8 @@ impl Broker {
             wasm_bindgen_futures::spawn_local(async move {
                 loop {
                     gloo_timers::future::TimeoutFuture::new(sweep_ms).await;
-                    store.sweep_expired();
+                    sweeper.store.sweep_expired().await;
+                    antares_api::sweep_expired_docs(&sweeper).await;
                 }
             });
         }

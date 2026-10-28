@@ -57,6 +57,10 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for CleanParams {
                     NgsiError::InvalidRequest(format!("repeated query parameter {k:?}")).into(),
                 );
             }
+            // 4.17: `type` is an Entity Type Selection on every route that takes it
+            if k == "type" && !v.is_empty() && v != "*" {
+                antares_ql::check_type_selection(&v)?;
+            }
             if !v.is_empty() {
                 map.insert(k, v);
             }
@@ -92,7 +96,7 @@ impl From<crate::policy::Denied> for ApiError {
 /// acquire timeout before answering, so a retry sooner than that walks into
 /// the same wall; one second past it is the first moment the queue can have
 /// moved.
-const RETRY_AFTER_SECONDS: u64 = 6;
+pub(crate) const RETRY_AFTER_SECONDS: u64 = 6;
 
 impl From<NgsiError> for ApiError {
     fn from(e: NgsiError) -> Self {
@@ -499,7 +503,7 @@ fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
             '>' if !quoted => angle = false,
             c if c == sep && !quoted && !angle => {
                 out.push(&s[start..i]);
-                start = i + c.len_utf8();
+                start = i.saturating_add(c.len_utf8());
             }
             _ => {}
         }
@@ -540,9 +544,21 @@ impl ParsedBody {
     }
 }
 
-/// Parse a request body per the 6.3.5 @context rules.
+/// Parse a request body per the 6.3.5 @context rules, under the state's
+/// behaviour profile.
 pub(crate) async fn parse_body(
+    st: &crate::AppState,
+    headers: &HeaderMap,
+    bytes: &[u8],
+    kind: BodyKind,
+) -> ApiResult<ParsedBody> {
+    parse_body_in(&st.loader, st.profile, headers, bytes, kind).await
+}
+
+/// [`parse_body`] over a loader and a profile.
+pub(crate) async fn parse_body_in(
     loader: &Loader,
+    profile: crate::Profile,
     headers: &HeaderMap,
     bytes: &[u8],
     kind: BodyKind,
@@ -569,10 +585,17 @@ pub(crate) async fn parse_body(
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|e| NgsiError::InvalidRequest(format!("request body is not valid JSON: {e}")))?;
     // Every parse_body consumer takes a single JSON object (entities, fragments,
-    // subscriptions, …; batch arrays go through parse_batch) — a non-object here
-    // is a malformed request, not bad data (001_02_02).
+    // subscriptions, …; batch arrays go through parse_batch). A non-object is
+    // valid JSON that is no valid datatype: InvalidRequest as ETSI 001_02_02
+    // asserts, or BadRequestData (8.2.3) under ANTARES_NON_OBJECT_BODY.
     if !value.is_object() {
-        return Err(NgsiError::InvalidRequest("request body must be a JSON object".into()).into());
+        let detail = "request body must be a JSON object".to_owned();
+        return Err(if profile.non_object_bad_request_data {
+            NgsiError::BadRequestData(detail)
+        } else {
+            NgsiError::InvalidRequest(detail)
+        }
+        .into());
     }
 
     let link = link_context(headers)?;
@@ -644,6 +667,11 @@ pub(crate) fn check_params(
         if !allowed.contains(&k.as_str()) {
             return Err(NgsiError::InvalidRequest(format!("unknown query parameter {k:?}")).into());
         }
+    }
+    // 4.19: a malformed scopeQ is refused before any read, at every
+    // operation that takes one
+    if let Some(s) = params.get("scopeQ") {
+        antares_ql::scope::check_scope_q(s)?;
     }
     Ok(())
 }
@@ -979,6 +1007,8 @@ pub const QUERY_PARAMS: &[&str] = &[
     "collation",
     "entityMapLifetime",
     "splitEntities",
+    // the broker's keyset cursor behind the next Link (`paging::CURSOR`)
+    "cursor",
 ];
 
 #[cfg(test)]
@@ -997,8 +1027,9 @@ mod clause_5_5_3 {
             header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
         );
-        let parsed = parse_body(
+        let parsed = parse_body_in(
             &loader,
+            crate::Profile::default(),
             &h,
             br#"{"id":"urn:x","type":"T"}"#,
             BodyKind::Standard,
@@ -1090,8 +1121,9 @@ mod clause_5_5_3 {
         // json + body @context → BadRequestData
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_TYPE, ct("application/json"));
-        let err = parse_body(
+        let err = parse_body_in(
             &loader,
+            crate::Profile::default(),
             &h,
             br#"{"id":"urn:x","type":"T","@context":{}}"#,
             BodyKind::Standard,
@@ -1104,8 +1136,9 @@ mod clause_5_5_3 {
         // ld+json without a body @context → BadRequestData
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_TYPE, ct("application/ld+json"));
-        let err = parse_body(
+        let err = parse_body_in(
             &loader,
+            crate::Profile::default(),
             &h,
             br#"{"id":"urn:x","type":"T"}"#,
             BodyKind::Standard,
@@ -1119,8 +1152,9 @@ mod clause_5_5_3 {
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_TYPE, ct("application/ld+json"));
         h.insert(header::LINK, core_link.parse().expect("link"));
-        let err = parse_body(
+        let err = parse_body_in(
             &loader,
+            crate::Profile::default(),
             &h,
             br#"{"id":"urn:x","type":"T","@context":{}}"#,
             BodyKind::Standard,
@@ -1134,8 +1168,9 @@ mod clause_5_5_3 {
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_TYPE, ct("application/json"));
         h.insert(header::LINK, core_link.parse().expect("link"));
-        let ok = parse_body(
+        let ok = parse_body_in(
             &loader,
+            crate::Profile::default(),
             &h,
             br#"{"id":"urn:x","type":"T"}"#,
             BodyKind::Standard,
@@ -1734,7 +1769,7 @@ mod negotiation {
             ("application/xml", BodyKind::Standard),
             ("application/merge-patch+json", BodyKind::Standard),
         ] {
-            let err = parse_body(&loader, &ct(mime), b"{}", kind)
+            let err = parse_body_in(&loader, crate::Profile::default(), &ct(mime), b"{}", kind)
                 .await
                 .map(|_| ())
                 .expect_err("unsupported media type");
@@ -1743,8 +1778,9 @@ mod negotiation {
                 "{mime} → {err:?}"
             );
         }
-        assert!(parse_body(
+        assert!(parse_body_in(
             &loader,
+            crate::Profile::default(),
             &ct("application/merge-patch+json"),
             br#"{"a":1}"#,
             BodyKind::MergePatch
@@ -1759,10 +1795,16 @@ mod negotiation {
             (&b"{oops"[..], "malformed"),
             (&[0x7b, 0xff, 0x7d][..], "non-UTF-8"),
         ] {
-            let err = parse_body(&loader, &ct("application/json"), bytes, BodyKind::Standard)
-                .await
-                .map(|_| ())
-                .expect_err(what);
+            let err = parse_body_in(
+                &loader,
+                crate::Profile::default(),
+                &ct("application/json"),
+                bytes,
+                BodyKind::Standard,
+            )
+            .await
+            .map(|_| ())
+            .expect_err(what);
             assert!(
                 matches!(err, ApiError::Ngsi(NgsiError::InvalidRequest(_))),
                 "{what} body → {err:?}"

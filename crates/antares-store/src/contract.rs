@@ -123,6 +123,28 @@ pub async fn run_current_state_contract(
         "a rejected mutate must commit nothing"
     );
 
+    // A type list, where the driver keeps one, names the type of a live
+    // Entity: `/types` answers from it without a fold.
+    if let Some(names) = d.entity_type_names(a).await.expect("type list") {
+        assert!(
+            names
+                .iter()
+                .any(|t| t == "https://uri.etsi.org/ngsi-ld/default-context/T"),
+            "the type list must name the type of a live Entity: {names:?}"
+        );
+    }
+
+    // An attribute catalogue, where the driver keeps one, lists every
+    // member a live Entity carries under each of its types, the
+    // member a write added included.
+    if let Some(pairs) = d.entity_attr_pairs(a).await.expect("attribute list") {
+        let t = "https://uri.etsi.org/ngsi-ld/default-context/T";
+        assert!(
+            pairs.iter().any(|(ty, attr)| ty == t && attr == "marker"),
+            "the attribute list must name a live Entity's member: {pairs:?}"
+        );
+    }
+
     // Tenant isolation, on every read and every write path.
     assert!(
         d.get(b, Kind::Entity, &e1).await.expect("get").is_none(),
@@ -202,6 +224,38 @@ pub async fn run_current_state_contract(
     assert!(batch[1].is_none(), "an absent id answers None, in place");
     assert!(batch[2].is_some(), "results align with ids: {ids:?}");
 
+    // A member whose closure refuses commits nothing while the others
+    // commit: a batch write conditioned on each stored Entity
+    // refuses member by member, and a refused member stays as it was.
+    let pair = vec![e1.clone(), e2.clone()];
+    let judged = d
+        .batch_mutate::<&'static str>(a, &pair, |id, v| {
+            v["judged"] = json!(true);
+            if id == e2.as_str() {
+                Err("refused")
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .expect("batch_mutate");
+    assert_eq!(
+        judged,
+        vec![Some(Ok(())), Some(Err("refused"))],
+        "each member's own answer, in place"
+    );
+    let accepted = d.get(a, Kind::Entity, &e1).await.expect("get");
+    assert_eq!(
+        accepted.expect("row")["judged"],
+        json!(true),
+        "an accepted member commits"
+    );
+    let refused = d.get(a, Kind::Entity, &e2).await.expect("get");
+    assert!(
+        refused.expect("row").get("judged").is_none(),
+        "a refused member must commit nothing"
+    );
+
     // A query may over-return (the caller re-checks whatever the backend
     // could not decide) but must never drop a matching row, and must never
     // cross a tenant.
@@ -263,6 +317,33 @@ pub async fn run_current_state_contract(
             paged.decided,
             "paged implies decided: a LIMIT over an undecided set pages the wrong rows"
         );
+    }
+    // Keyset: `after_id` is optional too, but a driver that pages
+    // must honour it, or a discovery walk reads its first page forever.
+    let first = std::cmp::min(e1.as_str(), e2.as_str());
+    let after = d
+        .query_entities(
+            a,
+            &crate::filter::EntityFilter {
+                ids: Some(&ids_ref),
+                after_id: Some(first),
+                page: Some(crate::filter::Page {
+                    offset: 0,
+                    limit: 10,
+                    count: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query_entities");
+    if after.paged {
+        assert!(
+            after.rows.iter().all(|r| r["id"].as_str() > Some(first)),
+            "a paging driver returns only ids after `after_id`: {:?}",
+            after.rows
+        );
+        assert_eq!(after.rows.len(), 1, "the one id after {first} is kept");
     }
 
     // `subscription_tenants` is the iteration domain the interval sweep and
@@ -573,7 +654,51 @@ pub async fn run_current_state_contract(
         json!(5),
         "a comma seconds-fraction is an instant, not a byte string"
     );
+    // attrs= asks for an Entity that holds one of them NOW: an Attribute
+    // whose every instance expired is not held (4.22), so an answer that
+    // claims to be decided must not name the Entity for it. An undecided
+    // one is re-judged by the caller over the served (stripped) rows.
+    let only_gone = [iri("gone")];
+    let by_attr = d
+        .query_entities(
+            a,
+            &crate::filter::EntityFilter {
+                attrs: Some(&only_gone),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query_entities");
+    assert!(
+        !by_attr.decided || by_attr.rows.iter().all(|r| r["id"] != exp_a.as_str()),
+        "attrs= over an Attribute whose only instance expired: a decided \
+         answer named the Entity"
+    );
+    assert!(
+        by_attr
+            .rows
+            .iter()
+            .filter(|r| r["id"] == exp_a.as_str())
+            .all(|r| r.get(iri("gone")).is_none()),
+        "a query served an expired Attribute"
+    );
     d.delete(a, Kind::Entity, &exp_a).await.expect("delete");
+
+    // batch_upsert takes each id once: the API splits repeats into rounds
+    // (5.6.8 / 5.6.10), and what a backend does with a repeat inside one
+    // call is its own guess (Postgres refuses an ON CONFLICT row affected
+    // twice). A repeat is refused on every arm, and nothing is written.
+    let dup = format!("urn:ngsi-ld:{prefix}:dup");
+    assert!(
+        d.batch_upsert(a, vec![(dup.clone(), doc(&dup)), (dup.clone(), doc(&dup))])
+            .await
+            .is_err(),
+        "batch_upsert with an id twice must be refused"
+    );
+    assert!(
+        d.get(a, Kind::Entity, &dup).await.expect("get").is_none(),
+        "a refused batch_upsert wrote nothing"
+    );
 
     // 5.8.6: an expired SUBSCRIPTION is not deleted and stays retrievable —
     // the API turns the stamp into status "expired" and keeps it updatable.
@@ -765,6 +890,42 @@ pub async fn run_current_state_contract(
         "an absent subscription books nothing"
     );
 
+    // the batched stamp is the same rule, one answer per attempt in
+    // input order, and a batch never books another tenant's row.
+    let t3 = "2020-01-03T00:00:00.000Z";
+    let batch = d
+        .record_deliveries(
+            a,
+            Kind::Subscription,
+            &[(gone.as_str(), t3), (sub.as_str(), t3)],
+        )
+        .await
+        .expect("record_deliveries");
+    assert_eq!(batch.len(), 2, "one answer per attempt: {batch:?}");
+    assert!(
+        batch.first().is_some_and(Option::is_none),
+        "an absent subscription books nothing"
+    );
+    let third = batch
+        .get(1)
+        .and_then(Option::as_ref)
+        .expect("the subscription is booked");
+    assert_eq!(third.doc["notification"]["timesSent"], 3);
+    assert_eq!(third.doc["notification"]["lastSuccess"], t3);
+    assert_eq!(
+        third.prev_success.as_ref().and_then(Value::as_str),
+        Some(t2),
+        "each attempt of a batch gets back the lastSuccess it overwrote"
+    );
+    let elsewhere = d
+        .record_deliveries(b, Kind::Subscription, &[(sub.as_str(), t3)])
+        .await
+        .expect("record_deliveries");
+    assert!(
+        elsewhere.first().is_some_and(Option::is_none),
+        "a batch in another tenant books nothing: {elsewhere:?}"
+    );
+
     assert!(
         d.delete(a, Kind::Subscription, &sub).await.expect("delete"),
         "the contract's own subscription must be removable"
@@ -859,12 +1020,144 @@ pub async fn run_current_state_contract(
         "and the Cached copy by anyone"
     );
 
+    context_rows_are_locked(d, a, b, prefix).await;
+
     for id in [&e1, &e2] {
         assert!(
             d.delete(a, Kind::Entity, id).await.expect("delete"),
             "the contract's own rows must be removable"
         );
     }
+}
+
+/// Drive two futures to completion together on the calling task, so their
+/// store calls interleave (the crate carries no executor of its own).
+async fn both<A: std::future::Future, B: std::future::Future>(
+    x: A,
+    y: B,
+) -> (A::Output, B::Output) {
+    let (mut x, mut y) = (Box::pin(x), Box::pin(y));
+    let (mut xo, mut yo) = (None, None);
+    std::future::poll_fn(|cx| {
+        if xo.is_none() {
+            if let std::task::Poll::Ready(v) = std::future::Future::poll(x.as_mut(), cx) {
+                xo = Some(v);
+            }
+        }
+        if yo.is_none() {
+            if let std::task::Poll::Ready(v) = std::future::Future::poll(y.as_mut(), cx) {
+                yo = Some(v);
+            }
+        }
+        match (xo.take(), yo.take()) {
+            (Some(a), Some(b)) => std::task::Poll::Ready((a, b)),
+            (a, b) => {
+                xo = a;
+                yo = b;
+                std::task::Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// 5.13.3.5 + ADR-0021 for the @context rows: a row has a kind, and a
+/// read-modify-write of one holds its lock, so a usage bump racing a
+/// delete leaves it deleted and two racing bumps both count.
+async fn context_rows_are_locked(
+    d: &dyn CurrentStateDriver,
+    a: &TenantId,
+    b: &TenantId,
+    prefix: &str,
+) {
+    let id = format!("{prefix}-ctx-bumped");
+    assert!(
+        d.context_put(None, &id, json!({"localId": id, "body": {"@context": {}}}))
+            .await
+            .is_err(),
+        "a row without a kind must be refused"
+    );
+    let bump = || -> crate::MutateFn<'static> {
+        Box::new(|row| {
+            let o = row.as_object_mut().ok_or(())?;
+            let n = o.get("numberOfHits").and_then(Value::as_u64).unwrap_or(0);
+            o.insert("numberOfHits".into(), json!(n.saturating_add(1)));
+            Ok(())
+        })
+    };
+    assert!(
+        d.context_mutate(None, &id, bump())
+            .await
+            .expect("context_mutate")
+            .is_none(),
+        "context_mutate of an absent row must answer None"
+    );
+    assert!(
+        d.context_get(None, &id)
+            .await
+            .expect("context_get")
+            .is_none(),
+        "context_mutate of an absent row must not insert it"
+    );
+    d.context_put(
+        None,
+        &id,
+        json!({"localId": id, "kind": "Cached", "numberOfHits": 0, "body": {"@context": {}}}),
+    )
+    .await
+    .expect("context_put");
+    let (x, y) = both(
+        d.context_mutate(Some(a), &id, bump()),
+        d.context_mutate(Some(b), &id, bump()),
+    )
+    .await;
+    assert!(
+        matches!((x, y), (Ok(Some(Ok(()))), Ok(Some(Ok(()))))),
+        "both bumps of a Cached row must apply"
+    );
+    let hits = d
+        .context_get(None, &id)
+        .await
+        .expect("context_get")
+        .map(|r| r["numberOfHits"].clone());
+    assert_eq!(hits, Some(json!(2)), "two racing bumps must both count");
+
+    let hosted = format!("{prefix}-ctx-owned");
+    d.context_put(
+        Some(a),
+        &hosted,
+        json!({"localId": hosted, "kind": "Hosted", "owner": a.as_str(), "body": {"@context": {}}}),
+    )
+    .await
+    .expect("context_put");
+    assert!(
+        d.context_mutate(Some(b), &hosted, bump())
+            .await
+            .expect("context_mutate")
+            .is_none(),
+        "another tenant's @context must be as absent to a mutate as to a read"
+    );
+    assert!(
+        d.context_delete(Some(a), &hosted)
+            .await
+            .expect("context_delete"),
+        "the owner removes its @context"
+    );
+    assert!(
+        d.context_mutate(Some(a), &hosted, bump())
+            .await
+            .expect("context_mutate")
+            .is_none(),
+        "a bump after the delete must find nothing"
+    );
+    assert!(
+        d.context_get(Some(a), &hosted)
+            .await
+            .expect("context_get")
+            .is_none(),
+        "a bump racing a delete must leave the row deleted"
+    );
+    assert!(d.context_delete(None, &id).await.expect("context_delete"));
 }
 
 /// Hold a temporal driver to the same shape. A driver that answers
@@ -950,4 +1243,354 @@ pub async fn run_temporal_contract(
         d.delete(a, &e1).await.expect("delete"),
         "the contract's own rows must be removable"
     );
+}
+
+/// Hold a driver to tenant isolation: `a` and `b` each hold an
+/// Entity, a Subscription, a Registration and a temporal document under the
+/// SAME ids, and nothing done as `a` reads, changes or deletes `b`'s copy.
+/// The walk covers every tenant-taking family the API reaches: one-row and
+/// batch writes, the three list reads, the query, delivery bookkeeping, the
+/// registration lookup, the temporal reads and the drain, and last a purge
+/// of `a`, which must leave `b` whole.
+///
+/// The caller picks the pair that matters for its backend: two names a
+/// LIKE pattern would confuse (`a_b`, `axb`), the default Tenant beside a
+/// named one, a name that extends the other. `a` is purged, so it must not
+/// be a Tenant other data lives in. `cs` and `tp` may be the same store.
+pub async fn run_tenant_isolation_contract(
+    cs: &dyn CurrentStateDriver,
+    tp: &dyn TemporalDriver,
+    a: &TenantId,
+    b: &TenantId,
+    prefix: &str,
+) {
+    use crate::filter::{EntityFilter, TemporalFilter};
+    assert_ne!(a, b, "the walk needs two Tenants");
+    let e = format!("urn:ngsi-ld:{prefix}:shared");
+    let sub = format!("urn:ngsi-ld:Subscription:{prefix}:shared");
+    let reg = format!("urn:ngsi-ld:ContextSourceRegistration:{prefix}:shared");
+    let ty = "https://uri.etsi.org/ngsi-ld/default-context/T";
+    let mine = |t: &TenantId| json!({"id": e, "type": ty, "who": t.as_str()});
+    let ids = [e.clone()];
+    let ids_ref = [e.as_str()];
+
+    for t in [a, b] {
+        assert!(
+            cs.create(t, Kind::Entity, &e, mine(t))
+                .await
+                .expect("create"),
+            "{}: the shared id is new in each Tenant",
+            t.as_str()
+        );
+        cs.create(
+            t,
+            Kind::Subscription,
+            &sub,
+            json!({"id": sub, "type": "Subscription", "who": t.as_str()}),
+        )
+        .await
+        .expect("subscription");
+        cs.create(
+            t,
+            Kind::Registration,
+            &reg,
+            json!({"id": reg, "type": "ContextSourceRegistration", "who": t.as_str(),
+                   "information": [{"entities": [{"type": ty}]}], "endpoint": "http://cs.example"}),
+        )
+        .await
+        .expect("registration");
+    }
+    // `b`'s copies as they stand; every step below compares against these.
+    let b_entity = cs.get(b, Kind::Entity, &e).await.expect("get");
+    let b_sub = cs.get(b, Kind::Subscription, &sub).await.expect("get");
+    // A macro, not a closure: the check awaits, and an async closure that
+    // borrows the ids cannot be called twice.
+    macro_rules! b_unchanged {
+        ($step:literal) => {
+            assert_eq!(
+                cs.get(b, Kind::Entity, &e).await.expect("get"),
+                b_entity,
+                "{} as {} changed {}'s Entity",
+                $step,
+                a.as_str(),
+                b.as_str()
+            );
+            assert_eq!(
+                cs.get(b, Kind::Subscription, &sub).await.expect("get"),
+                b_sub,
+                "{} as {} changed {}'s Subscription",
+                $step,
+                a.as_str(),
+                b.as_str()
+            );
+        };
+    }
+    let only_a = |rows: &[Value], what: &str| {
+        let shared: Vec<&Value> = rows.iter().filter(|r| r["id"] == e.as_str()).collect();
+        assert_eq!(shared.len(), 1, "{what}: the shared id once, {rows:?}");
+        assert_eq!(
+            shared[0]["who"],
+            a.as_str(),
+            "{what} served another Tenant's copy"
+        );
+    };
+
+    // Reads.
+    let got = cs
+        .get(a, Kind::Entity, &e)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(got["who"], a.as_str(), "get served another Tenant's copy");
+    only_a(&cs.list(a, Kind::Entity).await.expect("list"), "list");
+    only_a(
+        &cs.list_page(a, Kind::Entity, None, 1000)
+            .await
+            .expect("page"),
+        "list_page",
+    );
+    only_a(
+        &cs.list_slice(a, Kind::Entity, 0, 1000)
+            .await
+            .expect("slice")
+            .0,
+        "list_slice",
+    );
+    let q = cs
+        .query_entities(
+            a,
+            &EntityFilter {
+                ids: Some(&ids_ref),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    only_a(&q.rows, "query_entities");
+    let subs = cs.list(a, Kind::Subscription).await.expect("list");
+    assert!(
+        subs.iter()
+            .filter(|s| s["id"] == sub.as_str())
+            .all(|s| s["who"] == a.as_str()),
+        "the Subscription list served another Tenant's copy: {subs:?}"
+    );
+    let regs = cs
+        .matching_registrations(a, None, None)
+        .await
+        .expect("registrations");
+    let shared: Vec<&Value> = regs.iter().filter(|r| r["id"] == reg.as_str()).collect();
+    assert!(
+        shared.len() == 1 && shared[0]["who"] == a.as_str(),
+        "matching_registrations served another Tenant's copy: {regs:?}"
+    );
+
+    // Writes, one by one and batched.
+    cs.mutate::<(), ()>(a, Kind::Entity, &e, |d| {
+        d["touched"] = json!(true);
+        Ok(())
+    })
+    .await
+    .expect("mutate");
+    b_unchanged!("mutate");
+    cs.upsert(
+        a,
+        Kind::Entity,
+        &e,
+        json!({"id": e, "type": ty, "who": a.as_str(), "n": 1}),
+    )
+    .await
+    .expect("upsert");
+    b_unchanged!("upsert");
+    assert_eq!(
+        cs.batch_create(a, vec![(e.clone(), mine(a))])
+            .await
+            .expect("batch_create"),
+        [false],
+        "a batch create sees only its own Tenant's row"
+    );
+    b_unchanged!("batch_create");
+    assert_eq!(
+        cs.batch_upsert(a, vec![(e.clone(), mine(a))])
+            .await
+            .expect("batch_upsert"),
+        [false],
+        "a batch upsert replaces its own Tenant's row"
+    );
+    b_unchanged!("batch_upsert");
+    cs.batch_mutate::<()>(a, &ids, |_, d| {
+        d["batched"] = json!(true);
+        Ok(())
+    })
+    .await
+    .expect("batch_mutate");
+    b_unchanged!("batch_mutate");
+    cs.record_delivery(a, Kind::Subscription, &sub, "2026-10-11T00:00:00Z")
+        .await
+        .expect("record_delivery")
+        .expect("a's Subscription");
+    b_unchanged!("record_delivery");
+    assert!(
+        cs.delete_entity_if(a, &e, &|_| true)
+            .await
+            .expect("delete_entity_if"),
+        "a conditional delete removes its own Tenant's row"
+    );
+    b_unchanged!("delete_entity_if");
+    cs.create(a, Kind::Entity, &e, mine(a))
+        .await
+        .expect("recreate");
+    assert_eq!(
+        cs.batch_delete(a, &ids).await.expect("batch_delete"),
+        [true],
+        "a batch delete removes its own Tenant's row"
+    );
+    b_unchanged!("batch_delete");
+    cs.create(a, Kind::Entity, &e, mine(a))
+        .await
+        .expect("recreate");
+    assert!(cs.delete(a, Kind::Entity, &e).await.expect("delete"));
+    b_unchanged!("delete");
+    cs.create(a, Kind::Entity, &e, mine(a))
+        .await
+        .expect("recreate");
+
+    // History under the same id.
+    if tp.supported() {
+        let instance = |t: &TenantId| {
+            json!({"n": [{"type": "Property", "value": t.as_str(),
+                          "observedAt": "2026-10-11T00:00:00Z",
+                          "instanceId": format!("urn:ngsi-ld:{prefix}:{}", t.as_str())}]})
+        };
+        for t in [a, b] {
+            tp.create(t, &e, mine(t)).await.expect("temporal create");
+            tp.temporal_append(t, &e, &mine(t), &instance(t))
+                .await
+                .expect("append");
+        }
+        let b_history = tp.get(b, &e).await.expect("get");
+        macro_rules! history_unchanged {
+            ($step:literal) => {
+                assert_eq!(
+                    tp.get(b, &e).await.expect("get"),
+                    b_history,
+                    "{} as {} changed {}'s history",
+                    $step,
+                    a.as_str(),
+                    b.as_str()
+                );
+            };
+        }
+        let values = |doc: &Value| doc["n"].to_string();
+        let one = tp
+            .get_temporal(a, &e, &TemporalFilter::default())
+            .await
+            .expect("get_temporal")
+            .expect("a's history");
+        assert!(
+            !values(&one).contains(&format!("\"{}\"", b.as_str())),
+            "get_temporal served another Tenant's instances: {one}"
+        );
+        let rows = tp
+            .query_temporal(
+                a,
+                &TemporalFilter {
+                    ids: Some(&ids_ref),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query_temporal")
+            .rows;
+        assert_eq!(
+            rows.len(),
+            1,
+            "query_temporal: the shared id once, {rows:?}"
+        );
+        assert!(
+            !values(&rows[0]).contains(&format!("\"{}\"", b.as_str())),
+            "query_temporal served another Tenant's instances: {rows:?}"
+        );
+        assert!(
+            tp.list(a)
+                .await
+                .expect("list")
+                .iter()
+                .filter(|r| r["id"] == e.as_str())
+                .count()
+                == 1,
+            "the temporal list holds the shared id once"
+        );
+        tp.event_list(&[crate::TemporalEvent {
+            op: crate::TemporalOp::AttrModified,
+            tenant: a.clone(),
+            entity_id: e.clone(),
+            shell: mine(a),
+            attr: "n".into(),
+            instance: json!({"type": "Property", "value": "drained",
+                             "observedAt": "2026-10-11T00:01:00Z",
+                             "instanceId": format!("urn:ngsi-ld:{prefix}:drained")}),
+        }])
+        .await
+        .expect("event_list");
+        history_unchanged!("event_list");
+        tp.mutate::<(), ()>(a, &e, |d| {
+            d["touched"] = json!(true);
+            Ok(())
+        })
+        .await
+        .expect("mutate");
+        history_unchanged!("temporal mutate");
+        assert!(tp.delete(a, &e).await.expect("delete"));
+        history_unchanged!("temporal delete");
+        tp.create(a, &e, mine(a)).await.expect("recreate");
+        tp.purge_tenant(a).await.expect("temporal purge");
+        assert!(
+            tp.get(a, &e).await.expect("get").is_none(),
+            "the purge empties a's history"
+        );
+        history_unchanged!("temporal purge");
+        assert!(tp.delete(b, &e).await.expect("cleanup"));
+    }
+
+    // A purge of `a` leaves `b` whole.
+    match cs.purge_tenant(a).await {
+        Ok(_) => {
+            assert!(
+                cs.get(a, Kind::Entity, &e).await.expect("get").is_none(),
+                "the purge empties a"
+            );
+            b_unchanged!("purge_tenant");
+            assert!(
+                cs.get(b, Kind::Registration, &reg)
+                    .await
+                    .expect("get")
+                    .is_some(),
+                "the purge of {} took {}'s Registration",
+                a.as_str(),
+                b.as_str()
+            );
+        }
+        Err(antares_model::NgsiError::OperationNotSupported(_)) => {
+            for kind in [Kind::Entity, Kind::Subscription, Kind::Registration] {
+                let id = match kind {
+                    Kind::Entity => &e,
+                    Kind::Subscription => &sub,
+                    _ => &reg,
+                };
+                cs.delete(a, kind, id).await.expect("cleanup");
+            }
+        }
+        Err(other) => panic!("purge_tenant: {other:?}"),
+    }
+    for (kind, id) in [
+        (Kind::Entity, &e),
+        (Kind::Subscription, &sub),
+        (Kind::Registration, &reg),
+    ] {
+        assert!(
+            cs.delete(b, kind, id).await.expect("cleanup"),
+            "{}'s {kind:?} survived",
+            b.as_str()
+        );
+    }
 }

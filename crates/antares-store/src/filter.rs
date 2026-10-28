@@ -30,6 +30,16 @@ pub struct EntityFilter<'a> {
     /// narrows on it, the caller's regex still decides. Absent when `id=` is
     /// given (id takes precedence over idPattern).
     pub id_literal: Option<IdLiteral<'a>>,
+    /// The id starts with one of these, a necessary condition of
+    /// the caller's id selection, which still decides. With it a store that
+    /// takes it walks the match set and `after_id` in byte order, the order
+    /// of the C-collated id index that answers the prefixes.
+    pub id_prefixes: Option<&'a [String]>,
+    /// The id matches one of these `idPattern`s, each read whole as a policy
+    /// rule reads it (`^(?:pattern)$`): an exact condition. A store
+    /// that cannot apply one exactly ([`id_pattern_sql`]) leaves it to the
+    /// caller and reports the outcome undecided.
+    pub id_patterns: Option<&'a [String]>,
     /// Entity Type Selection (4.17) as OR-of-AND groups, expanded IRIs
     pub types: Option<&'a [Vec<String>]>,
     /// `attrs=`: the entity must carry at least one, expanded IRIs
@@ -39,10 +49,15 @@ pub struct EntityFilter<'a> {
     /// `scopeQ=` verbatim (4.19); compiled over the `scopes` column
     pub scope_q: Option<&'a str>,
     /// `georel`/`geometry`/`coordinates`/`geoproperty` (4.10), compiled over
-    /// the extracted `location` column
-    pub geo: Option<&'a GeoSpec<'a>>,
+    /// the extracted `location` column. Every one must hold: the request's
+    /// own and a policy narrowing's. Empty = no geoquery.
+    pub geo: &'a [GeoSpec<'a>],
     /// term → IRI, the request context's expander (the AST holds terms)
     pub expand: &'a (dyn Fn(&str) -> String + Sync),
+    /// The request @context, for a store that evaluates `q` on documents
+    /// with the API's own evaluator (`antares_ql::eval::eval_q`). None = such
+    /// a store leaves `q` to the caller.
+    pub ctx: Option<&'a antares_jsonld::Context>,
     /// Pagination pushdown: applied ONLY when every present predicate
     /// compiled exactly (`decided`) — otherwise the caller's evaluator still
     /// has rows to drop and a SQL LIMIT would page over the wrong set. The
@@ -56,6 +71,13 @@ pub struct EntityFilter<'a> {
     /// Projection pushdown (`omit`, top-level entries only): drop exactly
     /// these attr IRIs. Same `decided` gate.
     pub drop_attrs: Option<&'a [String]>,
+    /// Keyset: only the Entities whose id sorts after this one, in
+    /// the store's id order. A walk over a whole set passes the last id it
+    /// read instead of a growing `offset`, so every page is an index seek and
+    /// each row is read once: an OFFSET walk re-reads every row it skips, and
+    /// `/types?details=true` over a 25 000-Entity tenant took 57 s. Exact, so
+    /// `decided` is untouched.
+    pub after_id: Option<&'a str>,
 }
 
 impl Default for EntityFilter<'_> {
@@ -63,15 +85,19 @@ impl Default for EntityFilter<'_> {
         Self {
             ids: None,
             id_literal: None,
+            id_prefixes: None,
+            id_patterns: None,
             types: None,
             attrs: None,
             q: None,
             scope_q: None,
-            geo: None,
+            geo: &[],
             expand: &|t: &str| t.to_owned(),
+            ctx: None,
             page: None,
             keep_attrs: None,
             drop_attrs: None,
+            after_id: None,
         }
     }
 }
@@ -90,13 +116,15 @@ pub struct Page {
 
 /// What `query` produced. `decided` = SQL applied every present predicate
 /// exactly, so re-evaluation cannot drop a row; `paged` = LIMIT/OFFSET
-/// happened in SQL (implies `decided`), `total` = the pre-LIMIT match count.
+/// happened in SQL (implies `decided`, except from `query_candidates`),
+/// `total` = the pre-LIMIT match count.
 pub struct QueryOutcome {
     /// Matching entity documents.
     pub rows: Vec<Value>,
     /// Every present predicate was applied exactly; no re-check needed.
     pub decided: bool,
-    /// LIMIT/OFFSET already applied (implies `decided`).
+    /// LIMIT/OFFSET already applied (implies `decided`, except from
+    /// `Store::query_candidates`).
     pub paged: bool,
     /// Pre-LIMIT match count, when the backend computed it.
     pub total: Option<i64>,
@@ -116,6 +144,9 @@ pub struct TemporalFilter<'a> {
     /// `lastN`: per-(attr, datasetId) RANK() cap — ties all kept, so the
     /// per-attr lastN the API applies afterwards always finds its instances
     pub last_n: Option<i64>,
+    /// the cap keeps the OLDEST instances instead (firstN, TS 104 176
+    /// 6.4.7.3); same RANK() semantics, ascending
+    pub oldest_first: bool,
     /// ordering key for the lastN cap (the request's timeproperty)
     pub timeproperty: &'a str,
     /// Entity-level LIMIT/OFFSET pushdown (without it a temporal query
@@ -125,6 +156,10 @@ pub struct TemporalFilter<'a> {
     /// (≥1 instance, in-window when a range is given), so the paged set is
     /// exactly the set the evaluator would keep.
     pub page: Option<Page>,
+    /// With `page`: an Entity qualifies for the page only through an
+    /// instance of one of these Attributes (expanded IRIs), the ones a
+    /// policy's rules show; `None` qualifies through any.
+    pub page_attrs: Option<&'a [String]>,
     /// 5.7.4.4 S2 prefilter: the `q=` AST. The Pg arm compiles the leaves it
     /// can reproduce into windowed EXISTS predicates and treats everything
     /// else as TRUE — always a SUPERSET of the eval_q verdict, so the API
@@ -138,8 +173,9 @@ pub struct TemporalFilter<'a> {
     /// whose windowed instances the EXISTS checks (per-instance rows carry
     /// extracted geometries for EVERY geoproperty, not just `location`).
     /// Superset like `q` — `GeoQuery::matches` stays the arbiter; rows with
-    /// an unextracted `geo_value` always survive.
-    pub geo: Option<(&'a GeoSpec<'a>, &'a str)>,
+    /// an unextracted `geo_value` always survive. Every one must hold, like
+    /// [`EntityFilter::geo`]; empty = no geoquery.
+    pub geo: &'a [(GeoSpec<'a>, String)],
     /// 4.5.19 aggregated representation computed by the backend: when a
     /// driver can bucket and aggregate the windowed instances itself it
     /// returns per-attribute aggregated objects instead of instance arrays
@@ -181,11 +217,13 @@ impl Default for TemporalFilter<'_> {
             attrs: None,
             range: None,
             last_n: None,
+            oldest_first: false,
             timeproperty: "observedAt",
             page: None,
+            page_attrs: None,
             q: None,
             expand: &|t: &str| t.to_owned(),
-            geo: None,
+            geo: &[],
             aggregate: None,
         }
     }
@@ -291,7 +329,7 @@ mod tests {
         assert!(f.attrs.is_none());
         assert!(f.q.is_none());
         assert!(f.scope_q.is_none());
-        assert!(f.geo.is_none());
+        assert!(f.geo.is_empty());
         assert!(f.page.is_none(), "no LIMIT until the caller proves decided");
         assert!(f.keep_attrs.is_none());
         assert!(f.drop_attrs.is_none());
@@ -311,7 +349,7 @@ mod tests {
         assert!(f.last_n.is_none());
         assert!(f.page.is_none());
         assert!(f.q.is_none());
-        assert!(f.geo.is_none());
+        assert!(f.geo.is_empty());
         assert_eq!((f.expand)("speed"), "speed");
     }
 
@@ -595,9 +633,298 @@ pub fn id_pattern_literal(pattern: &str) -> Option<IdLiteral<'_>> {
     })
 }
 
+/// A literal every id a policy rule's `pattern` selects carries, the
+/// longest one after the start, else the prefix,
+/// read as the rule reads it, anchored at both ends (`^(?:pattern)$`); the
+/// text and whether ids start with it. Unlike [`id_pattern_literal`] it
+/// takes a literal from anywhere in the top-level sequence, so
+/// `^urn:x:KPI:[a-z]+:metro:stat-[a-z]+$` narrows on `:metro:stat-`
+/// and not on the prefix every KPI shares. `None` for a pattern
+/// that does not parse or forces no literal (alternation, a case-insensitive
+/// group, only classes). A necessary condition only: the regex still decides.
+pub fn id_pattern_required(pattern: &str) -> Option<(String, bool)> {
+    use regex_syntax::hir::{HirKind, Look};
+    let hir = regex_syntax::Parser::new()
+        .parse(&format!("^(?:{pattern})$"))
+        .ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let body = parts
+        .iter()
+        .skip_while(|h| matches!(h.kind(), HirKind::Look(Look::Start)));
+    let mut best: Option<(String, bool)> = None;
+    for (i, h) in body.enumerate() {
+        let HirKind::Literal(l) = h.kind() else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&l.0) else {
+            continue;
+        };
+        // an inner literal beats the prefix, which in `urn:ngsi-ld:{Type}:`
+        // ids repeats the type the read already narrows on
+        let rank = |len: usize, anchored: bool| (!anchored, len);
+        if best
+            .as_ref()
+            .is_none_or(|(b, a)| rank(b.len(), *a) < rank(text.len(), i == 0))
+        {
+            best = Some((text.to_owned(), i == 0));
+        }
+    }
+    best
+}
+
+/// An anchored `idPattern` read as `lead`, then a run of characters none of
+/// which is `sep`, then `tail` (which starts with `sep`), as in
+/// `^urn:ngsi-ld:KPI:[a-z0-9.-]+:metro:stat-…`. Every id it selects
+/// starts with `lead + s + tail`, `s` being the text between `lead` and the
+/// first `sep` after it, so the few values of `s` a Tenant's ids show turn
+/// the pattern into exact id prefixes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdSegments {
+    /// the literal every match starts with
+    pub lead: String,
+    /// the first character of `tail`, which the run never holds
+    pub sep: char,
+    /// the literal right after the run
+    pub tail: String,
+}
+
+/// [`IdSegments`] of `pattern` read as a policy rule reads it
+/// (`^(?:pattern)$`); `None` unless its top-level sequence starts with a
+/// literal, a class or a repetition of one that excludes an ASCII `sep`,
+/// and a literal starting with `sep`.
+pub fn id_pattern_segments(pattern: &str) -> Option<IdSegments> {
+    use regex_syntax::hir::{Class, HirKind, Look};
+    let hir = regex_syntax::Parser::new()
+        .parse(&format!("^(?:{pattern})$"))
+        .ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let mut body = parts
+        .iter()
+        .skip_while(|h| matches!(h.kind(), HirKind::Look(Look::Start)));
+    let text = |h: Option<&regex_syntax::hir::Hir>| match h.map(|h| h.kind()) {
+        Some(HirKind::Literal(l)) => std::str::from_utf8(&l.0).ok().map(str::to_owned),
+        _ => None,
+    };
+    let lead = text(body.next())?;
+    let run = body.next()?;
+    let tail = text(body.next())?;
+    let sep = tail.chars().next().filter(char::is_ascii)?;
+    let class = match run.kind() {
+        HirKind::Repetition(r) => r.sub.kind(),
+        k => k,
+    };
+    let holds_sep = match class {
+        HirKind::Class(Class::Unicode(c)) => c
+            .ranges()
+            .iter()
+            .any(|r| (r.start()..=r.end()).contains(&sep)),
+        HirKind::Class(Class::Bytes(c)) => {
+            let b = u8::try_from(sep).ok()?;
+            c.ranges()
+                .iter()
+                .any(|r| (r.start()..=r.end()).contains(&b))
+        }
+        _ => return None,
+    };
+    (!holds_sep).then_some(IdSegments { lead, sep, tail })
+}
+
+/// `pattern` read as a policy rule reads it (`^(?:pattern)$`), written as a
+/// PostgreSQL advanced regular expression with the same matches, so a store
+/// counts a dataset view's Entities in one statement where the API judged
+/// 164 000 of them per row and the gateway cut the read at 10 s.
+/// `None` outside a subset both engines read alike: ASCII literals, classes
+/// of printable ASCII, groups, alternation, greedy repetition up to 255
+/// (PostgreSQL's `RE_DUP_MAX`), `^` and `$`. Membership of a regular language
+/// does not depend on the engine's match preference, so within it the two
+/// select the same ids.
+/// No `\d`, `.` or non-ASCII folding (Unicode classes differ); add one
+/// here with a parity case when a seeded pattern needs it.
+pub fn id_pattern_sql(pattern: &str) -> Option<String> {
+    let hir = regex_syntax::Parser::new()
+        .parse(&format!("^(?:{pattern})$"))
+        .ok()?;
+    let mut out = String::new();
+    are(&hir, &mut out)?;
+    // a long pattern may pass `regex`'s bound and still be too complex for
+    // PostgreSQL, which would fail the statement instead of the pushdown
+    (out.len() <= 1024).then_some(out)
+}
+
+/// One printable ASCII character as an ARE atom: `\` keeps punctuation
+/// literal, inside a bracket expression too.
+fn are_char(c: u8, out: &mut String) -> Option<()> {
+    if !c.is_ascii_graphic() {
+        return None;
+    }
+    if !c.is_ascii_alphanumeric() {
+        out.push('\\');
+    }
+    out.push(char::from(c));
+    Some(())
+}
+
+fn are(h: &regex_syntax::hir::Hir, out: &mut String) -> Option<()> {
+    use regex_syntax::hir::{Class, HirKind, Look};
+    match h.kind() {
+        HirKind::Literal(l) => l.0.iter().try_for_each(|&b| are_char(b, out))?,
+        HirKind::Class(Class::Unicode(c)) => {
+            out.push('[');
+            for r in c.ranges() {
+                let (s, e) = (u8::try_from(r.start()).ok()?, u8::try_from(r.end()).ok()?);
+                let kin = |a: u8, b: u8| {
+                    (a.is_ascii_digit() && b.is_ascii_digit())
+                        || (a.is_ascii_lowercase() && b.is_ascii_lowercase())
+                        || (a.is_ascii_uppercase() && b.is_ascii_uppercase())
+                };
+                if s < e && kin(s, e) {
+                    out.push(char::from(s));
+                    out.push('-');
+                    out.push(char::from(e));
+                } else {
+                    (s..=e).try_for_each(|b| are_char(b, out))?;
+                }
+            }
+            out.push(']');
+        }
+        HirKind::Look(Look::Start) => out.push('^'),
+        HirKind::Look(Look::End) => out.push('$'),
+        HirKind::Repetition(r) if r.greedy && !matches!(r.sub.kind(), HirKind::Look(_)) => {
+            let n = |v: u32| (v <= 255).then_some(v);
+            out.push_str("(?:");
+            are(&r.sub, out)?;
+            out.push(')');
+            let q = match (n(r.min)?, r.max.map(n)) {
+                (0, None) => "*".to_owned(),
+                (1, None) => "+".to_owned(),
+                (0, Some(Some(1))) => "?".to_owned(),
+                (m, None) => format!("{{{m},}}"),
+                (m, Some(Some(x))) if m == x => format!("{{{m}}}"),
+                (m, Some(Some(x))) => format!("{{{m},{x}}}"),
+                (_, Some(None)) => return None,
+            };
+            out.push_str(&q);
+        }
+        HirKind::Capture(c) => {
+            out.push_str("(?:");
+            are(&c.sub, out)?;
+            out.push(')');
+        }
+        HirKind::Concat(hs) => hs.iter().try_for_each(|h| are(h, out))?,
+        HirKind::Alternation(hs) => {
+            out.push_str("(?:");
+            for (i, h) in hs.iter().enumerate() {
+                if i > 0 {
+                    out.push('|');
+                }
+                are(h, out)?;
+            }
+            out.push(')');
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// The least string that sorts, byte by byte, after every string starting
+/// with `prefix`; `None` when nothing does (an empty prefix, or one of
+/// `char::MAX` only). With it `[prefix, end)` is exactly the strings that
+/// start with `prefix` under `COLLATE "C"`.
+pub fn prefix_end(prefix: &str) -> Option<String> {
+    let mut s = prefix.to_owned();
+    while let Some(c) = s.pop() {
+        let next = (u32::from(c).saturating_add(1)..=u32::from(char::MAX)).find_map(char::from_u32);
+        if let Some(n) = next {
+            s.push(n);
+            return Some(s);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod id_literal_tests {
     use super::*;
+
+    /// the seeded dataset patterns translate, each to an ARE that
+    /// keeps punctuation literal; what both engines may read apart does not.
+    #[test]
+    fn id_pattern_sql_writes_the_seeded_patterns_and_refuses_the_rest() {
+        let sql = id_pattern_sql;
+        assert_eq!(
+            sql("^urn:ngsi-ld:Tree:[a-z0-9.-]+:town-centre:green-[a-z-]+-[0-9a-f-]{36}$")
+                .as_deref(),
+            Some(
+                "^^urn\\:ngsi\\-ld\\:Tree\\:(?:[\\-\\.0-9a-z])+\\:town\\-centre\\:green\\-\
+                 (?:[\\-a-z])+\\-(?:[\\-0-9a-f]){36}$$"
+            )
+        );
+        assert_eq!(
+            sql("^urn:x:(1|2|both)-[0-9]{1,4}(-[a-z]+)?$").as_deref(),
+            Some("^^urn\\:x\\:(?:(?:1|2|both))\\-(?:[0-9]){1,4}(?:(?:\\-(?:[a-z])+))?$$")
+        );
+        for refused in [
+            "urn:x:.*",
+            "urn:x:\\d+",
+            "(?i)urn:k",
+            "urn:x:[^a]",
+            "urn:x:a+?",
+            "urn:x:a{256}",
+            "urn:x:\\bz",
+            "urn:é",
+            "urn:x |",
+            "(unclosed",
+        ] {
+            assert_eq!(sql(refused), None, "{refused}");
+        }
+    }
+
+    /// a rule's pattern narrows on its most selective literal; each
+    /// result is a substring (a prefix when anchored) of every id it selects.
+    #[test]
+    fn required_literal_is_the_longest_the_rule_pattern_forces() {
+        let req = id_pattern_required;
+        let kpi = "^urn:ngsi-ld:KeyPerformanceIndicator:[a-z0-9.-]+:metro:stat-environment-[A-Za-z0-9._-]+$";
+        assert_eq!(
+            req(kpi),
+            Some((":metro:stat-environment-".to_owned(), false))
+        );
+        assert_eq!(req("urn:x:abc.*"), Some(("urn:x:abc".to_owned(), true)));
+        // a quantifier binds the last character
+        assert_eq!(req("^abc*$"), Some(("ab".to_owned(), true)));
+        assert_eq!(req("a|b"), None);
+        assert_eq!(req("urn:(a|b)"), Some(("urn:".to_owned(), true)));
+        // case-insensitive letters are classes; only the `:` is forced
+        assert_eq!(req("(?i)urn:a"), Some((":".to_owned(), false)));
+        assert_eq!(req("[ab]+"), None);
+        assert_eq!(req("(unclosed"), None);
+        assert_eq!(req(""), None);
+        for (p, id) in [
+            (
+                kpi,
+                "urn:ngsi-ld:KeyPerformanceIndicator:x.y:metro:stat-environment-a1",
+            ),
+            ("urn:x:abc.*", "urn:x:abc9"),
+            ("^abc*$", "ab"),
+            ("urn:(a|b)", "urn:b"),
+        ] {
+            let re = regex::Regex::new(&format!("^(?:{p})$")).expect("re");
+            assert!(re.is_match(id), "{p} vs {id}");
+            let (text, anchored) = req(p).expect("literal");
+            assert!(
+                if anchored {
+                    id.starts_with(&text)
+                } else {
+                    id.contains(&text)
+                },
+                "{p}: {id}"
+            );
+        }
+    }
 
     /// 5.2.33 idPattern narrowing: the literal is a necessary condition of
     /// the regex, never a sufficient one, so it may only ever shrink the
@@ -647,6 +974,56 @@ mod id_literal_tests {
                     sample.contains(l.text)
                 },
                 "{p}: {sample}"
+            );
+        }
+    }
+
+    /// a pattern's segments are exact prefixes of every id it
+    /// selects, and `prefix_end` bounds exactly the strings with a prefix.
+    #[test]
+    fn segments_split_a_pattern_at_its_first_run() {
+        let kpi = "^urn:ngsi-ld:KeyPerformanceIndicator:[a-z0-9.-]+:metro:stat-environment-[A-Za-z0-9._-]+$";
+        let s = id_pattern_segments(kpi).expect("segments");
+        assert_eq!(s.lead, "urn:ngsi-ld:KeyPerformanceIndicator:");
+        assert_eq!(s.sep, ':');
+        assert_eq!(s.tail, ":metro:stat-environment-");
+        let id = "urn:ngsi-ld:KeyPerformanceIndicator:city.example:metro:stat-environment-a1";
+        let re = regex::Regex::new(&format!("^(?:{kpi})$")).expect("re");
+        assert!(re.is_match(id));
+        let run = &id[s.lead.len()..];
+        let seg = &run[..run.find(s.sep).expect("sep")];
+        assert!(id.starts_with(&format!("{}{seg}{}", s.lead, s.tail)));
+        assert_eq!(
+            id_pattern_segments("urn:x:[a-z]:t").map(|s| s.tail),
+            Some(":t".to_owned())
+        );
+        // the run may hold the separator: no split
+        assert_eq!(id_pattern_segments("urn:x:.+:t"), None);
+        assert_eq!(id_pattern_segments("urn:x:[a-z:]+:t"), None);
+        // no literal after the run, a run first, alternation, case folding
+        assert_eq!(id_pattern_segments("urn:x:[a-z]+"), None);
+        assert_eq!(id_pattern_segments("[a-z]+:t"), None);
+        assert_eq!(id_pattern_segments("urn:(a|b):t"), None);
+        assert_eq!(id_pattern_segments("(?i)urn:[a-z]+:t"), None);
+        assert_eq!(id_pattern_segments("(unclosed"), None);
+
+        assert_eq!(prefix_end("ab:").as_deref(), Some("ab;"));
+        assert_eq!(prefix_end("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_end("a\u{D7FF}").as_deref(), Some("a\u{E000}"));
+        assert_eq!(prefix_end(""), None);
+        assert_eq!(prefix_end("\u{10FFFF}"), None);
+        let end = prefix_end("ab:").expect("end");
+        for (s, inside) in [
+            ("ab:", true),
+            ("ab:\u{10FFFF}z", true),
+            ("ab;", false),
+            ("ab", false),
+            ("ab9", false),
+        ] {
+            assert_eq!(
+                s.as_bytes() >= b"ab:".as_slice() && s.as_bytes() < end.as_bytes(),
+                inside,
+                "{s}"
             );
         }
     }

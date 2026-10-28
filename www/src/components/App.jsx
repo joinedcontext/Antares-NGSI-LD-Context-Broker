@@ -23,6 +23,8 @@ export default function App() {
   const [picked, setPicked] = useState(null); // {space,id,attr,emoji,type}
   const [apiOpen, setApiOpen] = useState(false);
   const [drawerW, setDrawerW] = useState(() => Number(load("antares.drawerw")) || 420);
+  // phones show one pane at a time; on a wide screen both, and this is unused
+  const [pane, setPane] = useState("board");
 
   useEffect(() => {
     let alive = true;
@@ -47,7 +49,7 @@ export default function App() {
       startPolling();
     })();
     const off = onNotification((n) => {
-      const ids = (n.data ?? []).map((e) => e.id.split(":").pop()).join(", ");
+      const ids = [...new Set((n.data ?? []).map((e) => e.id.split(":").pop()))].join(", ");
       toast(`🔔 ${ids || n.id || "notification"}`);
     });
     return () => {
@@ -60,19 +62,21 @@ export default function App() {
   const shownSpace = spaceExists ? selectedSpace : "default";
 
   return (
-    <div className="app">
+    <div className="app" style={{ "--drawer-w": `${drawerW}px` }}>
       <TopBar health={health} onApi={() => setApiOpen(true)} />
       {apiOpen && (
         <React.Suspense fallback={null}>
           <ApiConsole onClose={() => setApiOpen(false)} />
         </React.Suspense>
       )}
-      <div className="stage">
+      <main className={`stage show-${pane}`}>
         <Board
           selected={shownSpace}
           onSelectSpace={(name) => {
             setSelectedSpace(name);
             setPicked(null);
+            // a phone shows one pane: a tapped space opens its data
+            if (window.matchMedia?.("(max-width: 900px)").matches) setPane("data");
           }}
         />
         <div
@@ -94,12 +98,18 @@ export default function App() {
             window.addEventListener("pointerup", up);
           }}
         />
-        <aside className="drawer" data-testid="drawer" style={{ width: drawerW }}>
+        <aside className="drawer" data-testid="drawer">
           <TenantSheet space={shownSpace} picked={picked} onPick={setPicked} />
           {picked && <History key={`${picked.space}/${picked.id}`} {...picked} />}
         </aside>
-      </div>
-      <div className="toasts">
+      </main>
+      <nav className="tabs" aria-label="view">
+        <button className={pane === "board" ? "primary" : ""} aria-pressed={pane === "board"}
+          data-testid="tab-board" onClick={() => setPane("board")}>🗺 board</button>
+        <button className={pane === "data" ? "primary" : ""} aria-pressed={pane === "data"}
+          data-testid="tab-data" onClick={() => setPane("data")}>📋 {shownSpace}</button>
+      </nav>
+      <div className="toasts" role="status" aria-live="polite">
         {board.toasts.map((t) => (
           <div key={t.id} className="toast">{t.text}</div>
         ))}
