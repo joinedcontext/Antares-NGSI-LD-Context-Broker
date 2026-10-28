@@ -327,7 +327,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-jsonld, antares-matcher, antares-store]
+        crate: [ngsild-model, ngsild-ql, ngsild-jsonld, ngsild-matcher, antares-store]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

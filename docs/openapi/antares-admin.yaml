@@ -227,7 +227,6 @@ paths:
           schema:
             type: integer
             minimum: 1
-            maximum: 1000
             default: 100
       security: [{}, {adminToken: []}]
       responses:
