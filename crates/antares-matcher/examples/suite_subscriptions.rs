@@ -3,7 +3,7 @@
 //! Vehicle Entities and prints which of the two each would notify for. The selector types are
 //! expanded first, as a broker stores them; a `q`, `geoQ` or `watchedAttributes` applies as-is.
 //!
-//!     cargo run -p antares-matcher --example suite_subscriptions [ngsi-ld-test-suite]
+//!     cargo run -p ngsild-matcher --example suite_subscriptions [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
 use antares_jsonld::{core_context, expand_entity, Context, ExpandOpts};
 use ngsild_matcher::would_notify;

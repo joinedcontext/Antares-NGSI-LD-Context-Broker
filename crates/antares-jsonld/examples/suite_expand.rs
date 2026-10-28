@@ -2,7 +2,7 @@
 //! Expands the ETSI NGSI-LD test suite's Entity fixtures with the suite's own `@context` and
 //! prints what each one became: the stored attribute IRIs, or the 400 a broker would answer.
 //!
-//!     cargo run -p antares-jsonld --example suite_expand [ngsi-ld-test-suite]
+//!     cargo run -p ngsild-jsonld --example suite_expand [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
 use ngsild_jsonld::{core_context, expand_entity, ExpandOpts};
 use serde_json::Value;

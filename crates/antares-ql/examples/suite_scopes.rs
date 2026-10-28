@@ -3,7 +3,7 @@
 //! over the two Entities those TPs create, and prints how many each selects next to the count
 //! the TP expects.
 //!
-//!     cargo run -p antares-ql --example suite_scopes [ngsi-ld-test-suite]
+//!     cargo run -p ngsild-ql --example suite_scopes [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
 use ngsild_ql::scope::{check_scope_q, scope_matches};
 use serde_json::Value;

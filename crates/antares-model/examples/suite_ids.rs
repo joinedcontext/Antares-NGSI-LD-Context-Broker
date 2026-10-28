@@ -2,7 +2,7 @@
 //! Runs the entry checks over the ETSI NGSI-LD test suite's Entity fixtures: each id through
 //! `EntityId::new`, each Attribute name through `check_attr_name`.
 //!
-//!     cargo run -p antares-model --example suite_ids [ngsi-ld-test-suite/data/entities]
+//!     cargo run -p ngsild-model --example suite_ids [ngsi-ld-test-suite/data/entities]
 #![allow(clippy::print_stdout)]
 use ngsild_model::{check_attr_name, EntityId};
 use serde_json::Value;
