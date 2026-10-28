@@ -27,7 +27,8 @@ jobs:
     # same cold job peaks at 1.2 GB locally. The msrv and shared-crate jobs
     # keep the arm runner, they run fine there.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # four nextest configs of ~6 min each plus clippy and setup: ~40 min
+    timeout-minutes: 50
     env:
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
