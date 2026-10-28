@@ -3,7 +3,7 @@
 //! the same predicates the broker's notification path applies (5.8.6), over
 //! a stored subscription document and an entity in its internal form.
 //!
-//!     cargo run -p antares-matcher --example would_notify
+//!     cargo run -p ngsild-matcher --example would_notify
 
 use ngsild_matcher::would_notify;
 use serde_json::json;

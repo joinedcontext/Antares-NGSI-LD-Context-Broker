@@ -4,7 +4,7 @@
 //! render the result as the query string to forward — and show the SQL the
 //! broker would run for it.
 //!
-//!     cargo run -p antares-ql --example gateway_filter -- 'speed>25|heading<90'
+//!     cargo run -p ngsild-ql --example gateway_filter -- 'speed>25|heading<90'
 
 use ngsild_ql::{parse_q, sql::compile_q, CmpOp, QNode, QPath, QValue};
 

@@ -3145,7 +3145,7 @@ mod bench {
     /// The go/no-go threshold for a hand-rolled JSON-LD processor was
     /// ≥5k expansions/s/core. Antares hand-rolled its processor from day one
     /// rather than forking a `json-ld` crate — this measures it. Run with
-    /// `cargo test -p antares-jsonld --release -- --ignored bench_expansion`.
+    /// `cargo test -p ngsild-jsonld --release -- --ignored bench_expansion`.
     #[test]
     #[ignore = "benchmark — run explicitly in release"]
     fn bench_expansion_rate() {
