@@ -4,7 +4,7 @@
 // clear error) and runs the same broker over the same redb shadow as native
 // `file` mode: commit-before-ack, format check, boot rebuild.
 import init, { AntaresBroker } from "./pkg/antares_wasm.js";
-import { installLoopback } from "./loopback.js";
+import { installLoopback, LOOPBACK } from "./loopback.js";
 
 let broker = null;
 installLoopback(() => broker);
@@ -16,6 +16,9 @@ self.onmessage = async (e) => {
       // 4.22 GC cadence — the wasm broker reads globalThis.ANTARES_SWEEP_SECS
       // at construction (same variable as the native env knob).
       if (msg.sweepSecs > 0) globalThis.ANTARES_SWEEP_SECS = msg.sweepSecs;
+      // distributed subscriptions call back through the loopback, never a
+      // real http:// request out of an https page
+      globalThis.ANTARES_PUBLIC_URL = LOOPBACK;
       await init();
       broker = await AntaresBroker.persistent(
         msg.file ?? "antares.redb",

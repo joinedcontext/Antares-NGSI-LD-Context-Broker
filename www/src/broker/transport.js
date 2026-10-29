@@ -117,9 +117,11 @@ async function bootInPage() {
   const mod = await import(/* @vite-ignore */ pkgUrl);
   await mod.default();
   if (SWEEP_SECS > 0) globalThis.ANTARES_SWEEP_SECS = SWEEP_SECS;
-  pageBroker = new mod.AntaresBroker(ALLOW_PRIVATE_EGRESS);
   const lbUrl = new URL("loopback.js", document.baseURI).href;
-  const { installLoopback } = await import(/* @vite-ignore */ lbUrl);
+  const { installLoopback, LOOPBACK } = await import(/* @vite-ignore */ lbUrl);
+  // the same loopback callback the worker gets (worker.js)
+  globalThis.ANTARES_PUBLIC_URL = LOOPBACK;
+  pageBroker = new mod.AntaresBroker(ALLOW_PRIVATE_EGRESS);
   installLoopback(() => pageBroker);
   pageBroker.onNotification("http://page.local/", (url, body) => {
     dispatchNotification(body);
