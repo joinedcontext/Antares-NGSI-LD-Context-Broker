@@ -1545,6 +1545,21 @@ impl Loader {
 mod tests {
     use super::*;
 
+    /// Reads the request head before a loopback server answers: closing a
+    /// socket with unread request bytes sends RST, and the client may see the
+    /// reset before the response.
+    async fn read_head(sock: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => head.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
     /// 4.4: "the Core @context is protected and shall remain immutable and
     /// invariant during expansion or compaction of terms. […] implementations
     /// shall consider the Core @context as if it were in the last position of
@@ -1695,6 +1710,7 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nContent-Length: {}\r\n\r\n{body}",
                         body.len()
                     );
+                    read_head(&mut sock).await;
                     let _ = sock.write_all(resp.as_bytes()).await;
                     let _ = sock.flush().await;
                 }
@@ -1775,6 +1791,7 @@ mod tests {
                     "HTTP/1.1 302 Found\r\nLocation: http://{addr}/loop\r\nContent-Length: 0\r\n\r\n"
                 );
                 use tokio::io::AsyncWriteExt;
+                read_head(&mut sock).await;
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.flush().await;
             }
@@ -1821,6 +1838,7 @@ mod tests {
                     "HTTP/1.1 302 Found\r\nLocation: http://{addr}/internal\r\nContent-Length: 0\r\n\r\n"
                 );
                 use tokio::io::AsyncWriteExt;
+                read_head(&mut sock).await;
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.flush().await;
             }
@@ -1868,6 +1886,7 @@ mod tests {
             while let Ok((mut sock, _)) = target.accept().await {
                 hit.fetch_add(1, Ordering::SeqCst);
                 use tokio::io::AsyncWriteExt;
+                read_head(&mut sock).await;
                 let _ = sock
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                     .await;
@@ -1885,6 +1904,7 @@ mod tests {
                     target_addr.port()
                 );
                 use tokio::io::AsyncWriteExt;
+                read_head(&mut sock).await;
                 let _ = sock.write_all(resp.as_bytes()).await;
                 let _ = sock.flush().await;
             }
@@ -2061,6 +2081,7 @@ mod tests {
                     None => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
                         .to_string(),
                 };
+                read_head(&mut sock).await;
                 let _ = sock.write_all(resp.as_bytes()).await;
             }
         });
