@@ -227,10 +227,9 @@ standard distributed-operations API. Where it fits and how it compares:
 ## Contributing
 
 Changes are accepted into `dev` only. Fork, branch from `dev`, open the
-pull request into `dev`; one aimed at `main` fails its first check and
-gets retargeted. `main` holds released code and moves only when the
-maintainers promote `dev` into it, and releases are the `v*` tags cut
-there. Commits carry a DCO sign-off (`git commit -s`), one change each.
+pull request into `dev`. A release is one run of the `full` workflow on
+`dev`: the whole grid green, then the `v*` tag, the artifacts, and `main`
+moved to the release. Commits carry a DCO sign-off (`git commit -s`), one change each.
 
 The whole process, from the first commit to a release, is in
 [CONTRIBUTING.md](CONTRIBUTING.md). Report a vulnerability the way

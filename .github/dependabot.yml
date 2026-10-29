@@ -1,6 +1,6 @@
 # Dependency updates arrive as pull requests into the default branch, dev,
 # where ci.yml proves them like any other change (CONTRIBUTING.md). They
-# reach master with the next promotion and never on their own.
+# ship with the next release and never on their own.
 #
 # Minor and patch bumps come as ONE pull request per ecosystem per week:
 # every pull request into dev costs a full ci run, and forty single-crate

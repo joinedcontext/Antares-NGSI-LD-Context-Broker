@@ -5,8 +5,9 @@
 #   dev    — default branch. Maintainers push, everyone else opens a pull
 #            request that lands by rebase or squash with ci.yml green.
 #            No force push, no deletion, linear history.
-#   main — released code. Pull request only (from dev), full.yml green,
-#            merge commit only, no force push, no deletion.
+#   main   — the latest release. Only the release run of full.yml moves
+#            it (a merge commit of the released commit); nobody else
+#            updates it, no force push, no deletion.
 #   v*     — release tags. Once pushed, never moved and never deleted.
 #
 # Needs a token with Administration: write on the repository, in GH_TOKEN
@@ -15,8 +16,8 @@
 # existing dev branch is kept and a ruleset of the same name is replaced.
 #
 # Review count is 0 on purpose: a sole maintainer cannot approve their own
-# pull request, so requiring one would deadlock every promotion. Raise it
-# when a second maintainer joins.
+# pull request, so requiring one would deadlock every merge into dev. Raise
+# it when a second maintainer joins.
 set -euo pipefail
 
 REPO=${REPO:-joinedcontext/Antares-NGSI-LD-Context-Broker}
@@ -83,8 +84,8 @@ pull_request() { # merge-methods-json
 
 # Check contexts are "<caller job name> / <called job name>"; if GitHub
 # reports one as expected-but-never-reported, copy the exact name from a
-# pull request's checks tab. Not strict: main only ever receives dev, so
-# "up to date with the base" would demand a back-merge after every release.
+# pull request's checks tab. Not strict: dev is linear, a pull request is
+# rebased onto it when it lands.
 checks() { # context...
   local list="" c
   for c in "$@"; do list+="{\"context\":\"$c\"},"; done
@@ -96,17 +97,15 @@ checks() { # context...
 hard='{ "type": "deletion" }, { "type": "non_fast_forward" }'
 # RepositoryRole 5 is admin: the maintainers, who push to dev.
 admins='[ { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" } ]'
+# Integration 15368 is the GitHub Actions app: full.yml's release run.
+actions='[ { "actor_id": 15368, "actor_type": "Integration", "bypass_mode": "always" } ]'
 
-# Nobody bypasses these.
+# Nobody bypasses the tag and dev rules.
 ruleset protect-tags 'refs/tags/v*' '[]' "[ $hard, { \"type\": \"update\" } ]"
 ruleset protect-dev refs/heads/dev '[]' "[ $hard, { \"type\": \"required_linear_history\" } ]"
-ruleset protect-main refs/heads/main '[]' "[ $hard,
-  $(pull_request '["merge"]'),
-  $(checks "Source of the change" \
-           "Workspace tests / Workspace tests" \
-           "ETSI cell matrix / Matrix summary" \
-           "Browser build (wasm32)" \
-           "wasm Node tier (serial suites)") ]"
+# The release run moves main after the whole grid is green on the
+# released commit; no pull request or person updates it.
+ruleset protect-main refs/heads/main "$actions" "[ $hard, { \"type\": \"update\" } ]"
 
 # Maintainers bypass this one, which is what lets them push commits to dev.
 ruleset dev-pull-requests refs/heads/dev "$admins" "[

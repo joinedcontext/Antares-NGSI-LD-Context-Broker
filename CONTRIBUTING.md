@@ -9,30 +9,28 @@ how a release is cut.
 | Ref | Holds | How it moves | Gate |
 |---|---|---|---|
 | `dev` | the next release; the default branch | maintainers push commits, everyone else opens a pull request into it | `ci`: workspace tests, then the quick ETSI matrix (file, postgres, timescale) |
-| `main` | released code and nothing else | only by a pull request from `dev` | `full`: workspace tests, all seven ETSI cells, both wasm tiers |
-| `v*` tag | one release, cut on `main` | a maintainer tags the merge commit | `full` again; artifacts publish only when it is green |
+| `v*` tag | one release, on the `dev` commit it tested | the release run of `full` creates it once its whole grid is green | `full`: workspace tests, all seven ETSI cells, both wasm tiers, upgrade path, release binaries |
+| `main` | the latest release | the same release run merges the released commit into it | none of its own: it only ever receives a released commit |
 
 GitHub rulesets (`dev/branch-protection.sh` applies them) and one job
 of `full` (`dev/check-source.sh`) enforce the table:
 
-- `main` rejects direct pushes, force pushes and deletion. A pull
-  request into it merges only with the `full` checks green, and only as
-  a merge commit.
 - `dev` rejects force pushes and deletion. History there is linear: a
   pull request lands by rebase or squash, never as a merge commit.
-- A pull request into `main` comes from this repository's `dev`. One
-  from any other branch fails its first check before the matrix starts:
-  retarget it to `dev`.
-- A `v*` tag names a commit on `main` whose `Cargo.toml` workspace
-  version equals the tag, or the release run stops before it publishes.
-  A pushed release tag is never moved and never deleted.
+- A release runs on `dev`, its version equals the `Cargo.toml`
+  workspace version, and its tag does not exist yet, or the run stops
+  before the grid starts.
+- A release tag is created only after the whole grid is green, then is
+  never moved and never deleted.
+- `main` rejects every update except the release run's, and rejects
+  force pushes and deletion.
 
 `dev` is the default branch on purpose. A new pull request targets it
 without anyone choosing, and the scheduled workflows (`full` twice a
 week, `strict`, `fuzz`, `roll-weekly`, `scale-weekly`) run on the
 default branch, where the new code is. The `:dev` image and the public
-ETSI badges describe `dev`; `:latest` and the versioned images describe
-`main`.
+ETSI badges describe `dev`; `:latest`, the versioned images and `main`
+describe the latest release.
 
 ## The path of a change
 
@@ -61,32 +59,26 @@ What a pull request from a fork can and cannot do here:
   schedule or dispatch, never from a pull request.
 - Nothing a `v*` tag publishes is built from a cache.
 
-**As a maintainer.** Commit on `dev`, push a batch, then dispatch `ci`
-once for the batch (`ci` has no push trigger: a 40-minute pipeline that
-restarts on every push never finishes). A green dispatched run on `dev`
+**As a maintainer.** Commit on `dev` and push. Every push to `dev`
+runs `ci`, and runs on `dev` queue instead of cancelling each other, so
+push a batch rather than single commits. A green run on `dev`
 publishes the `:dev` image. Work that will stay red for more than a day
 lives on a topic branch and comes in by pull request like a fork's.
 
-**Promotion to `main`.** When `dev` holds a release:
+**Cutting a release.** When `dev` holds a release:
 
-1. Set the workspace version in `Cargo.toml` on `dev`
-   (`release: v0.MINOR.PATCH` as the commit subject), then open a pull
-   request `dev` → `main` with the same title.
-2. `full` runs when the pull request opens, reopens or leaves draft. A
-   later push to `dev` moves the pull request's head without rerunning
-   the grid. Red means the fix goes to `dev`; then run `full` once on the
-   final head (Actions → full → Run workflow on `dev`, or flip the pull
-   request to draft and back). The required checks hang on the head
-   commit, so the merge stays blocked until that run is green.
-3. Merge with a merge commit. Squash or rebase here would give `main`
-   commits `dev` does not have, and the next promotion would conflict
-   with itself.
-4. Tag the merge commit on `main` and push the tag: `dev/release-tag.sh`
-   (`--dry-run` shows the tag and the commit first). It reads the version
-   from `origin/main`, refuses a commit that is not the promotion's merge
-   or a tag that already exists, signs when git has a signing key and
-   annotates otherwise, and pushes on a typed `yes`. The tag run is the release gate, and a tag is final: a bad release
-   is fixed by the next PATCH, not by moving the tag.
+1. Set the workspace version in `Cargo.toml` on `dev`, with
+   `release: v0.MINOR.PATCH` as the commit subject, and push it.
+2. Actions → `full` → Run workflow on `dev`, `release` = `0.MINOR.PATCH`.
+   The run checks the version and that the tag is new, runs the whole
+   grid once on that commit, and only when every job is green it tags
+   `v0.MINOR.PATCH` on the tested commit, publishes the image, binaries,
+   wasm bundle, SBOM and the GitHub Release from the bytes it tested,
+   and moves `main` to the release.
+3. Red means nothing was tagged or published: fix it on `dev` and run
+   the same version again. A flaky job is rerun with "Re-run failed
+   jobs" on the same run. After the tag exists a release is final: a
+   bad one is fixed by the next PATCH, never by moving the tag.
 
 **Dependency updates.** Dependabot (`.github/dependabot.yml`) opens
 pull requests into `dev` every Monday: one grouped pull request of minor
@@ -100,10 +92,10 @@ not that a new upstream release is trustworthy. A cargo bump that moves
 a `[workspace.dependencies]` version without its `wasm32` twin fails
 `dev/check-wasm-pins.py`; push the matching pin to the same branch. The
 weekly `advisories` sweep (`cargo deny`) files an issue for an advisory
-no update resolves yet. Updates reach `main` with the next promotion.
+no update resolves yet. Updates ship with the next release.
 
-**Urgent fixes** take the same road: a commit on `dev`, then a promotion.
-There is no hotfix branch, so `main` never holds a change `dev` lacks.
+**Urgent fixes** take the same road: a commit on `dev`, then a release.
+There is no hotfix branch, so a release never holds a change `dev` lacks.
 
 ## Build
 
@@ -148,8 +140,8 @@ Integration tests that need services are env-gated and skip loudly:
 - **ETSI validation.** `STORE=<mode> dev/etsi-local.sh` runs the suite for
   ONE store mode locally (the one you touched); the CI cell matrix is the
   authority — the quick preset (file, postgres, timescale) runs all ten
-  suites per cell on every dispatch, the full seven-cell preset twice a
-  week and on `v*` tags.
+  suites per cell on every push to `dev`, the full seven-cell preset
+  twice a week and in every release run.
 - `cargo fmt` on touched crates; clippy is a CI wall
   (`unwrap_used`/`expect_used` denied outside tests, `unsafe_code` forbidden).
 - Naming comes from the spec: types verbatim from CIM 009 §5.2, one public
@@ -174,11 +166,12 @@ format version, Postgres migrations).
 - **Store-format changes** always ship with a migration note (and for the
   file store, a format-version bump — the broker refuses mismatched files
   rather than guessing).
-- **Releases** are `v*` tags on `main`, cut after a promotion (see
-  "The path of a change"). The tag triggers the full seven-cell ETSI
-  matrix as the release gate plus the examples job; artifacts (multi-arch
-  images, binaries, wasm bundle, SBOM) publish only on a green gate, and
-  the release notes are the commit subjects since the previous tag.
+- **Releases** are `v*` tags created by the release run of `full` (see
+  "Cutting a release"): the full seven-cell ETSI matrix is the release
+  gate, the tag and the artifacts (multi-arch images, binaries, wasm
+  bundle, SBOM) exist only after it is green, the examples job follows
+  the tag, and the release notes are the commit subjects since the
+  previous tag.
 
 ## Sign-off (DCO)
 
