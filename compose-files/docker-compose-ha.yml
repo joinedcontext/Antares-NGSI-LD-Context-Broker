@@ -72,6 +72,8 @@ services:
       ANTARES_STORE: ${STORE:-memory}
       ANTARES_DATA_DIR: /data
       ANTARES_EGRESS_ALLOW_PRIVATE: "true"
+      # the 6.3.10 ceiling antares1 runs with; behind the LB both must agree
+      ANTARES_TEMPORAL_INSTANCE_LIMIT: "9"
       ANTARES_BUS: ${HA_BUS:-nats}
       ANTARES_NATS_URL: nats://localhost:4222
       # Shares antares1's database — that is the whole point.
