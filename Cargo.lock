@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "antares-api"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "antares-api",
  "antares-notifier",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "antares-broker"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "antares-api",
  "antares-bus",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "antares-bus"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "antares-notifier"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "ngsild-jsonld",
  "ngsild-model",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "antares-plugin-example"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "antares-api",
  "antares-notifier",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "antares-sql"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "antares-sql",
  "antares-store",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "antares-store"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "antares-wasm"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "antares-api",
  "antares-sql",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-jsonld"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-matcher"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "ngsild-jsonld",
@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-model"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-ql"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "geo",
  "geo-types",
