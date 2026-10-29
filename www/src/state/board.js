@@ -171,11 +171,14 @@ export function setFedView(space, on) {
   emit();
 }
 
+// A burst of notifications keeps only the newest three on screen.
+const TOAST_MAX = 3;
 export function toast(text) {
-  board.toasts.push({ id: uuid(), text });
+  const t = { id: uuid(), text };
+  board.toasts = [...board.toasts, t].slice(-TOAST_MAX);
   emit();
   setTimeout(() => {
-    board.toasts.shift();
+    board.toasts = board.toasts.filter((x) => x !== t);
     emit();
   }, 4000);
 }
