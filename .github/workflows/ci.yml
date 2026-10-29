@@ -25,18 +25,20 @@ name: ci
 # k8s-smoke.yml. Shared pieces: workspace.yml (the test gate),
 # etsi-matrix.yml (the cell matrix), build-image.yml (image builds).
 
-# Runs on PRs targeting dev and on manual dispatch — NOT on every push:
-# cancel-in-progress meant a 40 min run never finished under a stream of
-# fix commits. Dispatch it when a batch is ready. Tags run full.yml.
+# Runs on PRs targeting dev, on every commit that lands on dev (which
+# publishes :dev when all green) and on manual dispatch. Tags run full.yml.
 on:
   pull_request:
     branches: [dev]
+  push:
+    branches: [dev]
   workflow_dispatch:
 
-# A newer commit supersedes a running pipeline.
+# A newer commit supersedes a running PR pipeline. On dev a run is never
+# cancelled: each landed commit finishes and publishes, a newer one queues.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   workspace:
@@ -75,7 +77,7 @@ jobs:
       arch: arm64
 
   publish-dev:
-    # Every green dispatched run on dev ships a DEV image: the sha and a moving
+    # Every green run on dev ships a DEV image: the sha and a moving
     # `dev` tag. Never `latest` — that belongs to a released version, so
     # `docker pull …:latest` can't silently land on an unreleased build.
     # The wasm broker image publishes from full.yml, after its cell.

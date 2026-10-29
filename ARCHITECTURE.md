@@ -403,7 +403,7 @@ Stated so they are not rediscovered. Each is measured, not guessed.
 
 Unit (`cargo test -p <crate> <filter> -j 2`) → clause Robot TPs against
 one local memory broker (`ANTARES_HTTP_PORT=9377 target/debug/antares`,
-`ngsi-ld-test-suite/`) → `ci.yml` (dispatch: workspace tests, clippy
+`ngsi-ld-test-suite/`) → `ci.yml` (PRs and each dev commit: workspace tests, clippy
 wall, quick ETSI matrix) → `full.yml` (seven store cells, twice weekly)
 → `strict.yml` (TSan, Miri, fuzz replay, coverage floor) →
 `perf-weekly.yml` / `scale-weekly.yml` (rented hardware, `dev/perf/`).
