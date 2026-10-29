@@ -34,8 +34,9 @@ on:
     # No `synchronize`: while the promotion PR is open, a push to dev moves
     # its head and would rerun the whole grid per commit. The grid runs when
     # the PR opens, reopens or leaves draft. The required checks hang on the
-    # head commit, so after later pushes prove the final head once: dispatch
-    # this workflow on dev, or flip the PR to draft and back.
+    # head commit, so after later pushes prove the final head once: close and
+    # reopen the PR, or flip it to draft and back. A workflow_dispatch run on
+    # dev does not count: the ruleset only credits runs tied to the PR.
     types: [opened, reopened, ready_for_review]
   workflow_dispatch:
 
