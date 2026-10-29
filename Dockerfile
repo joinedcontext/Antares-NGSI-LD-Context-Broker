@@ -68,6 +68,8 @@ ENV ANTARES_DEFAULT_LIMIT=100 \
 # mountpoint's ownership, so `file` mode can write without running as root —
 # distroless has no shell to chown at runtime.
 COPY --from=build --chown=65532:65532 /data-init /data
+# the distroless :nonroot user, stated so scanners and runtimes see it
+USER 65532:65532
 # OCI labels: what the registry shows and what a scanner reads
 ARG VERSION=dev
 ARG REVISION=unknown

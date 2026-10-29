@@ -662,9 +662,8 @@ pub async fn delete_context(
         };
         // A Cached copy (the core one included) belongs to no Tenant and
         // serves every one: only the default Tenant, the operator's, may
-        // evict or refetch it. Decided (worker-t5704, owner may
-        // override): admin-only, because one Tenant could otherwise evict
-        // or refetch the cache every other Tenant resolves from.
+        // evict or refetch it: one Tenant could otherwise evict or
+        // refetch the cache every other Tenant resolves from.
         if matches!(entry, CtxEntry::Cached(_) | CtxEntry::Core(_)) && tenant != TenantId::default()
         {
             return Err(ApiError::Denied(
