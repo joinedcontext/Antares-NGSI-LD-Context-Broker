@@ -7,9 +7,9 @@
 //! parameters ride in `notifier_info` (Table 7.2-1), receiver metadata in
 //! `receiver_info` (Table 7.2-2).
 
+use crate::build_message;
 use antares_jsonld::loader::EgressPolicy;
 use antares_model::NgsiError;
-use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -21,7 +21,9 @@ fn bad(m: String) -> NgsiError {
 use crate::redact_userinfo as redacted;
 
 /// Parsed `mqtt[s]://[user][:pass]@host[:port]/topic[/subtopic]*` (7.2).
-#[derive(Debug, Clone, PartialEq)]
+/// Debug prints the password as `[redacted]`: it is the subscriber's
+/// credential.
+#[derive(Clone, PartialEq)]
 pub struct MqttEndpoint {
     pub secure: bool,
     pub username: Option<String>,
@@ -29,6 +31,19 @@ pub struct MqttEndpoint {
     pub host: String,
     pub port: u16,
     pub topic: String,
+}
+
+impl std::fmt::Debug for MqttEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MqttEndpoint")
+            .field("secure", &self.secure)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("topic", &self.topic)
+            .finish()
+    }
 }
 
 impl MqttEndpoint {
@@ -133,36 +148,6 @@ impl MqttParams {
     }
 }
 
-/// The 7.2 message: `{"metadata": {...}, "body": notification}`.
-/// `link` is the HTTP-Link-header-formatted @context reference; per Table
-/// 7.2-2 it is included only when the Content-Type is application/json
-/// (with ld+json the @context travels in the body).
-pub fn build_message(
-    body: &Value,
-    content_type: &str,
-    link: Option<&str>,
-    receiver_info: &[(String, String)],
-) -> Value {
-    let mut metadata = Map::new();
-    // receiverInfo goes in first: 7.2 adds its entries "additionally", while
-    // Table 7.2-2 names endpoint.accept as the source of Content-Type and
-    // the served @context as the source of Link. A pair keyed like one of
-    // those two is an entry, never that parameter's value.
-    for (k, v) in receiver_info {
-        metadata.insert(k.clone(), Value::String(v.clone()));
-    }
-    metadata.insert("Content-Type".into(), Value::String(content_type.into()));
-    if content_type == "application/json" {
-        if let Some(l) = link {
-            metadata.insert("Link".into(), Value::String(l.to_owned()));
-        }
-    }
-    let mut msg = Map::new();
-    msg.insert("metadata".into(), Value::Object(metadata));
-    msg.insert("body".into(), body.clone());
-    Value::Object(msg)
-}
-
 /// The key a pooled MQTT connection is shared under. Everything that changes
 /// the identity the connection authenticates as (or how) must participate:
 /// two subscriptions whose endpoints differ only in password must never
@@ -185,6 +170,23 @@ fn pool_key(ep: &MqttEndpoint, params: MqttParams) -> String {
         ep.port,
         if params.v5 { 5 } else { 3 }
     )
+}
+
+/// The client options of one MQTT endpoint, for either protocol version
+/// (rumqttc has one options type per version, with the same setters): 30 s
+/// keep-alive, the endpoint's credentials, TLS when it is `mqtts`.
+macro_rules! options {
+    ($ty:ty, $id:expr, $dial:expr, $port:expr, $ep:expr) => {{
+        let mut opts = <$ty>::new($id, $dial, $port);
+        opts.set_keep_alive(Duration::from_secs(30));
+        if let Some(u) = &$ep.username {
+            opts.set_credentials(u, $ep.password.as_deref().unwrap_or(""));
+        }
+        if $ep.secure {
+            opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
+        }
+        opts
+    }};
 }
 
 /// The mqtts trust store, built ONCE per process. Loading the platform
@@ -214,10 +216,11 @@ fn shared_tls_config() -> Result<rumqttc::TlsConfiguration, NgsiError> {
 /// copy of both. Private egress is allowed by default (dev boxes, compose
 /// stacks and the conformance mocks all live there) and
 /// `ANTARES_EGRESS_ALLOW_PRIVATE=false` turns the deny on for
-/// internet-exposed deployments. Read once per process.
-fn allow_private_egress() -> bool {
-    static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALLOW.get_or_init(|| EgressPolicy::from_env().allow_private)
+/// internet-exposed deployments, with `ANTARES_EGRESS_PRIVATE_HOSTS` naming
+/// the peers it still reaches. Read once per process.
+fn egress_policy() -> EgressPolicy {
+    static POLICY: std::sync::OnceLock<EgressPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(EgressPolicy::from_env)
 }
 
 /// Resolve the endpoint host ONCE and return the address to dial, or a
@@ -231,7 +234,7 @@ fn allow_private_egress() -> bool {
 async fn checked_addr(
     host: &str,
     port: u16,
-    allow_private: bool,
+    policy: EgressPolicy,
     dns_timeout: Duration,
 ) -> Result<std::net::SocketAddr, NgsiError> {
     let denied = || {
@@ -255,10 +258,7 @@ async fn checked_addr(
     };
     addrs
         .into_iter()
-        .find(|a| {
-            !EgressPolicy::ip_is_metadata(a.ip())
-                && (allow_private || !EgressPolicy::ip_is_private(a.ip()))
-        })
+        .find(|a| policy.admits(host, a.ip()))
         .ok_or_else(denied)
 }
 
@@ -288,6 +288,9 @@ enum Client {
 struct Conn {
     client: Client,
     pump: tokio::task::JoinHandle<()>,
+    /// One `()` per PUBACK or PUBCOMP the broker sent: a connection is
+    /// checked out by one publish at a time, so the next one answers it.
+    acks: tokio::sync::mpsc::Receiver<()>,
     last_used: Instant,
 }
 
@@ -332,14 +335,22 @@ impl MqttSink {
         // one retry with a fresh connection: a pooled client whose broker
         // restarted fails the first publish; a dead broker fails both.
         for attempt in 0..2 {
-            let conn = match self.checkout(&key) {
+            let mut conn = match self.checkout(&key) {
                 Some(c) => c,
                 None => self.connect(ep, params).await?,
             };
-            let published = tokio::time::timeout(
-                self.timeout,
-                Self::publish(&conn.client, &ep.topic, params.qos, message),
-            )
+            // an ack a timed-out publish left behind answers nothing now
+            while conn.acks.try_recv().is_ok() {}
+            let (client, acks) = (&conn.client, &mut conn.acks);
+            // QoS 1 and 2 are delivered once the broker acknowledged them
+            // (PUBACK, PUBCOMP), not once rumqttc queued them
+            let published = tokio::time::timeout(self.timeout, async {
+                Self::publish(client, &ep.topic, params.qos, message).await?;
+                if params.qos > 0 && acks.recv().await.is_none() {
+                    return Err("connection lost before the broker acknowledged".to_owned());
+                }
+                Ok(())
+            })
             .await;
             match published {
                 Ok(Ok(())) if !conn.pump.is_finished() => {
@@ -428,17 +439,10 @@ impl MqttSink {
         };
         // Egress policy first: resolve once, judge the answer, dial what was
         // judged. Nothing below opens a socket to an unchecked destination.
-        let addr = checked_addr(&ep.host, ep.port, allow_private_egress(), self.timeout).await?;
+        let addr = checked_addr(&ep.host, ep.port, egress_policy(), self.timeout).await?;
         let dial = dial_host(ep, addr);
         if params.v5 {
-            let mut opts = rumqttc::v5::MqttOptions::new(id, dial, addr.port());
-            opts.set_keep_alive(Duration::from_secs(30));
-            if let Some(u) = &ep.username {
-                opts.set_credentials(u, ep.password.as_deref().unwrap_or(""));
-            }
-            if ep.secure {
-                opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
-            }
+            let opts = options!(rumqttc::v5::MqttOptions, id, dial, addr.port(), ep);
             let (client, mut eventloop) = rumqttc::v5::AsyncClient::new(opts, 16);
             tokio::time::timeout(self.timeout, async {
                 loop {
@@ -454,21 +458,28 @@ impl MqttSink {
             .await
             .map_err(|_| refused("connect timeout".into()))?
             .map_err(refused)?;
-            let pump = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
+            let (ack, acks) = tokio::sync::mpsc::channel(16);
+            let pump = tokio::spawn(async move {
+                while let Ok(event) = eventloop.poll().await {
+                    if matches!(
+                        event,
+                        rumqttc::v5::Event::Incoming(
+                            rumqttc::v5::mqttbytes::v5::Packet::PubAck(_)
+                                | rumqttc::v5::mqttbytes::v5::Packet::PubComp(_)
+                        )
+                    ) {
+                        let _ = ack.try_send(());
+                    }
+                }
+            });
             Ok(Conn {
                 client: Client::V5(client),
                 pump,
+                acks,
                 last_used: Instant::now(),
             })
         } else {
-            let mut opts = rumqttc::MqttOptions::new(id, dial, addr.port());
-            opts.set_keep_alive(Duration::from_secs(30));
-            if let Some(u) = &ep.username {
-                opts.set_credentials(u, ep.password.as_deref().unwrap_or(""));
-            }
-            if ep.secure {
-                opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
-            }
+            let opts = options!(rumqttc::MqttOptions, id, dial, addr.port(), ep);
             let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 16);
             tokio::time::timeout(self.timeout, async {
                 loop {
@@ -482,14 +493,131 @@ impl MqttSink {
             .await
             .map_err(|_| refused("connect timeout".into()))?
             .map_err(refused)?;
-            let pump = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
+            let (ack, acks) = tokio::sync::mpsc::channel(16);
+            let pump = tokio::spawn(async move {
+                while let Ok(event) = eventloop.poll().await {
+                    if matches!(
+                        event,
+                        rumqttc::Event::Incoming(
+                            rumqttc::Packet::PubAck(_) | rumqttc::Packet::PubComp(_)
+                        )
+                    ) {
+                        let _ = ack.try_send(());
+                    }
+                }
+            });
             Ok(Conn {
                 client: Client::V3(client),
                 pump,
+                acks,
                 last_used: Instant::now(),
             })
         }
     }
+}
+
+/// One message an inbound subscription received: the topic it was
+/// published on and its payload, as sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inbound {
+    pub topic: String,
+    pub payload: Vec<u8>,
+}
+
+/// Subscribe to `ep.topic` and hand every message published there to `tx`,
+/// for an inbound bridge Channel. MQTT 5 only, at QoS 1, under the
+/// shared subscription `$share/{group}/{topic}` (MQTT 5.0 4.8.2): every
+/// broker replica binds the same Channels, and the server hands each message
+/// to one of them, so a sample is written once whatever the replica count.
+///
+/// The destination is judged by the egress policy before the first connect
+/// and the checked address is dialled, as for a notification. The event loop
+/// runs on the returned task: it reconnects after a dropped connection and
+/// subscribes again on every ConnAck (a clean start keeps no subscription).
+/// A full `tx` drops the message rather than stalling the event loop's
+/// keep-alive. Aborting the task closes the subscription.
+///
+/// # Errors
+/// The egress denial, or a broker that does not ConnAck within `timeout`.
+pub async fn listen(
+    ep: &MqttEndpoint,
+    group: &str,
+    tx: tokio::sync::mpsc::Sender<Inbound>,
+    timeout: Duration,
+) -> Result<tokio::task::JoinHandle<()>, NgsiError> {
+    use rumqttc::v5::mqttbytes::v5::Packet;
+    use rumqttc::v5::mqttbytes::QoS;
+    use rumqttc::v5::Event;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "antares-in-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let addr = checked_addr(&ep.host, ep.port, egress_policy(), timeout).await?;
+    let opts = options!(
+        rumqttc::v5::MqttOptions,
+        id,
+        dial_host(ep, addr),
+        addr.port(),
+        ep
+    );
+    let (client, mut eventloop) = rumqttc::v5::AsyncClient::new(opts, 16);
+    let filter = format!("$share/{group}/{}", ep.topic);
+    let refused =
+        |e: String| NgsiError::InternalError(format!("mqtt connect {}:{}: {e}", ep.host, ep.port));
+    tokio::time::timeout(timeout, async {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| refused("connect timeout".into()))?
+    .map_err(refused)?;
+    client
+        .subscribe(filter.clone(), QoS::AtLeastOnce)
+        .await
+        .map_err(|e| refused(e.to_string()))?;
+    let (host, port) = (ep.host.clone(), ep.port);
+    Ok(tokio::spawn(async move {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::Publish(p))) => {
+                    let msg = Inbound {
+                        topic: String::from_utf8_lossy(&p.topic).into_owned(),
+                        payload: p.payload.to_vec(),
+                    };
+                    match tx.try_send(msg) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!(
+                                "mqtt inbound {host}:{port}: queue full, message dropped"
+                            );
+                        }
+                    }
+                }
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    if client
+                        .subscribe(filter.clone(), QoS::AtLeastOnce)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("mqtt inbound {host}:{port}: {e}; reconnecting in 5 s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }))
 }
 
 /// Clause 7: the mqtt(s) binding. `parse_endpoint` holds Table 7.2-1 (the
@@ -543,6 +671,22 @@ impl crate::NotificationSink for MqttSink {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let e = MqttEndpoint::parse("mqtt://u:s3cret@host:9001/t").expect("user+pass");
+        let shown = format!("{e:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(
+            shown.contains("[redacted]") && shown.contains("\"u\"") && shown.contains("host"),
+            "{shown}"
+        );
+        let none = format!(
+            "{:?}",
+            MqttEndpoint::parse("mqtt://u@host/t").expect("user")
+        );
+        assert!(none.contains("password: None"), "{none}");
+    }
 
     #[test]
     fn parses_endpoint_variants() {
@@ -697,6 +841,71 @@ mod tests {
         );
     }
 
+    /// A stub MQTT 3.1.1 broker on loopback: it accepts every CONNECT and
+    /// answers a QoS 1 PUBLISH with its PUBACK only when `ack` holds.
+    async fn stub_broker(ack: bool) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        let Some(packet) = buf.get(..n).filter(|p| !p.is_empty()) else {
+                            return;
+                        };
+                        let reply: Vec<u8> = match packet.first().map(|b| b >> 4) {
+                            Some(1) => vec![0x20, 0x02, 0x00, 0x00],
+                            // header, one-byte length, topic length + topic, pkid
+                            Some(3) if ack => {
+                                let topic = usize::from(packet.get(3).copied().unwrap_or(0));
+                                let at = 4usize.saturating_add(topic);
+                                let pkid = packet.get(at..at.saturating_add(2)).unwrap_or(&[0, 1]);
+                                [&[0x40, 0x02][..], pkid].concat()
+                            }
+                            _ => continue,
+                        };
+                        if s.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// a QoS 1 publish is delivered once the broker sent its
+    /// PUBACK; a broker that never acknowledges fails it within the timeout.
+    #[tokio::test]
+    async fn a_qos1_publish_waits_for_the_puback() {
+        let params = MqttParams { qos: 1, v5: false };
+        let sink = MqttSink::new(2, Duration::from_millis(300));
+        let silent =
+            MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(false).await))
+                .expect("parse");
+        let started = Instant::now();
+        let err = sink
+            .publish_message(&silent, params, b"{}")
+            .await
+            .expect_err("no PUBACK, no delivery");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let acking =
+            MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await))
+                .expect("parse");
+        sink.publish_message(&acking, params, b"{}")
+            .await
+            .expect("the PUBACK delivers");
+    }
+
     /// The MQTT destination is client-supplied (`notification.endpoint.uri`,
     /// 7.2), so it is an egress target: the cloud instance-metadata range is
     /// refused before any socket is opened, whatever the private-egress
@@ -724,6 +933,15 @@ mod tests {
     /// metadata range is refused unconditionally, private ranges only when
     /// the deployment switched private egress off, and IPv4-mapped IPv6
     /// spellings are judged as their IPv4 selves.
+    const OPEN: EgressPolicy = EgressPolicy {
+        allow_private: true,
+        private_hosts: &[],
+    };
+    const CLOSED: EgressPolicy = EgressPolicy {
+        allow_private: false,
+        private_hosts: &[],
+    };
+
     #[tokio::test]
     async fn checked_addr_applies_the_egress_rules_to_resolved_addresses() {
         let d = Duration::from_secs(2);
@@ -737,7 +955,7 @@ mod tests {
             "fd00:ec2::254",
             "2002:a9fe:a9fe::",
         ] {
-            let e = checked_addr(host, 1883, true, d)
+            let e = checked_addr(host, 1883, OPEN, d)
                 .await
                 .expect_err("metadata range must be refused whatever the switch says");
             assert!(e.to_string().contains("denied"), "{host}: {e}");
@@ -751,24 +969,24 @@ mod tests {
             "::1",
             "localhost",
         ] {
-            let ok = checked_addr(host, 1883, true, d)
+            let ok = checked_addr(host, 1883, OPEN, d)
                 .await
                 .unwrap_or_else(|e| panic!("{host} must be reachable by default: {e}"));
             assert_eq!(ok.port(), 1883);
             assert!(
-                checked_addr(host, 1883, false, d).await.is_err(),
+                checked_addr(host, 1883, CLOSED, d).await.is_err(),
                 "{host} must be refused with private egress off"
             );
         }
         // a public literal clears the strict policy and comes back as the
         // ADDRESS to dial — the resolution the check judged, pinned
-        let a = checked_addr("93.184.216.34", 8883, false, d)
+        let a = checked_addr("93.184.216.34", 8883, CLOSED, d)
             .await
             .expect("public address allowed");
         assert_eq!(a.to_string(), "93.184.216.34:8883");
         // a name that cannot be resolved is a denial, not a pass-through
         assert!(
-            checked_addr("no-such-host.invalid", 1883, true, d)
+            checked_addr("no-such-host.invalid", 1883, OPEN, d)
                 .await
                 .is_err(),
             "an unresolvable destination must not be dialled"

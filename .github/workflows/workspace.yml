@@ -27,7 +27,8 @@ jobs:
     # same cold job peaks at 1.2 GB locally. The msrv and shared-crate jobs
     # keep the arm runner, they run fine there.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # four nextest configs of ~6 min each plus clippy and setup: ~40 min
+    timeout-minutes: 50
     env:
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
@@ -167,8 +168,8 @@ jobs:
       # --run-ignored all: that would also pull in the release-only timing gate.
       - name: Tests that need a live database
         run: |
-          dev/unit-junit.sh ignored-db-api -p antares-api \
-            --test split_entities_5_7_2 --test temporal_fed_paging_5_7_4 \
+          dev/unit-junit.sh ignored-db-api -p antares-api --test it \
+            -E 'test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)' \
             --run-ignored ignored-only
           dev/unit-junit.sh ignored-db-broker -p antares-broker --bin antares \
             --run-ignored ignored-only outbox_flush_waits
@@ -199,7 +200,7 @@ jobs:
       # reports page must render, and fold-reports.sh takes the NEWEST bundle.
       - name: Unit JUnit bundle (folded into /reports/unit/)
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: unit-junit
           path: unit-junit/
@@ -256,6 +257,12 @@ jobs:
       # clean one.
       - name: No addon in the shipped build
         run: ./dev/check-no-addon.sh
+      # Every migration states what a rollback of its release does
+      # (docs/src/operations.md); the self-test plants each violation once.
+      - name: Migration rollback manifest
+        run: |
+          python3 dev/check-migrations.py --self-test
+          python3 dev/check-migrations.py
       # SQL-injection guard: dynamically assembled SQL (AssertSqlSafe, or an
       # sqlx query built with format!) belongs to the antares-sql backend
       # source and nowhere else. Everything a request supplies reaches the
@@ -321,7 +328,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-jsonld, antares-matcher, antares-store]
+        crate: [ngsild-model, ngsild-ql, ngsild-jsonld, ngsild-matcher, antares-store]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -6,6 +6,7 @@ pub mod doc;
 pub mod entity;
 pub mod maintenance;
 pub mod outbox;
+pub mod seal;
 pub mod temporal;
 
 use antares_model::TenantId;
@@ -26,6 +27,19 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// another release is not, and a caller that retries it reports the timeout
 /// instead of the cause. Only the history errors are permanent: an execution
 /// failure can be a lock the next attempt gets.
+/// The filter values a stored text column can equal. PostgreSQL `text` holds
+/// no NUL, so a request string carrying one names nothing the store holds;
+/// binding it would raise `22021` and turn a query that matches nothing into
+/// an error. Callers bind what this keeps.
+pub(crate) fn storable<S: AsRef<str>>(values: &[S]) -> Vec<String> {
+    values
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|v| !v.contains('\0'))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn is_schema_mismatch(e: &sqlx::Error) -> bool {
     use sqlx::migrate::MigrateError::{
         Dirty, VersionMismatch, VersionMissing, VersionNotPresent, VersionTooNew, VersionTooOld,
@@ -42,6 +56,87 @@ pub fn is_schema_mismatch(e: &sqlx::Error) -> bool {
         ),
         _ => false,
     }
+}
+
+/// What the boot path does with the migrations a newer release applied
+/// (`newer`: version and description of each applied version above `newest`,
+/// this binary's own newest). A rollback starts the previous image on the
+/// schema the release it rolls back already migrated, and sqlx refuses every
+/// applied version it does not ship, so without this the previous image could
+/// never boot (docs/src/operations.md "Rollback"). A migration whose file name
+/// starts with `breaking_` is one this release cannot serve: the way back is
+/// the pre-release backup, so the boot stops with that version. `Ok(true)`
+/// means newer, compatible migrations are applied and tolerated.
+fn tolerate_newer(
+    newest: i64,
+    newer: &[(i64, String)],
+) -> Result<bool, sqlx::migrate::MigrateError> {
+    match newer.iter().find(|(_, d)| d.starts_with("breaking ")) {
+        Some((v, _)) => Err(sqlx::migrate::MigrateError::VersionTooNew(*v, newest)),
+        None => Ok(!newer.is_empty()),
+    }
+}
+
+/// The first applied version at or below this binary's newest that `known`
+/// (the versions [`MIGRATOR`] ships) lacks: a history from another release,
+/// which the lenient run below would otherwise pass over.
+fn first_unknown_older(applied: &[i64], known: &[i64]) -> Option<i64> {
+    applied.iter().copied().find(|v| !known.contains(v))
+}
+
+/// Version and description of each applied migration above `newest`.
+async fn newer_migrations(
+    conn: &mut sqlx::PgConnection,
+    newest: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT version, description FROM _sqlx_migrations WHERE version > $1 ORDER BY version",
+    )
+    .bind(newest)
+    .fetch_all(conn)
+    .await
+    .or_else(|e| match &e {
+        // a database never migrated has no history table yet
+        sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(Vec::new()),
+        _ => Err(e),
+    })
+}
+
+/// Run [`MIGRATOR`], tolerating compatible migrations of a newer release
+/// ([`tolerate_newer`]). An unknown applied version at or below this binary's
+/// newest is still a history from another release and refused as before.
+async fn migrate(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    let newest = MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
+    let newer = newer_migrations(conn, newest).await?;
+    let tolerate = tolerate_newer(newest, &newer).map_err(|e| {
+        tracing::error!(
+            "the database holds a breaking migration of a newer release ({newer:?}): this \
+             release cannot serve it; restore the backup taken before that release"
+        );
+        sqlx::Error::Migrate(Box::new(e))
+    })?;
+    if !tolerate {
+        return MIGRATOR.run(conn).await.map_err(Into::into);
+    }
+    tracing::warn!(
+        "the database holds migrations {newer:?} of a newer release, all marked compatible: \
+         serving it as a rollback; roll forward again or restore the pre-release backup \
+         before applying another schema change"
+    );
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version <= $1")
+            .bind(newest)
+            .fetch_all(&mut *conn)
+            .await?;
+    let known: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+    if let Some(v) = first_unknown_older(&applied, &known) {
+        return Err(sqlx::Error::Migrate(Box::new(
+            sqlx::migrate::MigrateError::VersionMissing(v),
+        )));
+    }
+    let mut lenient = sqlx::migrate::Migrator::with_migrations(MIGRATOR.iter().cloned().collect());
+    lenient.set_ignore_missing(true);
+    lenient.run(conn).await.map_err(Into::into)
 }
 
 /// The `ANTARES_MIGRATE` switch: off only for an explicit `0`/`false`.
@@ -61,6 +156,10 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Er
     connect_with(url, max_connections, std::time::Duration::from_secs(30)).await
 }
 
+/// How long a released connection may take to answer its liveness ping
+/// before it is dropped instead of going back to the pool.
+pub const RELEASE_PING: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// [`connect`] with the per-session `statement_timeout` chosen by the
 /// deployment (`ANTARES_PG_STATEMENT_TIMEOUT_MS`).
 pub async fn connect_with(
@@ -68,27 +167,7 @@ pub async fn connect_with(
     max_connections: u32,
     statement_timeout: std::time::Duration,
 ) -> Result<PgPool, sqlx::Error> {
-    use std::time::Duration;
-    let session = format!(
-        "SET statement_timeout = '{}ms'; SET lock_timeout = '5s'",
-        statement_timeout.as_millis()
-    );
-    let pool = PgPoolOptions::new()
-        .max_connections(max_connections)
-        .acquire_timeout(Duration::from_secs(5))
-        .idle_timeout(Duration::from_secs(600))
-        .max_lifetime(Duration::from_secs(1800))
-        .after_connect(move |conn, _meta| {
-            let session = session.clone();
-            Box::pin(async move {
-                use sqlx::Executor;
-                // the only interpolated value is a validated integer of
-                // milliseconds (parsed by the broker), never client text
-                conn.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(session)))
-                    .await?;
-                Ok(())
-            })
-        })
+    let pool = options(max_connections, statement_timeout)
         .connect(url)
         .await?;
     // DDL is exempt from the per-session statement timeout: building an index
@@ -107,10 +186,77 @@ pub async fn connect_with(
         migrate_conn
             .execute(sqlx::raw_sql("SET statement_timeout = 0"))
             .await?;
-        MIGRATOR.run(&mut migrate_conn).await?;
+        migrate(&mut migrate_conn).await?;
         migrate_conn.close().await?;
     }
     Ok(pool)
+}
+
+/// The write reserve (`ANTARES_PG_WRITE_RESERVE`): a second pool of
+/// `max_connections` with the same session settings and bounds as
+/// [`connect_with`], which only the batch writes draw from, so reads queued
+/// on the main pool cannot hold a pipeline's batch upsert behind them. It
+/// runs no migrations: [`connect_with`] already did, on the main pool.
+pub async fn connect_reserve(
+    url: &str,
+    max_connections: u32,
+    statement_timeout: std::time::Duration,
+) -> Result<PgPool, sqlx::Error> {
+    options(max_connections, statement_timeout)
+        .connect(url)
+        .await
+}
+
+/// The bounds and session settings every broker pool shares.
+fn options(max_connections: u32, statement_timeout: std::time::Duration) -> PgPoolOptions {
+    use std::time::Duration;
+    // No parallel workers: a request reads a page, and a page whose filter
+    // the planner thinks selective (a `q` under RLS is never an index
+    // condition) got a Gather of two workers, two processes started per
+    // statement. On the distinct-1000 rig (2 PostgreSQL cores, 1 000 req/s)
+    // that took a `q` page from 2.5 ms to 106 ms. No JIT either: the
+    // per-instance expiry pruning each `q` term carries puts a page of seven
+    // Entities past the JIT cost thresholds, and LLVM spent 13.8 s
+    // compiling 607 functions for a query that ran in 1 ms.
+    let session = format!(
+        "SET statement_timeout = '{}ms'; SET lock_timeout = '5s'; \
+         SET max_parallel_workers_per_gather = 0; SET jit = off",
+        statement_timeout.as_millis()
+    );
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(600))
+        .max_lifetime(Duration::from_secs(1800))
+        // sqlx tests a released connection with a ping it never times out,
+        // and holds its pool slot until the ping answers. Through the mesh
+        // proxy, which accepts the bytes, a stream whose far side stalled
+        // never answers: once each such stream held a slot for hours, until
+        // all 20 were gone and every read answered 503. This ping is
+        // bounded; one that fails or runs out drops the socket at once, and
+        // the slot opens a fresh connection on demand. sqlx's own ping after
+        // it costs one more round trip on a connection that just answered.
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                use sqlx::Connection;
+                match tokio::time::timeout(RELEASE_PING, conn.ping()).await {
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(sqlx::Error::PoolTimedOut),
+                }
+            })
+        })
+        .after_connect(move |conn, _meta| {
+            let session = session.clone();
+            Box::pin(async move {
+                use sqlx::Executor;
+                // the only interpolated value is a validated integer of
+                // milliseconds (parsed by the broker), never client text
+                conn.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(session)))
+                    .await?;
+                Ok(())
+            })
+        })
 }
 
 /// Make RLS effective for this transaction — SET LOCAL only (transaction
@@ -285,7 +431,19 @@ pub async fn ensure_tenant(pool: &PgPool, tenant: &TenantId) -> Result<(), sqlx:
 
 #[cfg(test)]
 mod tests {
-    use super::{bypasses, is_schema_mismatch, migrate_enabled};
+    use super::{
+        bypasses, first_unknown_older, is_schema_mismatch, migrate_enabled, tolerate_newer,
+    };
+
+    /// the lenient run of a rollback ignores missing versions,
+    /// so an applied version at or below the newest that this binary lacks
+    /// is found before it runs.
+    #[test]
+    fn a_rollback_still_refuses_an_unknown_older_version() {
+        assert_eq!(first_unknown_older(&[1, 2, 3], &[1, 2, 3]), None);
+        assert_eq!(first_unknown_older(&[1, 5, 2], &[1, 2, 3]), Some(5));
+        assert_eq!(first_unknown_older(&[], &[1]), None);
+    }
 
     /// The RLS probe answers a security gate: a probe that errors must read as
     /// "unsafe", never as "the role does not bypass RLS".
@@ -333,6 +491,27 @@ mod tests {
             )))),
             "a migration that failed to execute may be a lock the next attempt gets"
         );
+    }
+
+    /// A rollback boots on a newer release's compatible migrations and stops
+    /// on a breaking one, naming its version.
+    #[test]
+    fn a_rollback_tolerates_compatible_migrations_and_stops_on_a_breaking_one() {
+        use sqlx::migrate::MigrateError;
+        assert_eq!(tolerate_newer(16, &[]).ok(), Some(false));
+        let compatible = [(17, "type counts".to_owned())];
+        assert_eq!(tolerate_newer(16, &compatible).ok(), Some(true));
+        let breaking = [
+            (17, "type counts".to_owned()),
+            (18, "breaking drop names".to_owned()),
+        ];
+        let refused = tolerate_newer(16, &breaking).err().map(|e| e.to_string());
+        assert_eq!(
+            refused,
+            Some(MigrateError::VersionTooNew(18, 16).to_string())
+        );
+        let named = [(17, "not breaking yet".to_owned())];
+        assert_eq!(tolerate_newer(16, &named).ok(), Some(true));
     }
 
     /// Migrations stay on unless a deployment explicitly turns them off.

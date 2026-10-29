@@ -363,7 +363,7 @@ async fn pg_rows(url: &str, row: &str) -> (i64, i64) {
     (entities, instances)
 }
 
-/// `url` with its database swapped for `name`, created on first use.
+/// `url` with its database swapped for `name`, created empty on each call.
 fn own_database(url: &str, name: &str) -> String {
     use antares_sql::sqlx;
     tokio::runtime::Builder::new_current_thread()
@@ -374,17 +374,16 @@ fn own_database(url: &str, name: &str) -> String {
             let pool = antares_sql::store::pg::connect(url, 1)
                 .await
                 .expect("connect");
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
-                    .bind(name)
-                    .fetch_one(&pool)
-                    .await
-                    .expect("pg_database");
-            if !exists {
-                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            // Recreated per run: one left from an earlier checkout carries
+            // that checkout's migration checksums, which this binary refuses.
+            for stmt in [
+                format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
+                format!("CREATE DATABASE {name}"),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(stmt.clone()))
                     .execute(&pool)
                     .await
-                    .expect("create database");
+                    .expect(&stmt);
             }
         });
     let (head, _) = url.rsplit_once('/').expect("database url");

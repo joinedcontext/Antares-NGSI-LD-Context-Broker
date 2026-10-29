@@ -33,9 +33,9 @@ Current counts (`python3 dev/spec.py status`):
 
 ```text
 947 sections
-  implemented       477
+  implemented       476
   informative       468
-  partial             2
+  partial             3
   robot-tagged       193
 ```
 
@@ -47,7 +47,7 @@ gaps` lists leaf clauses without a TP.
 
 ## The suite
 
-The suite directory holds 671 `.robot` files under
+The suite directory holds 672 `.robot` files under
 `TP/NGSI-LD/{CommonBehaviours, ContextInformation, ContextSource,
 DistributedOperations, jsonldContext}`. Most carry ETSI's own numbering
 (`002_01`, `D018_01`); the rest are additions written here for normative
@@ -55,18 +55,18 @@ surface the official set leaves untested, either clause-numbered (`566_01`
 for 5.6.6, `5510_01` for 5.5.10, `4233_01` for 4.23.3) or slotted into the
 ETSI family they extend, and all following the same conventions and tagged
 with their clause so the ledger picks them up. Every file expands to test
-cases; one full run of a native cell is 1822 test cases:
+cases; one full run of a native cell is 1833 test cases:
 
 | suite | test cases |
 |---|---|
 | CommonBehaviours | 65 |
-| Consumption | 535 |
+| Consumption | 545 |
 | EntityMap | 22 |
 | Provision | 406 |
 | Snapshot | 5 |
 | Subscription | 156 |
 | ContextSource | 145 |
-| DistributedOperations | 134 |
+| DistributedOperations | 135 |
 | IOP | 286 |
 | jsonldContext | 68 |
 
@@ -79,7 +79,7 @@ than a CIM 009 requirement, with the reason the behaviour exists.
 
 ## The matrix
 
-The same 1822 cases run once per native cell; `wasm-file` runs 1810 of
+The same 1833 cases run once per native cell; `wasm-file` runs 1821 of
 them, the twelve MQTT cases having no broker socket to run against in the
 browser build. Every push gates on the quick preset; the full preset runs
 twice a week, on `v*` tags and on dispatch, and is what the report page and
@@ -95,7 +95,7 @@ the badges render.
 | timescale-nats | as above on TimescaleDB | full | same, on the temporal-heavy backend |
 | wasm-file | browser artifact over the file store | full | five Node shims driving the WebAssembly build; MQTT excluded, the browser has no broker socket |
 
-A native cell passes at 1822/1822, `wasm-file` at 1810/1810.
+A native cell passes at 1833/1833, `wasm-file` at 1821/1821.
 `dev/etsi-matrix-summary.py` folds the per-cell results into one table and
 lists every failure across the matrix; a release requires that list to be
 empty.
@@ -120,6 +120,17 @@ ROLL_DURING_RUN=1` (reproduce a `-nats` cell), `WASM=1 WASM_DOCKER=1
 STORE=file` (reproduce the wasm cell). Results land in `results/$STORE`
 with Robot's own `log.html` per suite.
 
+The suite names its own `@context` by a raw.githubusercontent.com URL on
+`dev`, in `variables.py` and in 331 data and expectation files. A pipeline
+run instead serves `resources/jsonld-contexts/` from the checkout on port
+8079 (`dev/etsi-local-context.sh`; it refuses a port a suite file names, the
+IOP mocks own 8089). It rewrites that URL for the length of
+the run and puts the files back in teardown, so a commit is tested with its
+own context file and a GitHub outage fails nothing. The cell fails when a
+file still names the GitHub URL, or when no broker fetched the context from
+the local server (`local-context-check.txt` and `local-context/access.log`
+in the cell artifact).
+
 For a single clause during development, one broker without Docker is
 enough. `resources/variables.py` carries the suite's own compose addresses
 (`scorpio1` for the broker, `172.28.0.18` for the notification and
@@ -134,6 +145,7 @@ cd ngsi-ld-test-suite && robot --variable url:http://localhost:9377/ngsi-ld/v1 \
   --variable notification_server_host:127.0.0.1 \
   --variable context_source_host:127.0.0.1 \
   --variable context_server_host:127.0.0.1 \
+  --variable mqtt_broker_host:ngsi-ld-test-suite-mosquitto-container \
   --outputdir /tmp/robot-566 TP/NGSI-LD/ContextInformation/Provision/Entities/DeleteEntity/566_01.robot
 ```
 
@@ -146,7 +158,7 @@ carries the fix. The current list:
 
 | # | target | finding |
 |---|---|---|
-| 1 | suite | `D018_01` asserts 508 Loop Detected for an inclusive registration |
+| 1 | spec | CIM 009 6.3.17 scopes 508 to a single exclusive or redirect source; TS 104 175 9.7 makes every detected loop an error (`D018_01`) |
 | 2 | suite | nine official `_exc` TPs create exclusive registrations that 4.3.6.3 forbids |
 | 3 | suite | `LdContextNotAvailable` fixtures assert 503; V1.9.1 mandates 504 |
 | 4 | spec | 5.3.4 SnapshotNotification: member naming conflict and a phantom `snapshotReady` |
@@ -157,6 +169,22 @@ carries the fix. The current list:
 | 9 | suite | three temporal TPs assert `Content-Range` unit `date-time`; 6.3.10 mandates `DateTime` |
 | 10 | spec | 4.5.19.0's unbounded period count contradicts the aggregation fixtures |
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
+| 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
+| 14 | spec | TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x GET/HEAD tables with 200 (Antares: 200) |
+| 15 | suite | 020_17 to 020_20 delete an Attribute of an Entity held only as a temporal evolution; 5.6.5.4 answers 404 |
+| 16 | suite | 020_19 and 020_20 expect a deleted scope as `[]`; 4.18 makes it `urn:ngsi-ld:null` |
+| 17 | spec | TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and names no version a client can prefer (Antares: 201) |
+| 18 | suite | 021_08 expects temporal instances that fail `q`; 5.7.4.4 keeps only those that meet it |
+| 19 | suite | 037_11 and 041_03 query without Accept and expect ld+json pagination Links; 6.3.10 types them after the response |
+| 20 | suite | 051_04_01 expects 400 for an unknown @context id with `reload=true`; 5.13.5.4 raises ResourceNotFound first |
+| 21 | suite | 008_01 expects a second temporal upsert to replace instances at the same observedAt; 5.6.11.4 adds them |
+| 22 | suite | 046_22_08 reads a deleted three-instance Attribute as one object; 5.8.6 tombstones each instance with its datasetId |
+| 23 | suite | 046_05 percent-encodes the q of a Subscription body; Table 5.2.12-1 makes it a JSON string read as written |
+| 24 | spec | TS 104 176 9.4.3.1 and 9.4.3.2 carry each other's headings: Create Context Source Registration Subscription is headed GET/HEAD, Query is headed POST; Antares serves POST for create, GET for query |
+| 25 | suite | 054_02_02 and 056_02_02 expect 400 for PUT and PATCH on /entities; TS 104 176 6.3.2 raises 405 for a recognized but unsupported verb |
+| 26 | suite | 003_06_01 and 003_08_01 expect 207 for a batch whose Content-Type and @context disagree; TS 104 176 6.2.4 raises one BadRequestData error response |
+| 27 | suite | the 047 TPs take the initial csource notification TS 104 175 12.4.7 mandates for the one a registration triggers |
+| 28 | suite | integration/all-fixes TPs that over-specify: Link whitespace, `langProperties`, jsonKeys on a JsonProperty, `pick` only in a forward stub, a lastN page above the configured limit |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.
@@ -171,14 +199,14 @@ code/test anchors its evidence cites. It adds no tests; it names where the
 next ones belong.
 
 310 leaf clauses carry 1661 SHALL statements; 117 of them have no Robot
-TP (338 SHALLs), 63 cite no code/test anchor.
+TP (338 SHALLs), 62 cite no code/test anchor.
 
 The fifteen untested clauses with the most SHALL statements:
 
 | clause | title | SHALL | robot TPs | code/test anchors |
 |---|---|---:|---:|---:|
 | 6.18.3.2 | Resource methods › GET | 23 | 0 | 1 |
-| 6.8.3.2 | Resource methods › GET | 17 | 0 | 0 |
+| 6.8.3.2 | Resource methods › GET | 17 | 0 | 1 |
 | 6.5.3.1 | Resource methods › GET | 11 | 0 | 0 |
 | 5.2.39 | EntityMap | 10 | 0 | 4 |
 | 4.2.3 | Cross Domain Ontology | 8 | 0 | 1 |

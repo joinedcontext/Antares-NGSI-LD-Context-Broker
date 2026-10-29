@@ -24,8 +24,8 @@ broker running in your browser, yes in the browser 😅
 - **Small.** About 35 MiB average RSS while the complete ETSI suite runs,
   about 9 MiB idle. The whole store ladder fits where a JVM heap alone
   would not.
-- **Conformant.** 1822/1822 ETSI CIM 009 V1.9.1 test cases green in every
-  native store mode, and 1810/1810 in the browser build, where the MQTT
+- **Conformant.** 1833/1833 ETSI CIM 009 V1.9.1 test cases green in every
+  native store mode, and 1821/1821 in the browser build, where the MQTT
   cases have no socket to run against
   ([per-store report with Robot drill-down](https://antaresbroker.joinedcontext.com/reports/latest/)).
   The ledger covers the whole spec text, one file per clause, in `docs/spec/`.
@@ -117,7 +117,7 @@ docker compose -f compose-files/docker-compose-ha.yml up    # two replicas + hap
 ```
 
 Image tags: `:dev` is the latest green `dev`, `:dev-<run>` one CI run,
-`:0.1.4` one release, `:0.1` the newest patch of a minor, `:latest` the
+`:0.2.0` one release, `:0.2` the newest patch of a minor, `:latest` the
 latest release. Images are multi-arch (amd64, arm64). The
 role-split fleet (`--roles api,matcher,notifier,temporal,registry`) and
 the Kubernetes manifests are in [Deployment](docs/src/deployment.md).

@@ -83,6 +83,7 @@ fn doc_kind(kind: Kind) -> Result<DocKind, NgsiError> {
         Kind::EntityMap => Ok(DocKind::EntityMap),
         Kind::DistSub => Ok(DocKind::DistSub),
         Kind::DeadLetter => Ok(DocKind::DeadLetter),
+        Kind::View => Ok(DocKind::View),
         // Entities and Temporal Representations have their own tables and
         // never reach the document store. Every caller routes them to their
         // own match arm first; one that does not has mismatched its arms,
@@ -91,6 +92,19 @@ fn doc_kind(kind: Kind) -> Result<DocKind, NgsiError> {
             "{kind:?} is not a document-store kind"
         ))),
     }
+}
+
+/// A transaction scoped to one tenant: begun, then RLS set for it first.
+#[cfg(feature = "postgres")]
+async fn tenant_tx(
+    p: &PgBackend,
+    tenant: &TenantId,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, NgsiError> {
+    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+    crate::store::pg::set_tenant(&mut tx, tenant)
+        .await
+        .map_err(db)?;
+    Ok(tx)
 }
 
 /// Postgres backend bundle: one pool, three table-family stores, plus the
@@ -117,6 +131,21 @@ impl PgBackend {
             hook: std::sync::RwLock::new(None),
             version: Value::Object(serde_json::Map::new()),
         }
+    }
+
+    /// Seal the notification credentials under `ANTARES_SECRET_KEY`
+    /// ([`super::pg::seal`]).
+    pub fn with_secret_key(mut self, key: super::pg::seal::SecretKey) -> Self {
+        self.docs = self.docs.with_secret_key(key);
+        self
+    }
+
+    /// Give the batch writes their own pool (`ANTARES_PG_WRITE_RESERVE`):
+    /// reads keep the main pool, so a flood of them cannot queue
+    /// ahead of a pipeline's batch upsert.
+    pub fn with_write_reserve(mut self, reserve: sqlx::postgres::PgPool) -> Self {
+        self.entities = self.entities.with_batch_pool(reserve);
+        self
     }
 
     /// Attach what the startup probe read from the server
@@ -160,6 +189,29 @@ pub enum AnyStore {
 #[cfg(feature = "postgres")]
 fn row_id(v: &Value) -> &str {
     v.get("id").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// The bound on one size scan of a tenant (`GET /q/tenants/{tenant}`):
+/// the history table runs to tens of GB, and a size is not worth a
+/// longer hold on a connection.
+#[cfg(feature = "postgres")]
+const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
+
+/// The attribute instances of one tenant, both history tables.
+#[cfg(feature = "postgres")]
+async fn count_instances(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    tenant: &TenantId,
+) -> Result<u64, NgsiError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
+              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
+    )
+    .bind(tenant.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(n.max(0) as u64)
 }
 
 impl AnyStore {
@@ -242,6 +294,29 @@ impl AnyStore {
             AnyStore::Mem(_) => {}
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.entities.set_outbox(on),
+        }
+    }
+
+    /// Seal the notification credentials a release before
+    /// `ANTARES_SECRET_KEY` stored in plaintext; the count of rows
+    /// sealed. The memory arm seals nothing.
+    pub async fn seal_plaintext_credentials(&self) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(_) => Ok(0),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.docs.seal_plaintext().await.map_err(db),
+        }
+    }
+
+    /// Asynchronous commit for the batch writes (ANTARES_PG_BATCH_ASYNC_COMMIT). The memory arm has no commit to relax.
+    pub fn set_async_batch_commit(
+        &self,
+        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))] on: bool,
+    ) {
+        match self {
+            AnyStore::Mem(_) => {}
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.set_async_batch_commit(on),
         }
     }
 
@@ -494,6 +569,30 @@ impl AnyStore {
         Ok(doc)
     }
 
+    /// [`Self::get`] of several Entities, in one transaction on Postgres;
+    /// an absent or expired id has no entry.
+    pub async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        let found: std::collections::HashMap<String, Value> = match self {
+            AnyStore::Mem(s) => ids
+                .iter()
+                .filter_map(|id| Some(((*id).to_owned(), s.get(tenant, Kind::Entity, id)?)))
+                .collect(),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.get_many(tenant, ids).await.map_err(db)?,
+        };
+        let now = now_utc();
+        Ok(found
+            .into_iter()
+            .filter_map(|(id, mut d)| {
+                (!crate::store::filter::strip_expired(&mut d, &now)).then_some((id, d))
+            })
+            .collect())
+    }
+
     pub async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError> {
         match self {
             AnyStore::Mem(s) => Ok(s.delete(tenant, kind, id).await),
@@ -561,6 +660,26 @@ impl AnyStore {
             rows.retain_mut(|d| !crate::store::filter::strip_expired(d, &now));
         }
         Ok(rows)
+    }
+
+    /// Every document's id and digest (see `CurrentStateDriver::list_digests`):
+    /// a Postgres doc kind digests in the database, so no body leaves it.
+    pub async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+    ) -> Result<Vec<(String, u64)>, NgsiError> {
+        #[cfg(feature = "postgres")]
+        if let AnyStore::Pg(p) = self {
+            if !matches!(kind, Kind::Entity | Kind::Temporal) {
+                return p
+                    .docs
+                    .list_digests(tenant, doc_kind(kind)?)
+                    .await
+                    .map_err(db);
+            }
+        }
+        Ok(antares_store::digests(self.list(tenant, kind).await?))
     }
 
     /// One id-ordered page of documents (see `CurrentStateDriver::list_page`).
@@ -635,8 +754,28 @@ impl AnyStore {
             AnyStore::Mem(s) => Ok(s.list_slice(tenant, kind, offset, limit)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => match kind {
-                // Not doc kinds; sliced from the whole list, like `list_page`.
-                Kind::Entity | Kind::Temporal => {
+                // Not doc kinds: each reads its own window in SQL, so the
+                // whole-list ceiling never refuses a page.
+                Kind::Entity => {
+                    let (mut rows, total) = p
+                        .entities
+                        .list_slice(
+                            tenant,
+                            i64::try_from(offset).unwrap_or(i64::MAX),
+                            i64::try_from(limit).unwrap_or(i64::MAX),
+                        )
+                        .await
+                        .map_err(db)?;
+                    // 4.22 at the read boundary, as `list_page` does
+                    let now = now_utc();
+                    rows.retain_mut(|d| !crate::store::filter::strip_expired(d, &now));
+                    Ok((rows, usize::try_from(total).unwrap_or(usize::MAX)))
+                }
+                // Temporal is sliced from the whole list, as in
+                // `list_page`: its documents are rebuilt from instance rows
+                // and the paged temporal query skips shells without history;
+                // the upgrade is a keyset reader over temporal_entities.
+                Kind::Temporal => {
                     let mut rows = AnyStore::list(self, tenant, kind).await?;
                     rows.sort_by(|a, b| row_id(a).cmp(row_id(b)));
                     let total = rows.len();
@@ -685,25 +824,45 @@ impl AnyStore {
     }
 
     /// Query Entities with the filter pushed down where the backend
-    /// can take it. `memory`/`file` have nothing to push into — their
-    /// entities are already in RAM — so they return the same snapshot `list`
-    /// does (never `decided`, never `paged`). Either way the caller applies
-    /// the exact filter afterwards unless the outcome says SQL already did.
+    /// can take it: SQL for Postgres, the borrowed documents for
+    /// `memory`/`file` (`Store::query_entities`). Either way the caller
+    /// applies the exact filter afterwards unless the outcome says the store
+    /// already did.
     pub async fn query_entities(
         &self,
         tenant: &TenantId,
-        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
+        self.query_paged(tenant, f, false).await
+    }
+
+    /// `Store::query_candidates`: the Pg arm pages the candidates it cannot
+    /// decide; the memory arm answers as `query_entities`.
+    pub async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+    ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
+        self.query_paged(tenant, f, true).await
+    }
+
+    async fn query_paged(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+        candidates: bool,
+    ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         let mut outcome = match self {
-            AnyStore::Mem(s) => crate::store::filter::QueryOutcome {
-                rows: s.list(tenant, Kind::Entity),
-                decided: false,
-                paged: false,
-                total: None,
-            },
+            AnyStore::Mem(s) => {
+                let _ = candidates;
+                s.query_entities(tenant, f)
+            }
             #[cfg(feature = "postgres")]
-            AnyStore::Pg(p) => p.entities.query(tenant, f).await.map_err(db)?,
+            AnyStore::Pg(p) => match candidates {
+                true => p.entities.query_candidates(tenant, f).await,
+                false => p.entities.query(tenant, f).await,
+            }
+            .map_err(db)?,
         };
         // 4.22: the Pg arm already excludes expired ENTITIES in SQL (so
         // paging/totals stay exact); instance stripping — and the whole job
@@ -713,6 +872,68 @@ impl AnyStore {
             .rows
             .retain_mut(|d| !crate::store::filter::strip_expired(d, &now));
         Ok(outcome)
+    }
+
+    /// The Entity types of the Tenant's live Entities, sorted, read without
+    /// the documents: the `types` column on Postgres, the held
+    /// documents' `type` on the memory arm.
+    pub async fn entity_type_names(&self, tenant: &TenantId) -> Result<Vec<String>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_type_names(tenant, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.type_names(tenant).await.map_err(db),
+        }
+    }
+
+    /// The (type, member name) pairs of the Tenant's attribute catalogue,
+    /// sorted: table `entity_attrs` on Postgres, which may still
+    /// list a pair no live Entity carries; the live documents in memory.
+    pub async fn entity_attr_pairs(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<(String, String)>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_attr_pairs(tenant, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.attr_pairs(tenant).await.map_err(db),
+        }
+    }
+
+    /// The types of the Tenant's live Entities that carry one of `any_of`,
+    /// sorted: the types index on Postgres, one pass in memory.
+    pub async fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Vec<String>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_types_beside(tenant, any_of, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.types_beside(tenant, any_of).await.map_err(db),
+        }
+    }
+
+    /// The id segments the Pg arm reads by its C-collated id index;
+    /// the memory arm keeps none and its probes narrow by literal.
+    pub async fn entity_id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        match self {
+            AnyStore::Mem(_) => {
+                let _ = (tenant, lead, sep, max);
+                Ok(None)
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p
+                .entities
+                .id_segments(tenant, lead, sep, max)
+                .await
+                .map_err(db),
+        }
     }
 
     /// Query Temporal Evolution with entity narrowing, instance-window
@@ -776,9 +997,26 @@ impl AnyStore {
                 }
                 s.mutate(tenant, Kind::Temporal, id, |doc| {
                     let target = doc.as_object_mut().ok_or(())?;
+                    // 4.8: the Entity's modifiedAt is its last write, an
+                    // Attribute's update included; never moved backwards
+                    if let Some(m) = shell.get("modifiedAt").and_then(Value::as_str) {
+                        let stale = target
+                            .get("modifiedAt")
+                            .and_then(Value::as_str)
+                            .is_none_or(|cur| super::mem::earlier(cur, m));
+                        if stale {
+                            target.insert("modifiedAt".into(), Value::String(m.to_owned()));
+                        }
+                    }
                     if let Some(adds) = additions.as_object() {
                         for (k, v) in adds {
-                            let incoming: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+                            let mut incoming: Vec<Value> =
+                                v.as_array().cloned().unwrap_or_default();
+                            // The memory store keeps no provenance and no
+                            // versions; Postgres does.
+                            incoming.iter_mut().for_each(|i| {
+                                antares_store::take_provenance(i);
+                            });
                             match target.get_mut(k).and_then(Value::as_array_mut) {
                                 // same instanceId = the same instance corrected
                                 // (the pg arm's ON CONFLICT DO UPDATE)
@@ -905,6 +1143,15 @@ impl AnyStore {
         tenant: &TenantId,
         items: Vec<(String, Value)>,
     ) -> Result<Vec<bool>, NgsiError> {
+        // Each id once per call, on every arm: Postgres refuses an ON CONFLICT
+        // row affected twice and the memory arm would keep the last, so a
+        // repeat is the caller's bug (the API splits repeats into rounds).
+        let mut seen = std::collections::HashSet::with_capacity(items.len());
+        if let Some((id, _)) = items.iter().find(|(id, _)| !seen.insert(id.as_str())) {
+            return Err(NgsiError::InternalError(format!(
+                "batch_upsert names {id} twice"
+            )));
+        }
         match self {
             AnyStore::Mem(s) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -1063,11 +1310,8 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     // the tenant setting is what the RLS-guarded counts see
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
                     let created_at: Option<String> = sqlx::query_scalar(
                         "SELECT created_at::text FROM tenants WHERE tenant_id = $1",
                     )
@@ -1114,10 +1358,7 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     let known = sqlx::query_scalar::<_, i32>(
                         "SELECT 1 FROM tenants WHERE tenant_id = $1 FOR UPDATE",
                     )
@@ -1131,6 +1372,8 @@ impl AnyStore {
                     }
                     for table in [
                         "entities",
+                        // emptied by the delete trigger of `entities` (0024)
+                        "entity_values",
                         "subscriptions",
                         "csource_subscriptions",
                         "csource_registrations",
@@ -1140,6 +1383,9 @@ impl AnyStore {
                         "entity_map_docs",
                         "dist_subs",
                         "dead_letters",
+                        "views",
+                        "entity_types",
+                        "entity_attrs",
                         // ADR-0021: `tenant_id` is GENERATED from the row's kind
                         // and owner, so a Cached row's is NULL and this DELETE
                         // takes only what the Tenant stored itself.
@@ -1210,6 +1456,14 @@ impl AnyStore {
                 "@context belongs to another tenant".into(),
             ));
         }
+        // 5.13.1 names three kinds and the row's kind decides who reaches it
+        // (ADR-0021): a row without one would be Cached to Postgres and
+        // nothing at all to the memory arm.
+        if doc.get("kind").and_then(Value::as_str).is_none() {
+            return Err(NgsiError::InternalError(
+                "@context row without a kind".into(),
+            ));
+        }
         match self {
             AnyStore::Mem(s) => s.context_put(tenant, id, doc),
             #[cfg(feature = "postgres")]
@@ -1236,6 +1490,30 @@ impl AnyStore {
             AnyStore::Mem(s) => Ok(s.context_get(tenant, id)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.docs.context_get(tenant, id).await.map_err(db),
+        }
+    }
+
+    pub async fn context_mutate(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'_>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        // the row a closure leaves must still be one this caller may store,
+        // and keep its kind: the same two checks context_put makes
+        let guarded = move |doc: &mut Value| {
+            let kind = doc.get("kind").cloned();
+            f(doc)?;
+            if doc.get("kind") != kind.as_ref() || !antares_store::context_row_visible(doc, tenant)
+            {
+                return Err(());
+            }
+            Ok(())
+        };
+        match self {
+            AnyStore::Mem(s) => Ok(s.context_mutate(tenant, id, guarded)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.docs.context_mutate(tenant, id, guarded).await.map_err(db),
         }
     }
 
@@ -1327,6 +1605,15 @@ mod db_error_tests {
 // the inherent methods above. New backends implement the traits directly —
 // this enum stays an implementation detail of the built-in backends, no
 // longer the API surface.
+/// The most Entities one history transaction appends. Each append
+/// holds `FOR KEY SHARE` on its Entity until the commit, which only a DELETE
+/// of that Entity waits for (writes lock `FOR NO KEY UPDATE`); a
+/// 1000-member page in one transaction would hold such a delete for the whole
+/// append. Small requests, a live vehicle feed's, are one transaction.
+// A fixed chunk; a measured one if lock waits show.
+#[cfg(feature = "postgres")]
+const HISTORY_CHUNK: usize = 64;
+
 #[async_trait::async_trait]
 impl antares_store::CurrentStateDriver for AnyStore {
     async fn ping(&self) -> Result<(), NgsiError> {
@@ -1406,6 +1693,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
     ) -> Result<Option<Value>, NgsiError> {
         AnyStore::get(self, tenant, kind, id).await
     }
+    async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        AnyStore::get_entities(self, tenant, ids).await
+    }
     async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError> {
         AnyStore::delete(self, tenant, kind, id).await
     }
@@ -1419,6 +1713,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
     }
     async fn list(&self, tenant: &TenantId, kind: Kind) -> Result<Vec<Value>, NgsiError> {
         AnyStore::list(self, tenant, kind).await
+    }
+    async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+    ) -> Result<Vec<(String, u64)>, NgsiError> {
+        AnyStore::list_digests(self, tenant, kind).await
     }
     async fn list_page(
         &self,
@@ -1452,6 +1753,40 @@ impl antares_store::CurrentStateDriver for AnyStore {
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         AnyStore::query_entities(self, tenant, f).await
+    }
+    async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+    ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
+        AnyStore::query_candidates(self, tenant, f).await
+    }
+    async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_type_names(self, tenant).await.map(Some)
+    }
+    async fn entity_attr_pairs(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Vec<(String, String)>>, NgsiError> {
+        AnyStore::entity_attr_pairs(self, tenant).await.map(Some)
+    }
+    async fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_types_beside(self, tenant, any_of)
+            .await
+            .map(Some)
+    }
+    async fn entity_id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_id_segments(self, tenant, lead, sep, max).await
     }
     async fn mutate_boxed<'a>(
         &self,
@@ -1498,8 +1833,66 @@ impl antares_store::CurrentStateDriver for AnyStore {
         }
         antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await
     }
+    /// The Postgres arm books every attempt in ONE statement (see
+    /// `pg::doc::record_deliveries`); every other arm books them one by one.
+    async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        attempts: &[(&str, &str)],
+    ) -> Result<Vec<Option<antares_store::Delivery>>, NgsiError> {
+        #[cfg(feature = "postgres")]
+        {
+            if let (AnyStore::Pg(p), Ok(dk)) = (self, doc_kind(kind)) {
+                let mut found = p
+                    .docs
+                    .record_deliveries(tenant, dk, attempts)
+                    .await
+                    .map_err(db)?;
+                return Ok(attempts
+                    .iter()
+                    .map(|(id, _)| {
+                        found
+                            .remove(*id)
+                            .map(|(doc, prev_success)| antares_store::Delivery {
+                                doc,
+                                prev_success,
+                            })
+                    })
+                    .collect());
+            }
+        }
+        let mut out = Vec::with_capacity(attempts.len());
+        for (id, now) in attempts {
+            out.push(antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await?);
+        }
+        Ok(out)
+    }
     async fn sweep_expired(&self) -> usize {
         AnyStore::sweep_expired(self)
+    }
+    async fn retain_current(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.retain_current(tenant, type_iri, before, batch, dry_run)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => crate::store::pg::maintenance::retain_current(
+                p.docs.pool(),
+                tenant.as_str(),
+                type_iri,
+                before,
+                batch,
+                dry_run,
+            )
+            .await
+            .map_err(db),
+        }
     }
     async fn tenant_exists(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         AnyStore::tenant_exists(self, tenant).await
@@ -1510,11 +1903,62 @@ impl antares_store::CurrentStateDriver for AnyStore {
     async fn tenant_ids(&self) -> Result<Vec<String>, NgsiError> {
         AnyStore::tenant_ids(self).await
     }
+    async fn history_overrides(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Value)>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.history_overrides(limit)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                crate::store::pg::maintenance::history_overrides(p.docs.pool(), limit)
+                    .await
+                    .map_err(db)
+            }
+        }
+    }
     async fn tenant_stats_one(
         &self,
         tenant: &TenantId,
     ) -> Result<Option<antares_store::TenantStats>, NgsiError> {
         AnyStore::tenant_stats_one(self, tenant).await
+    }
+    async fn tenant_bytes(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<antares_store::TenantBytes, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.tenant_bytes(tenant)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    // a scan of the tenant: bounded, a slow one answers no size
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    // the stored row, TOAST included, by the first type the
+                    // write recorded
+                    let rows: Vec<(String, i64)> = sqlx::query_as(
+                        "SELECT coalesce(types[1], ''), sum(pg_column_size(e.*))::bigint
+                           FROM entities e WHERE tenant_id = $1 GROUP BY 1",
+                    )
+                    .bind(tenant.as_str())
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                    let mut out = antares_store::TenantBytes::default();
+                    for (ty, n) in rows {
+                        let n = n.max(0) as u64;
+                        out.entities = out.entities.saturating_add(n);
+                        out.by_type.insert(ty, n);
+                    }
+                    Ok(out)
+                }
+                .await
+            }
+        }
     }
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         AnyStore::purge_tenant(self, tenant).await
@@ -1534,6 +1978,14 @@ impl antares_store::CurrentStateDriver for AnyStore {
     ) -> Result<Option<Value>, NgsiError> {
         AnyStore::context_get(self, tenant, id).await
     }
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        AnyStore::context_mutate(self, tenant, id, f).await
+    }
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError> {
         AnyStore::context_delete(self, tenant, id).await
     }
@@ -1547,6 +1999,137 @@ impl antares_store::TemporalDriver for AnyStore {
     async fn close(&self) {
         AnyStore::close(self).await;
     }
+    fn set_short_history(&self, short: antares_store::ShortHistory) {
+        match self {
+            // Memory has no WAL to save
+            AnyStore::Mem(_) => drop(short),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.temporal.set_short_history(short),
+        }
+    }
+    async fn versions(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+    ) -> Result<serde_json::Map<String, Value>, NgsiError> {
+        match self {
+            // Memory keeps no versions or provenance
+            AnyStore::Mem(_) => {
+                let _ = (tenant, entity_id);
+                Ok(serde_json::Map::new())
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.temporal.versions(tenant, entity_id).await.map_err(db),
+        }
+    }
+    async fn erase(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+        attrs: Option<&[String]>,
+        before: Option<&str>,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(_) => {
+                let instant = |t: &str| {
+                    chrono::DateTime::parse_from_rfc3339(
+                        &antares_store::filter::canonical_datetime(t),
+                    )
+                    .ok()
+                };
+                // an instance goes when it was observed at or before the cut;
+                // a cut that is no DateTime erases nothing
+                let cut = before.map(instant);
+                let goes = |i: &Value| match cut {
+                    None => true,
+                    Some(cut) => {
+                        let at = i
+                            .get("observedAt")
+                            .and_then(Value::as_str)
+                            .and_then(instant);
+                        cut.zip(at).is_some_and(|(cut, at)| at <= cut)
+                    }
+                };
+                let erased = AnyStore::mutate(self, tenant, Kind::Temporal, entity_id, |doc| {
+                    let o = doc.as_object_mut().ok_or(())?;
+                    let mut n = 0u64;
+                    for (k, v) in o.iter_mut() {
+                        let named = attrs.is_none_or(|a| a.contains(k));
+                        let Some(list) = v.as_array_mut().filter(|_| named) else {
+                            continue;
+                        };
+                        if !list.iter().all(Value::is_object) {
+                            continue; // the Entity's own `type` list
+                        }
+                        let was = list.len();
+                        list.retain(|i| !goes(i));
+                        let gone = was.saturating_sub(list.len());
+                        n = n.saturating_add(u64::try_from(gone).unwrap_or(u64::MAX));
+                    }
+                    let emptied = o
+                        .values()
+                        .filter_map(Value::as_array)
+                        .all(|l| l.is_empty() || !l.iter().all(Value::is_object));
+                    Ok::<_, ()>((n, emptied))
+                })
+                .await?;
+                let Some(Ok((n, emptied))) = erased else {
+                    return Ok(0);
+                };
+                if attrs.is_none() && emptied {
+                    AnyStore::delete(self, tenant, Kind::Temporal, entity_id).await?;
+                }
+                Ok(n)
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p
+                .temporal
+                .erase(tenant, entity_id, attrs, before)
+                .await
+                .map_err(db),
+        }
+    }
+    async fn retain_history(
+        &self,
+        tenant: &TenantId,
+        scope: antares_store::HistoryScope<'_>,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.retain_history(tenant, scope, before, batch, dry_run)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => crate::store::pg::maintenance::retain_history(
+                p.docs.pool(),
+                tenant.as_str(),
+                scope,
+                before,
+                batch,
+                dry_run,
+            )
+            .await
+            .map_err(db),
+        }
+    }
+    async fn drop_retained_history(
+        &self,
+        floors: &[(String, String)],
+    ) -> Result<Vec<String>, NgsiError> {
+        match self {
+            // memory keeps no partitions
+            AnyStore::Mem(_) => {
+                let _ = floors;
+                Ok(Vec::new())
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                crate::store::pg::maintenance::drop_retained_partitions(p.docs.pool(), floors)
+                    .await
+                    .map_err(db)
+            }
+        }
+    }
     fn version_info(&self) -> Value {
         AnyStore::version_info(self)
     }
@@ -1556,18 +2139,62 @@ impl antares_store::TemporalDriver for AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    count_instances(&mut tx, tenant).await
+                }
+                .await
+            }
+        }
+    }
+    async fn attr_instance_count_within(
+        &self,
+        tenant: &TenantId,
+        bound: std::time::Duration,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => {
+                // the memory store counts at once: no bound to apply
+                let _ = bound;
+                Ok(s.attr_instance_count(tenant))
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    // a scan of the tenant's history: a slow one answers no count
+                    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+                        .bind(format!("{}ms", bound.as_millis().max(1)))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    count_instances(&mut tx, tenant).await
+                }
+                .await
+            }
+        }
+    }
+    async fn attr_instance_bytes(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.attr_instance_bytes(tenant)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
                         .await
                         .map_err(db)?;
                     let n: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+                        "SELECT (SELECT coalesce(sum(pg_column_size(a.*)), 0)
+                                   FROM attr_instances a WHERE tenant_id = $1)::bigint
+                              + (SELECT coalesce(sum(pg_column_size(r.*)), 0)
+                                   FROM attr_rows r WHERE tenant_id = $1)::bigint",
                     )
                     .bind(tenant.as_str())
                     .fetch_one(&mut *tx)
                     .await
                     .map_err(db)?;
-                    Ok(n as u64)
+                    Ok(n.max(0) as u64)
                 }
                 .await
             }
@@ -1582,20 +2209,25 @@ impl antares_store::TemporalDriver for AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
-                    for table in ["attr_instances", "temporal_entities"] {
-                        sqlx::query(sqlx::AssertSqlSafe(format!(
-                            "DELETE FROM {table} WHERE tenant_id = $1"
-                        )))
-                        .bind(tenant.as_str())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    // whole statements, not a spliced table name: the
+                    // attr_instances tenant-predicate check reads literals
+                    for sql in [
+                        "DELETE FROM attr_instances WHERE tenant_id = $1",
+                        "DELETE FROM attr_rows WHERE tenant_id = $1",
+                        "DELETE FROM iri_ids WHERE tenant_id = $1",
+                        "DELETE FROM attr_versions WHERE tenant_id = $1",
+                        "DELETE FROM temporal_entities WHERE tenant_id = $1",
+                    ] {
+                        sqlx::query(sql)
+                            .bind(tenant.as_str())
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db)?;
                     }
-                    tx.commit().await.map_err(db)
+                    tx.commit().await.map_err(db)?;
+                    p.temporal.forget_tenant(tenant);
+                    Ok(())
                 }
                 .await
             }
@@ -1609,6 +2241,24 @@ impl antares_store::TemporalDriver for AnyStore {
         additions: &Value,
     ) -> Result<(), NgsiError> {
         AnyStore::temporal_append(self, tenant, id, shell, additions).await
+    }
+    /// On Postgres a drained request is one transaction per
+    /// `HISTORY_CHUNK` Entities; a scope change, and the memory
+    /// arm, take the default's append per Entity.
+    async fn event_list(&self, evs: &[antares_store::TemporalEvent]) -> Result<(), NgsiError> {
+        #[cfg(feature = "postgres")]
+        if let (AnyStore::Pg(p), Some(appends)) = (self, antares_store::fold_appends(evs)) {
+            // One chunk that fails (a lock timeout) loses its own Entities'
+            // history, never the rest of the request's.
+            let mut first = None;
+            for chunk in appends.chunks(HISTORY_CHUNK) {
+                if let Err(e) = p.temporal.append_many(chunk).await {
+                    first.get_or_insert(e);
+                }
+            }
+            return first.map_or(Ok(()), |e| Err(db(e)));
+        }
+        antares_store::drain_events(self, evs).await
     }
     /// Only the Postgres arm pages in SQL, and only an exact prefilter
     /// makes that page the evaluator's page; the memory arm answers
@@ -1665,7 +2315,17 @@ impl antares_store::TemporalDriver for AnyStore {
         id: &str,
         f: antares_store::MutateFn<'a>,
     ) -> Result<Option<Result<(), ()>>, NgsiError> {
-        AnyStore::mutate(self, tenant, Kind::Temporal, id, f).await
+        // Postgres takes the provenance into its column in decompose; the
+        // memory store keeps none, so neither arm answers it as data.
+        let keeps_none = matches!(self, AnyStore::Mem(_));
+        AnyStore::mutate(self, tenant, Kind::Temporal, id, move |doc: &mut Value| {
+            let done = f(doc);
+            if keeps_none {
+                antares_store::strip_provenance(doc);
+            }
+            done
+        })
+        .await
     }
 }
 

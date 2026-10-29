@@ -2,6 +2,10 @@
 //! PgTemporalStore integration (the temporal bridge). Skips
 //! loudly without ANTARES_TEST_DATABASE_URL (see tests/pg.rs recipe).
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing.
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::temporal::PgTemporalStore;
@@ -239,12 +243,33 @@ async fn occupied_range_is_skipped_without_poisoning_the_pass() {
     .fetch_one(&pool)
     .await
     .expect("suffix");
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP TABLE IF EXISTS {this_week}"
-    )))
-    .execute(&pool)
-    .await
-    .expect("drop");
+    // The DROP waits for ACCESS EXCLUSIVE and queues every reader of
+    // attr_instances behind it: a second at a time, as maintenance does, so
+    // a parallel test's read neither fails it nor waits on it for long.
+    let drop_week = format!("DROP TABLE IF EXISTS {this_week}");
+    for attempt in 1.. {
+        let mut tx = pool.begin().await.expect("tx");
+        sqlx::query("SET LOCAL lock_timeout = '1s'")
+            .execute(&mut *tx)
+            .await
+            .expect("lock_timeout");
+        match sqlx::query(sqlx::AssertSqlSafe(drop_week.clone()))
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {
+                tx.commit().await.expect("drop");
+                break;
+            }
+            Err(sqlx::Error::Database(e))
+                if e.code().as_deref() == Some("55P03") && attempt < 60 =>
+            {
+                drop(tx);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("drop: {e}"),
+        }
+    }
     sqlx::query(
         "INSERT INTO attr_instances
            (tenant_id, entity_id, attr_id, instance_id, observed_at, created_at, modified_at, data)
@@ -1014,7 +1039,7 @@ async fn a_temporal_query_never_reads_another_tenants_history() {
         ids: Some(&[geo_id]),
         range: Some(window()),
         timeproperty: "observedAt",
-        geo: Some((&spec, location)),
+        geo: &[(spec.clone(), location.to_owned())],
         expand: &expand,
         ..TemporalFilter::default()
     };
@@ -1110,7 +1135,7 @@ async fn a_comma_seconds_fraction_survives_the_geo_prefilter() {
                 timeproperty: "observedAt",
             }),
             timeproperty: "observedAt",
-            geo: Some((&spec, location)),
+            geo: &[(spec.clone(), location.to_owned())],
             expand: &expand,
             ..TemporalFilter::default()
         };
@@ -1123,5 +1148,261 @@ async fn a_comma_seconds_fraction_survives_the_geo_prefilter() {
             1,
             "timeAt {time_at}: the instance is in the window"
         );
+    }
+}
+
+/// the probes read only the weeks that can hold the instance, and
+/// record what they recorded before. A value written this week is compared
+/// with this week's newest, never with an older equal one behind it; one
+/// append whose observedAts lie five weeks apart corrects both in place.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_probes_record_what_the_unbounded_ones_did() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgtempbounded").expect("tenant");
+    let id = "urn:ngsi-ld:Vehicle:bounded";
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let _ = s.delete(&t, id).await;
+    ensure_entity(&pool, &t, id).await;
+    let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    let name = "https://uri.etsi.org/ngsi-ld/default-context/name";
+    // minutes ago; 50400 is five weeks
+    let at = |minutes: i64| {
+        (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let shell =
+        json!({"id": id, "type": "Vehicle", "createdAt": at(60000), "modifiedAt": at(60000)});
+    let mut n = 0;
+    let mut write = |attrs: serde_json::Value, modified: String| {
+        n += 1;
+        let mut attrs = attrs;
+        for a in attrs.as_object_mut().expect("attrs").values_mut() {
+            for (j, i) in a.as_array_mut().expect("instances").iter_mut().enumerate() {
+                i["instanceId"] = json!(format!("urn:ngsi-ld:Instance:b-{n}-{j}"));
+                i["modifiedAt"] = json!(modified);
+                i["createdAt"] = json!(modified);
+            }
+        }
+        attrs
+    };
+    let values = |attr: &str| {
+        let (pool, attr) = (pool.clone(), attr.to_owned());
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT data->'value' FROM attr_instances
+                 WHERE tenant_id = 'pgtempbounded' AND entity_id = $1 AND attr_id = $2
+                 ORDER BY observed_at",
+            )
+            .bind(id)
+            .bind(attr)
+            .fetch_all(&pool)
+            .await
+            .expect("rows")
+        }
+    };
+    // Without observedAt: "a" five weeks ago, then "b", "b", "a" now.
+    for (v, ago) in [("a", 50400), ("b", 3), ("b", 2), ("a", 1)] {
+        let adds = write(json!({name: [{"type": "Property", "value": v}]}), at(ago));
+        s.append(&t, id, &shell, &adds).await.expect("append");
+    }
+    assert_eq!(values(name).await, [json!("a"), json!("b"), json!("a")]);
+    // With observedAt: two weeks in one append, then both corrected at once.
+    let (old, new) = (at(50400), at(0));
+    let pair = |v: i64| {
+        json!({speed: [
+        {"type": "Property", "value": v, "observedAt": old},
+        {"type": "Property", "value": v, "observedAt": new}]})
+    };
+    for v in [1, 1, 2] {
+        let adds = write(pair(v), at(0));
+        s.append(&t, id, &shell, &adds).await.expect("append");
+    }
+    assert_eq!(
+        values(speed).await,
+        [json!(2), json!(2)],
+        "corrected in place"
+    );
+    let _ = s.delete(&t, id).await;
+}
+
+/// an auto-recorded append writes a row only for a new observation.
+/// With observedAt: one row per (attribute, datasetId, observedAt), a new
+/// value at the same observedAt corrects that row in place. Without: a row
+/// only when the value differs from the newest stored one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_append_records_no_new_instance() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgtempdedup").expect("tenant");
+    let other = TenantId::new("pgtempdedup2").expect("tenant");
+    let id = "urn:ngsi-ld:Vehicle:dedup";
+    for tenant in [&t, &other] {
+        pg::ensure_tenant(&pool, tenant).await.expect("tenant row");
+        let _ = s.delete(tenant, id).await;
+        ensure_entity(&pool, tenant, id).await;
+    }
+    let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    let name = "https://uri.etsi.org/ngsi-ld/default-context/name";
+    let shell = json!({"id": id, "type": "Vehicle",
+        "createdAt": "2026-08-15T09:00:00Z", "modifiedAt": "2026-08-15T09:00:00Z"});
+    let mut n = 0;
+    let mut append = |tenant: &TenantId, adds: serde_json::Value| {
+        n += 1;
+        let at = format!("2026-08-15T09:{n:02}:00Z");
+        // Every write stamps a fresh instanceId and modifiedAt, as the API does.
+        let mut adds = adds;
+        for (k, a) in adds.as_object_mut().expect("attrs").iter_mut() {
+            for (j, i) in a.as_array_mut().expect("instances").iter_mut().enumerate() {
+                i["instanceId"] =
+                    json!(format!("urn:ngsi-ld:Instance:{k}-{n}-{j}").replace("https://", ""));
+                i["modifiedAt"] = json!(at);
+                i["createdAt"] = json!("2026-08-15T09:00:00Z");
+            }
+        }
+        (tenant.clone(), adds)
+    };
+    let rows = |tenant: &TenantId, attr: &str| {
+        let (pool, tenant, attr) = (pool.clone(), tenant.as_str().to_owned(), attr.to_owned());
+        async move {
+            sqlx::query_as::<_, (String, Option<String>, serde_json::Value)>(
+                "SELECT instance_id, dataset_id, data FROM attr_instances
+                 WHERE tenant_id = $1 AND entity_id = $2 AND attr_id = $3 ORDER BY observed_at",
+            )
+            .bind(tenant)
+            .bind(id)
+            .bind(attr)
+            .fetch_all(&pool)
+            .await
+            .expect("rows")
+        }
+    };
+    let observed =
+        |v: i64, at: &str| json!({speed: [{"type": "Property", "value": v, "observedAt": at}]});
+
+    for _ in 0..3 {
+        let (tn, adds) = append(&t, observed(10, "2026-08-15T08:00:00Z"));
+        s.append(&tn, id, &shell, &adds).await.expect("append");
+    }
+    assert_eq!(
+        rows(&t, speed).await.len(),
+        1,
+        "three unchanged writes, one instance"
+    );
+    let (tn, adds) = append(&t, observed(10, "2026-08-15T08:05:00Z"));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    assert_eq!(
+        rows(&t, speed).await.len(),
+        2,
+        "a new observedAt is a new instance"
+    );
+    let kept = rows(&t, speed).await[1].0.clone();
+    let (tn, adds) = append(&t, observed(11, "2026-08-15T08:05:00Z"));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    let got = rows(&t, speed).await;
+    assert_eq!(
+        got.len(),
+        2,
+        "a corrected value at the same observedAt stays one instance"
+    );
+    assert_eq!(
+        (got[1].0.as_str(), &got[1].2["value"]),
+        (kept.as_str(), &json!(11))
+    );
+    // the kept id is the column (checked above); data does not repeat it
+    assert_eq!(
+        got[1].2.get("instanceId"),
+        None,
+        "the instance keeps its id in its column"
+    );
+
+    // Without observedAt: compared with the newest stored value.
+    let plain = |v: &str| json!({name: [{"type": "Property", "value": v}]});
+    for v in ["a", "a", "b", "b", "a"] {
+        let (tn, adds) = append(&t, plain(v));
+        s.append(&tn, id, &shell, &adds).await.expect("append");
+    }
+    let got = rows(&t, name).await;
+    let values: Vec<_> = got.iter().map(|r| r.2["value"].clone()).collect();
+    assert_eq!(
+        values,
+        [json!("a"), json!("b"), json!("a")],
+        "a change, and a change back, are recorded"
+    );
+
+    // Two datasetIds are two series; two equal entries in one append are one.
+    let both = |v: i64| {
+        json!({speed: [
+        {"type": "Property", "value": v, "observedAt": "2026-08-15T07:00:00Z", "datasetId": "urn:ds:a"},
+        {"type": "Property", "value": v, "observedAt": "2026-08-15T07:00:00Z", "datasetId": "urn:ds:b"},
+        {"type": "Property", "value": v, "observedAt": "2026-08-15T07:00:00Z", "datasetId": "urn:ds:b"}]})
+    };
+    let (tn, adds) = append(&t, both(5));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    let (tn, adds) = append(&t, both(5));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    let mut sets: Vec<_> = rows(&t, speed)
+        .await
+        .into_iter()
+        .filter_map(|r| r.1)
+        .collect();
+    sets.sort();
+    assert_eq!(sets, ["urn:ds:a", "urn:ds:b"]);
+
+    // Another tenant's identical history never suppresses this tenant's.
+    let (tn, adds) = append(&other, observed(10, "2026-08-15T08:00:00Z"));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    assert_eq!(rows(&other, speed).await.len(), 1);
+
+    // without observedAt each datasetId is compared with its own newest
+    // row; the first write of a series has none and is recorded.
+    let note = "https://uri.etsi.org/ngsi-ld/default-context/note";
+    let in_set =
+        |ds: &str, v: &str| json!({note: [{"type": "Property", "value": v, "datasetId": ds}]});
+    for (ds, v) in [
+        ("urn:ds:a", "x"),
+        ("urn:ds:b", "x"),
+        ("urn:ds:a", "x"),
+        ("urn:ds:b", "y"),
+    ] {
+        let (tn, adds) = append(&t, in_set(ds, v));
+        s.append(&tn, id, &shell, &adds).await.expect("append");
+    }
+    let got: Vec<_> = rows(&t, note)
+        .await
+        .into_iter()
+        .map(|r| (r.1.unwrap_or_default(), r.2["value"].clone()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("urn:ds:a".to_owned(), json!("x")),
+            ("urn:ds:b".to_owned(), json!("x")),
+            ("urn:ds:b".to_owned(), json!("y"))
+        ],
+        "a repeat in one series is skipped, a change in the other recorded"
+    );
+    // The newest row resent under its own instanceId with another value is a
+    // correction of that row, not a skip and not a second row.
+    let newest = rows(&t, note).await.pop().expect("a row");
+    let fix = json!({note: [{"type": "Property", "value": "z", "datasetId": "urn:ds:b",
+        "instanceId": newest.0, "createdAt": "2026-08-15T09:00:00Z", "modifiedAt": newest.2["modifiedAt"]}]});
+    s.append(&t, id, &shell, &fix).await.expect("append");
+    let got = rows(&t, note).await;
+    assert_eq!(got.len(), 3, "still three rows");
+    assert_eq!(got[2].2["value"], json!("z"), "the newest row corrected");
+
+    // The reconstructed evolution reads the same series.
+    let doc = s.get(&t, id).await.expect("get").expect("present");
+    assert_eq!(doc[name].as_array().map(Vec::len), Some(3), "{doc}");
+    for tenant in [&t, &other] {
+        let _ = s.delete(tenant, id).await;
+        sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+            .bind(tenant.as_str())
+            .execute(&pool)
+            .await
+            .expect("cleanup");
     }
 }

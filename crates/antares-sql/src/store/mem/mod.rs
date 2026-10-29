@@ -51,26 +51,32 @@ fn oldest_cached(contexts: &BTreeMap<String, Value>) -> Vec<String> {
         return Vec::new();
     }
     cached.sort_unstable_by(|(a_id, a_ts), (b_id, b_ts)| (a_ts, a_id).cmp(&(b_ts, b_id)));
-    cached[..cached.len() - MAX_CACHED_CONTEXTS]
+    cached
         .iter()
+        .take(cached.len().saturating_sub(MAX_CACHED_CONTEXTS))
         .map(|(id, _)| (*id).to_owned())
+        .collect()
+}
+
+/// The attribute names of an internal entity doc: every member but the
+/// entity's own (`ENTITY_META_KEYS`), collected so the doc can be changed
+/// while they are walked.
+fn attribute_names(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    obj.keys()
+        .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
+        .cloned()
         .collect()
 }
 
 /// Drop attribute instances whose `expiresAt` passed (4.22) from an internal
 /// entity or temporal doc; an attribute whose last instance expired is
 /// removed entirely. Returns whether the doc changed.
-fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
+pub(crate) fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
     let Some(obj) = doc.as_object_mut() else {
         return false;
     };
     let mut changed = false;
-    let attrs: Vec<String> = obj
-        .keys()
-        .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    for k in attrs {
+    for k in attribute_names(obj) {
         let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
             continue;
         };
@@ -89,13 +95,57 @@ fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
     changed
 }
 
+/// Whether an internal doc's types include `type_iri` (retention).
+fn typed(doc: &Value, type_iri: &str) -> bool {
+    match doc.get("type") {
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some(type_iri)),
+        Some(Value::String(t)) => t == type_iri,
+        _ => false,
+    }
+}
+
+/// Whether `scope` reaches the temporal document `id`.
+fn in_scope(id: &str, doc: &Value, scope: antares_store::HistoryScope<'_>) -> bool {
+    use antares_store::HistoryScope;
+    match scope {
+        HistoryScope::Entity(one) => id == one,
+        HistoryScope::Type {
+            type_iri,
+            except_ids,
+        } => typed(doc, type_iri) && !except_ids.iter().any(|e| e == id),
+        HistoryScope::Rest {
+            except_types,
+            except_ids,
+        } => !except_types.iter().any(|t| typed(doc, t)) && !except_ids.iter().any(|e| e == id),
+    }
+}
+
+/// The instant an attribute instance is kept by, the same fallback the
+/// Postgres arm's `observed_at` column takes.
+fn instance_instant(inst: &Value) -> Option<&str> {
+    ["observedAt", "modifiedAt", "deletedAt", "createdAt"]
+        .iter()
+        .find_map(|k| inst.get(*k).and_then(Value::as_str))
+}
+
+/// `a` before `b`, compared as instants (4.6.3 allows a comma fraction), by
+/// bytes when either does not parse.
+pub(crate) fn earlier(a: &str, b: &str) -> bool {
+    let instant =
+        |s: &str| chrono::DateTime::parse_from_rfc3339(&filter::canonical_datetime(s)).ok();
+    match (instant(a), instant(b)) {
+        (Some(x), Some(y)) => x < y,
+        _ => a < b,
+    }
+}
+
 /// The 4.22 "now" the write paths judge `expiresAt` against — the same UTC-Z
 /// millisecond form the read boundary uses.
 fn now_stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-const ALL_KINDS: [Kind; 9] = [
+const ALL_KINDS: [Kind; 10] = [
     Kind::Entity,
     Kind::Subscription,
     Kind::Registration,
@@ -105,6 +155,7 @@ const ALL_KINDS: [Kind; 9] = [
     Kind::EntityMap,
     Kind::DistSub,
     Kind::DeadLetter,
+    Kind::View,
 ];
 
 /// Run `f` off the tokio worker pool when called from a multi-thread runtime:
@@ -170,6 +221,7 @@ struct Inner {
     entity_map_docs: HashMap<String, BTreeMap<String, Value>>,
     dist_subs: HashMap<String, BTreeMap<String, Value>>,
     dead_letters: HashMap<String, BTreeMap<String, Value>>,
+    views: HashMap<String, BTreeMap<String, Value>>,
     /// tenant → entity id → temporal doc (attr IRI → instance array).
     temporal: HashMap<String, BTreeMap<String, Value>>,
     /// hosted/cached @context documents, shared across tenants by design.
@@ -264,6 +316,7 @@ impl Store {
                 Kind::EntityMap => &mut inner.entity_map_docs,
                 Kind::DistSub => &mut inner.dist_subs,
                 Kind::DeadLetter => &mut inner.dead_letters,
+                Kind::View => &mut inner.views,
             };
             for row in ::redb::ReadableTable::iter(&table).map_err(|e| e.to_string())? {
                 let (k, v) = row.map_err(|e| e.to_string())?;
@@ -331,7 +384,10 @@ impl Store {
     /// Consistency holds because mutations work on a clone and swap last.
     fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         use std::sync::atomic::Ordering;
-        let depth = self.write_waiters.fetch_add(1, Ordering::Relaxed) + 1;
+        let depth = self
+            .write_waiters
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         self.write_waiters_peak.fetch_max(depth, Ordering::Relaxed);
         let guard = self
             .inner
@@ -416,7 +472,13 @@ impl Store {
             if let Some(docs) = inner.entities.get_mut(&tenant) {
                 self.persist(T_ENTITIES, &key_bytes(&tenant, &id), None);
                 docs.remove(&id);
-                reaped += 1;
+                reaped = reaped.saturating_add(1);
+            }
+            // Its history goes with it.
+            if let Some(docs) = inner.temporal.get_mut(&tenant) {
+                if docs.remove(&id).is_some() {
+                    self.persist(T_TEMPORAL_ENTITIES, &key_bytes(&tenant, &id), None);
+                }
             }
         }
         let Inner {
@@ -432,7 +494,7 @@ impl Store {
             for (tenant, docs) in map.iter_mut() {
                 for (id, doc) in docs.iter_mut() {
                     if prune_expired_instances(doc, now) {
-                        reaped += 1;
+                        reaped = reaped.saturating_add(1);
                         self.persist(table, &key_bytes(tenant, id), Some(doc));
                     }
                 }
@@ -475,6 +537,77 @@ impl Store {
         names.into_iter().collect()
     }
 
+    /// The types the Tenant's live Entities carry, sorted: one pass
+    /// over the held documents, none of them cloned. 4.22: an expired Entity
+    /// carries no type.
+    pub fn entity_type_names(&self, tenant: &TenantId, now: &str) -> Vec<String> {
+        self.entity_types_where(tenant, now, |_| true)
+    }
+
+    /// The types of the live Entities that carry one of `any_of`, sorted.
+    pub fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+        now: &str,
+    ) -> Vec<String> {
+        self.entity_types_where(tenant, now, |types| {
+            types.len() > 1 && types.iter().any(|t| any_of.iter().any(|a| a == t))
+        })
+    }
+
+    /// The (type, member name) pairs the Tenant's live Entities carry,
+    /// sorted: one pass over the held documents.
+    pub fn entity_attr_pairs(&self, tenant: &TenantId, now: &str) -> Vec<(String, String)> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pairs = std::collections::BTreeSet::new();
+        if let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) {
+            for doc in m.values().filter(|d| !filter::expired_at(d, now)) {
+                let types: Vec<&str> = match &doc["type"] {
+                    Value::String(t) => vec![t.as_str()],
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                for k in doc.as_object().into_iter().flat_map(|o| o.keys()) {
+                    pairs.extend(types.iter().map(|t| (*t, k.as_str())));
+                }
+            }
+        }
+        pairs
+            .into_iter()
+            .map(|(t, k)| (t.to_owned(), k.to_owned()))
+            .collect()
+    }
+
+    fn entity_types_where(
+        &self,
+        tenant: &TenantId,
+        now: &str,
+        keep: impl Fn(&[&str]) -> bool,
+    ) -> Vec<String> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut names = std::collections::BTreeSet::new();
+        if let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) {
+            for doc in m.values().filter(|d| !filter::expired_at(d, now)) {
+                let types: Vec<&str> = match &doc["type"] {
+                    Value::String(t) => vec![t.as_str()],
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                if keep(&types) {
+                    names.extend(types);
+                }
+            }
+        }
+        names.into_iter().map(str::to_owned).collect()
+    }
+
     /// What one tenant holds. Existence is the caller's question — an
     /// unknown tenant simply counts zero of everything.
     pub fn tenant_stats_one(&self, tenant: &TenantId) -> antares_store::TenantStats {
@@ -512,6 +645,162 @@ impl Store {
                 .flat_map(|d| d.values().filter_map(Value::as_array))
                 .map(|a| a.iter().filter(|i| i.is_object()).count() as u64)
                 .sum()
+        })
+    }
+
+    /// The serialized size of the tenant's Entities, by first type.
+    pub fn tenant_bytes(&self, tenant: &TenantId) -> antares_store::TenantBytes {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = antares_store::TenantBytes::default();
+        for doc in inner
+            .entities
+            .get(tenant.as_str())
+            .into_iter()
+            .flat_map(BTreeMap::values)
+        {
+            let n = serde_json::to_vec(doc).map_or(0, |v| v.len() as u64);
+            let ty = match doc.get("type") {
+                Some(Value::String(t)) => t.as_str(),
+                Some(Value::Array(a)) => a.first().and_then(Value::as_str).unwrap_or(""),
+                _ => "",
+            };
+            out.entities = out.entities.saturating_add(n);
+            let t = out.by_type.entry(ty.to_owned()).or_default();
+            *t = t.saturating_add(n);
+        }
+        out
+    }
+
+    /// The serialized size of the tenant's temporal documents.
+    pub fn attr_instance_bytes(&self, tenant: &TenantId) -> u64 {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.temporal.get(tenant.as_str()).map_or(0, |docs| {
+            docs.values()
+                .map(|d| serde_json::to_vec(d).map_or(0, |v| v.len() as u64))
+                .sum()
+        })
+    }
+
+    /// Retention of current state: drop at most `batch` Entities of
+    /// `tenant` typed `type_iri` that carry no `expiresAt` and whose
+    /// `modifiedAt` is before `before`. Persisted per key in `file` mode;
+    /// `dry_run` counts them and drops none.
+    pub fn retain_current(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> u64 {
+        on_blocking(true, || {
+            let mut inner = self.write_inner();
+            let Some(docs) = inner.entities.get_mut(tenant.as_str()) else {
+                return 0;
+            };
+            let dead: Vec<String> = docs
+                .iter()
+                .filter(|(_, doc)| {
+                    typed(doc, type_iri)
+                        && doc.get("expiresAt").is_none()
+                        && doc
+                            .get("modifiedAt")
+                            .and_then(Value::as_str)
+                            .is_some_and(|m| earlier(m, before))
+                })
+                .map(|(id, _)| id.clone())
+                .take(batch)
+                .collect();
+            for id in dead.iter().filter(|_| !dry_run) {
+                self.persist(T_ENTITIES, &key_bytes(tenant.as_str(), id), None);
+                docs.remove(id);
+            }
+            dead.len() as u64
+        })
+    }
+
+    /// The Entities of every Tenant carrying their own history retention,
+    /// at most `limit`, with the Property as stored.
+    pub fn history_overrides(&self, limit: usize) -> Vec<(String, String, Value)> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .entities
+            .iter()
+            .flat_map(|(tenant, docs)| {
+                docs.iter().filter_map(move |(id, doc)| {
+                    doc.get(antares_store::HISTORY_RETENTION)
+                        .map(|own| (tenant.clone(), id.clone(), own.clone()))
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// Retention of history: drop at most `batch` attribute
+    /// instances of the `tenant`'s temporal documents `scope` names whose
+    /// instant is before `before`; an attribute left without instances goes.
+    /// `dry_run` counts them and drops none.
+    pub fn retain_history(
+        &self,
+        tenant: &TenantId,
+        scope: antares_store::HistoryScope<'_>,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> u64 {
+        on_blocking(true, || {
+            let mut inner = self.write_inner();
+            let Some(docs) = inner.temporal.get_mut(tenant.as_str()) else {
+                return 0;
+            };
+            let mut left = batch;
+            let mut dropped = 0u64;
+            for (id, doc) in docs.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                if !in_scope(id, doc, scope) {
+                    continue;
+                }
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let before_count = dropped;
+                for k in attribute_names(obj) {
+                    let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
+                        continue;
+                    };
+                    arr.retain(|inst| {
+                        let old =
+                            left > 0 && instance_instant(inst).is_some_and(|t| earlier(t, before));
+                        if old {
+                            left = left.saturating_sub(1);
+                            dropped = dropped.saturating_add(1);
+                        }
+                        dry_run || !old
+                    });
+                    if arr.is_empty() && !dry_run {
+                        obj.remove(&k);
+                    }
+                }
+                if dropped != before_count && !dry_run {
+                    self.persist(
+                        T_TEMPORAL_ENTITIES,
+                        &key_bytes(tenant.as_str(), id),
+                        Some(doc),
+                    );
+                }
+            }
+            dropped
         })
     }
 
@@ -589,6 +878,7 @@ impl Store {
             Kind::EntityMap => &inner.entity_map_docs,
             Kind::DistSub => &inner.dist_subs,
             Kind::DeadLetter => &inner.dead_letters,
+            Kind::View => &inner.views,
         }
     }
 
@@ -603,6 +893,7 @@ impl Store {
             Kind::EntityMap => &mut inner.entity_map_docs,
             Kind::DistSub => &mut inner.dist_subs,
             Kind::DeadLetter => &mut inner.dead_letters,
+            Kind::View => &mut inner.views,
         }
     }
 
@@ -809,6 +1100,151 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// Query Entities on the stored documents, under the read
+    /// lock: ids, the idPattern literal, types and attrs are tested on the
+    /// borrowed documents and only what the answer holds is copied, where a
+    /// snapshot of the tenant used to be. ids, types and attrs are exact
+    /// here, and so is a `q` without linked-entity terms when the request
+    /// @context comes along: it runs through the API's own evaluator.
+    /// Without anything else (`scopeQ`, a geo query, a linked
+    /// term) the outcome is `decided`: the projection applies and a page is
+    /// cut in id order (the map's order), counted when asked. Otherwise the
+    /// caller stays the arbiter over the narrowed rows. 4.22: an expired
+    /// Entity is not a match, before any cut; its expired instances are the
+    /// caller's.
+    pub fn query_entities(
+        &self,
+        tenant: &TenantId,
+        f: &filter::EntityFilter<'_>,
+    ) -> filter::QueryOutcome {
+        let now = crate::store::any::now_utc();
+        // a linked term reads other Entities under the caller's narrowing
+        let q = match (f.q, f.ctx) {
+            (Some(q), Some(ctx)) if !q.has_linked_paths() => Some((q, ctx)),
+            _ => None,
+        };
+        let decided = (f.q.is_none() || q.is_some()) && f.scope_q.is_none() && f.geo.is_empty();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) else {
+            return filter::QueryOutcome {
+                rows: Vec::new(),
+                decided,
+                paged: decided && f.page.is_some(),
+                total: f.page.as_ref().filter(|_| decided).map(|_| 0),
+            };
+        };
+        // a pattern that does not compile matches nothing (`Rule::id_patterns`)
+        let id_res: Option<Vec<_>> = f.id_patterns.map(|ps| {
+            ps.iter()
+                .filter_map(|p| antares_ql::regex::compile(&format!("^(?:{p})$")).ok())
+                .collect()
+        });
+        let matches = |id: &str, doc: &Value| {
+            !filter::expired_at(doc, &now)
+                && id_res
+                    .as_ref()
+                    .is_none_or(|res| res.iter().any(|re| re.is_match(id)))
+                && f.id_literal.is_none_or(|l| {
+                    if l.anchored {
+                        id.starts_with(l.text)
+                    } else {
+                        id.contains(l.text)
+                    }
+                })
+                && f.types.is_none_or(|sel| {
+                    let held: Vec<&str> = doc["type"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    sel.iter()
+                        .any(|group| group.iter().all(|w| held.contains(&w.as_str())))
+                })
+                && f.attrs
+                    .is_none_or(|attrs| attrs.iter().any(|a| has_live_attr(doc, a, &now)))
+                && q.is_none_or(|(q, ctx)| {
+                    // 4.22: `q` judges what a read may see, so an instance
+                    // past its expiresAt never makes the Entity match;
+                    // only a doc carrying one pays the copy
+                    if holds_expired_instance(doc, &now) {
+                        let mut live = doc.clone();
+                        filter::strip_expired(&mut live, &now);
+                        antares_ql::eval::eval_q(q, &live, ctx, &|_| None)
+                    } else {
+                        antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+                    }
+                })
+        };
+        // ids name at most what the client sent: look each up, in id order
+        let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match (f.ids, f.after_id) {
+            (Some(ids), after) => {
+                let mut want: Vec<&str> = ids.to_vec();
+                want.sort_unstable();
+                want.dedup();
+                want.retain(|id| after.is_none_or(|a| *id > a));
+                Box::new(want.into_iter().filter_map(|id| m.get_key_value(id)))
+            }
+            (None, Some(a)) => Box::new(
+                m.range::<str, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded)),
+            ),
+            (None, None) => Box::new(m.iter()),
+        };
+        let hits = candidates
+            .filter(|(id, doc)| matches(id, doc))
+            .map(|(_, d)| d);
+        let project = |doc: &Value| {
+            let mut v = doc.clone();
+            if decided {
+                if let Some(o) = v.as_object_mut() {
+                    if let Some(keep) = f.keep_attrs {
+                        o.retain(|k, _| !k.starts_with("http") || keep.contains(k));
+                    } else if let Some(drop) = f.drop_attrs {
+                        o.retain(|k, _| !drop.contains(k));
+                    }
+                }
+            }
+            v
+        };
+        let Some(p) = f.page.as_ref().filter(|_| decided) else {
+            return filter::QueryOutcome {
+                rows: hits.map(project).collect(),
+                decided,
+                paged: false,
+                total: None,
+            };
+        };
+        let offset = usize::try_from(p.offset).unwrap_or(0);
+        let limit = usize::try_from(p.limit).unwrap_or(usize::MAX);
+        let mut rows: Vec<Value> = Vec::new();
+        let (mut matched, mut more) = (0usize, false);
+        for doc in hits {
+            if matched >= offset && rows.len() < limit {
+                rows.push(project(doc));
+            } else if rows.len() == limit && !p.count {
+                more = true;
+                break;
+            }
+            // the rest is counted, never copied
+            matched = matched.saturating_add(1);
+        }
+        let total = if p.count {
+            matched
+        } else {
+            // the smallest total consistent with "a next page exists"
+            offset
+                .saturating_add(rows.len())
+                .saturating_add(usize::from(more))
+        };
+        filter::QueryOutcome {
+            rows,
+            decided,
+            paged: true,
+            total: Some(i64::try_from(total).unwrap_or(i64::MAX)),
+        }
+    }
+
     /// One id-ordered window of docs and the size of the whole set. The
     /// per-tenant map is a `BTreeMap` keyed by id, so the window is a skip
     /// over an already-ordered iterator.
@@ -939,6 +1375,30 @@ impl Store {
             .cloned()
     }
 
+    /// Read-modify-write under the write lock; `None` when the row is absent
+    /// or another Tenant's, `Some(Err)` when `f` refused (nothing written).
+    pub fn context_mutate(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: impl FnOnce(&mut Value) -> Result<(), ()>,
+    ) -> Option<Result<(), ()>> {
+        on_blocking(self.shadow.is_some(), || {
+            let mut inner = self.write_inner();
+            let row = inner
+                .contexts
+                .get_mut(id)
+                .filter(|r| context_row_visible(r, tenant))?;
+            let mut doc = row.clone();
+            if f(&mut doc).is_err() {
+                return Some(Err(()));
+            }
+            self.persist(T_JSONLD_CONTEXTS, id.as_bytes(), Some(&doc));
+            *row = doc;
+            Some(Ok(()))
+        })
+    }
+
     pub fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> bool {
         on_blocking(self.shadow.is_some(), || {
             let mut inner = self.write_inner();
@@ -973,6 +1433,31 @@ impl Store {
             })
             .collect()
     }
+}
+
+/// Whether `doc` holds Attribute `iri` once 4.22 has stripped its expired
+/// instances: an instance array keeps it while one instance is live, as
+/// `filter::strip_expired` decides.
+fn has_live_attr(doc: &Value, iri: &str, now: &str) -> bool {
+    match doc.get(iri) {
+        Some(Value::Array(arr)) if iri.contains(':') => {
+            arr.is_empty() || arr.iter().any(|i| !filter::expired_at(i, now))
+        }
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Whether an Attribute instance of `doc`, a sub-Attribute's included, is
+/// past its `expiresAt`: what `filter::strip_expired` would remove.
+fn holds_expired_instance(doc: &Value, now: &str) -> bool {
+    doc.as_object().is_some_and(|o| {
+        o.iter()
+            .filter(|(k, _)| k.contains(':'))
+            .filter_map(|(_, v)| v.as_array())
+            .flatten()
+            .any(|i| filter::expired_at(i, now) || holds_expired_instance(i, now))
+    })
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! recording which Entities — and which Context Sources — are relevant to an
 //! ongoing consumption request (4.5.25, data type 5.2.39).
 
-use crate::entity_map::{created_response, dt, map_delete, map_get, map_put, open_map};
+use crate::entity_map::{created_response, dt, map_delete, map_get, map_set_expiry, open_map};
 use crate::negotiate::*;
 use crate::state::AppState;
 use antares_model::{NgsiError, TenantId};
@@ -11,7 +11,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 
 // ---------- storage (5.14.1.1: "internal storage, or memory") ----------
@@ -76,16 +76,17 @@ pub async fn update_entity_map(
         let obj = frag.as_object().ok_or_else(|| {
             NgsiError::BadRequestData("EntityMap fragment must be a JSON object".into())
         })?;
-        let mut doc = map_get(&st, &tenant, &id)
-            .await?
-            .ok_or_else(|| NgsiError::ResourceNotFound(format!("EntityMap {id} not found")))?;
+        let gone = || NgsiError::ResourceNotFound(format!("EntityMap {id} not found"));
+        map_get(&st, &tenant, &id).await?.ok_or_else(gone)?;
         if let Some(e) = obj.get("expiresAt") {
             let s = e.as_str().filter(|s| dt(s).is_some()).ok_or_else(|| {
                 NgsiError::BadRequestData("expiresAt must be a DateTime (4.6.3)".into())
             })?;
-            doc["expiresAt"] = json!(s);
+            // only the member this update names, onto the map as stored now
+            if !map_set_expiry(&st, &tenant, &id, s).await? {
+                return Err(gone().into());
+            }
         }
-        map_put(&st, &tenant, doc).await?;
         Ok::<_, ApiError>(no_content(&tenant))
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -133,6 +134,8 @@ fn allowed_temporal_create_params() -> Vec<&'static str> {
         "aggrMethods",
         "aggrPeriodDuration",
         "lastN",
+        "firstN",
+        "offsetN",
     ]);
     v
 }
@@ -150,13 +153,6 @@ async fn create_map(
 ) -> Response {
     let go = async {
         let tenant = tenant_from(&headers)?;
-        let filter = gate!(
-            st,
-            &tenant,
-            &headers,
-            if temporal { "5.14.5" } else { "5.14.4" }
-        )
-        .await?;
         let allowed = if temporal {
             allowed_temporal_create_params()
         } else {
@@ -168,6 +164,17 @@ async fn create_map(
             Some(b) => query_body_params(b, &params, temporal)?,
             None => params,
         };
+        // ADR-0020: the engine is shown the query the map pages
+        let named = crate::entities::ReadMembers::of(&st, &headers, &vp).await;
+        let filter = gate!(
+            st, &tenant, &headers, if temporal { "5.14.5" } else { "5.14.4" },
+            q: named.q.as_ref(),
+            scope_q: vp.get("scopeQ").map(String::as_str),
+            types: &named.types,
+            attrs: &named.attrs,
+            geo: named.geo.as_ref(),
+        )
+        .await?;
         check_params(&vp, &allowed)?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
@@ -180,7 +187,7 @@ async fn create_map(
             crate::entities::build_query_map(&st, &tenant, &headers, &ctx, &vp, &filter).await?
         };
         let mut resp = created_response(doc, &ctx, accept, &tenant);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())

@@ -27,6 +27,15 @@ pub static MAX_BODY_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new
 });
 pub const MAX_URI_BYTES: usize = 8 * 1024; // → bare 414
 pub const MAX_JSON_DEPTH: usize = 64; // → 400 BadRequestData
+/// → 403 TooManyResults (5.5.6) on the NGSI-LD API, 413 on a surface
+/// (`antares_ops::Refusal::Limit`). The most bytes of one in-process answer
+/// a handler buffers before reading it (a temporal candidate set, a
+/// snapshot fill page, a surface's query): the page size bounds the Entity
+/// count, not the bytes, and every concurrent request holds its buffer.
+/// `AppState::max_answer_bytes` carries it, so a test can lower it.
+pub const MAX_ANSWER_BYTES: usize = 64 * 1024 * 1024;
+/// The fixed detail of an answer past [`MAX_ANSWER_BYTES`].
+pub const ANSWER_TOO_LARGE: &str = "the answer is larger than the broker buffers for one request";
 /// → 400 BadRequestData. Maximum coordinate positions in a QUERY geometry
 /// (4.10 geoQ, 4.23 ordering reference). The spec sets no ceiling, and the
 /// geometry is not bounded by the URI length on the POST query path — the
@@ -46,6 +55,68 @@ pub static MAX_BATCH_ITEMS: std::sync::LazyLock<usize> = std::sync::LazyLock::ne
         .filter(|n| *n > 0)
         .unwrap_or(1_000)
 });
+/// Deployment knob (ANTARES_MAX_LIMIT): the most Entities one query page
+/// answers (`limit`, 6.3.9; past it 403 TooManyResults). 1,000 unless set;
+/// read once at first use.
+pub static MAX_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_MAX_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000)
+});
+/// Deployment knob (ANTARES_DEFAULT_LIMIT): the Entities a query page answers
+/// when the request names no `limit` (6.3.9 leaves it to the broker); the
+/// next page is Linked. 100 unless set, never above [`MAX_LIMIT`].
+pub static DEFAULT_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_DEFAULT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100)
+        .min(*MAX_LIMIT)
+});
+/// Deployment knob (ANTARES_TEMPORAL_INSTANCE_LIMIT): NGSI-LD 6.3.10, the
+/// most instances of one Attribute a temporal response serves; past it the
+/// representation is cut and answered 206 with a Content-Range. 1,000 unless
+/// set: a week of a 10-minute sensor in one answer. The ETSI suite
+/// creates 20 instances and expects the cut, so its brokers run with 9. The
+/// answer stays bounded by [`MAX_ANSWER_BYTES`]. Read once at first use into
+/// `AppState::temporal_instance_limit`, which a test or the wasm broker
+/// (no process env; it reads `globalThis`) sets per state.
+pub static TEMPORAL_INSTANCE_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_TEMPORAL_INSTANCE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000)
+});
+
+/// [`TEMPORAL_INSTANCE_LIMIT`].
+pub fn temporal_instance_limit() -> usize {
+    *TEMPORAL_INSTANCE_LIMIT
+}
+
+/// Deployment knob (ANTARES_TEMPORAL_DEFAULT_INSTANCES): the instances of one
+/// Attribute a temporal response serves when the request names no
+/// lastN/firstN; past it the answer is cut and 206 like the ceiling's.
+/// 100 unless set, never above [`temporal_instance_limit`], so the ETSI
+/// brokers (ceiling 9) keep 9. Read once at first use into
+/// `AppState::temporal_default_instances`.
+pub static TEMPORAL_DEFAULT_INSTANCES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("ANTARES_TEMPORAL_DEFAULT_INSTANCES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(100)
+            .min(temporal_instance_limit())
+    });
+
+/// [`TEMPORAL_DEFAULT_INSTANCES`].
+pub fn temporal_default_instances() -> usize {
+    *TEMPORAL_DEFAULT_INSTANCES
+}
 // Deployment knob (ANTARES_MAX_FED_RESPONSE_BYTES): ceiling on one forwarded
 // (4.3.6) response body. The spec sets no ceiling; an over-cap peer part
 // fails like an unparseable payload (Table 6.3.17-1, warning 111) instead of
@@ -149,6 +220,144 @@ pub static MAX_FOLD_DOCS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(
 /// (`antares_notification_changes_dropped_total`), so this number is the
 /// back-pressure a deployment has before delivery loss starts.
 pub const CHANGE_QUEUE: usize = 1024;
+/// Groups one subscription may have waiting for delivery. Each subscription
+/// is served on a lane of its own, so a slow or dead endpoint backs up its
+/// lane and never the matching of every other change; a full lane
+/// drops the group for that subscription alone and counts it
+/// (`antares_notification_lane_dropped_total`).
+pub const DELIVERY_LANE: usize = 64;
+/// What every delivery lane together may hold, in estimated heap bytes of
+/// the entities waiting in them. [`DELIVERY_LANE`] counts groups, and a
+/// group is up to a drain's worth of entities copied for that subscription
+/// alone, so twenty subscriptions behind slow receivers under a batch upsert
+/// flood held 64 groups of 100 3 KB entities each and took the process past
+/// its 1536 MiB limit in seconds. Past this the group is dropped
+/// for that subscription and counted, as a full lane drops it. 128 MiB
+/// leaves room for a running batch, which costs as much again.
+/// Deployment knob (ANTARES_DELIVERY_LANE_BYTES), read once at first use.
+pub static DELIVERY_LANE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_DELIVERY_LANE_BYTES").ok().as_deref(),
+        128 * 1024 * 1024,
+        usize::MAX,
+    )
+});
+/// Batch write bodies in flight at once, in bytes. One batch costs about a
+/// hundred times its body while it runs: the parsed items, their expansion
+/// for the policy check, the stored pre-images, the forward copy, the rows
+/// and the change events, so a 1000-entity upsert of 3 MB held about 300 MB
+/// and eight of them at once took the process past its 1536 MiB limit;
+/// two at once were 480 MB live, so the default runs one batch of
+/// that size beside small ones. A batch waits for its share and is answered 503 with
+/// `Retry-After` when none frees inside [`BATCH_ADMIT_WAIT`]; one batch is
+/// always admitted alone, however large. Deployment knob
+/// (ANTARES_BATCH_INFLIGHT_BYTES), read once at first use.
+pub static BATCH_INFLIGHT_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_BATCH_INFLIGHT_BYTES")
+            .ok()
+            .as_deref(),
+        4 * 1024 * 1024,
+        u32::MAX as usize,
+    )
+});
+/// How long a batch waits for its share of [`BATCH_INFLIGHT_BYTES`]. A waiting
+/// batch holds only its body, and the batches ahead of it take well under a
+/// second each, so it waits long enough for a queue of dozens to drain; a
+/// client timeout of 30 s still sees the 503 first.
+pub const BATCH_ADMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+static BATCH_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*BATCH_INFLIGHT_BYTES));
+
+/// Batch writes running at once, whatever their size. Each holds a database
+/// connection for as long as it runs, so a stream of small batches has to
+/// leave the rest of the pool to the reads: 811 vehicle upserts in two
+/// minutes held all 20 of a broker's and a visitor's read waited 4 s for
+/// one. Deployment knob (ANTARES_BATCH_INFLIGHT), read once at first
+/// use; keep it under `ANTARES_PG_POOL`.
+pub static BATCH_INFLIGHT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_BATCH_INFLIGHT").ok().as_deref(),
+        8,
+        u32::MAX as usize,
+    )
+});
+static BATCH_RUNNING: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*BATCH_INFLIGHT));
+
+/// The admission of a batch body of `bytes`, held for as long as the batch
+/// runs: its share of [`BATCH_INFLIGHT_BYTES`] and one of [`BATCH_INFLIGHT`]
+/// slots; `None` when they did not free inside [`BATCH_ADMIT_WAIT`].
+pub async fn admit_batch(bytes: usize) -> Option<Admitted> {
+    admit_both(
+        (&BATCH_SLOTS, *BATCH_INFLIGHT_BYTES),
+        (&BATCH_RUNNING, *BATCH_INFLIGHT),
+        bytes,
+        BATCH_ADMIT_WAIT,
+    )
+    .await
+}
+
+/// A running batch's share of the byte budget and its slot.
+pub type Admitted = (
+    tokio::sync::SemaphorePermit<'static>,
+    tokio::sync::SemaphorePermit<'static>,
+);
+
+async fn admit_both<'a>(
+    bytes_budget: (&'a tokio::sync::Semaphore, usize),
+    running: (&'a tokio::sync::Semaphore, usize),
+    bytes: usize,
+    wait: std::time::Duration,
+) -> Option<(
+    tokio::sync::SemaphorePermit<'a>,
+    tokio::sync::SemaphorePermit<'a>,
+)> {
+    // One wait for both: the slot gets what the byte share left of it.
+    // Clock rule: std Instant panics on wasm32 (every batch write aborted the
+    // wasm broker).
+    #[cfg(not(target_arch = "wasm32"))]
+    let started = std::time::Instant::now();
+    #[cfg(target_arch = "wasm32")]
+    let started = web_time::Instant::now();
+    let share = admit(bytes_budget.0, bytes_budget.1, bytes, wait).await?;
+    let slot = admit(
+        running.0,
+        running.1,
+        1,
+        wait.saturating_sub(started.elapsed()),
+    )
+    .await?;
+    Some((share, slot))
+}
+
+async fn admit(
+    slots: &tokio::sync::Semaphore,
+    budget: usize,
+    bytes: usize,
+    wait: std::time::Duration,
+) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    // capped at the whole budget, so the largest body is admitted once it runs alone
+    let weight = bytes.clamp(1, budget) as u32;
+    #[cfg(not(target_arch = "wasm32"))]
+    let admitted = tokio::time::timeout(wait, slots.acquire_many(weight))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    // the wasm build has no tokio timer: a batch is admitted only when its share is free now
+    #[cfg(target_arch = "wasm32")]
+    let admitted = {
+        let _ = wait;
+        slots.try_acquire_many(weight).ok()
+    };
+    match admitted {
+        Some(permit) => Some(permit),
+        _ => {
+            metrics::counter!("antares_batch_overloaded_total").increment(1);
+            None
+        }
+    }
+}
 /// Notifications in flight at once per drain: one serial POST at a time
 /// capped a 9-subscription fan-out at ~600 POST/s and overflowed the ring.
 /// Deployment knob (ANTARES_DELIVERY_WIDTH): what a width is worth is a
@@ -219,6 +428,11 @@ impl LimitStats {
             "maxJsonDepth": MAX_JSON_DEPTH,
             "maxGeoVertices": MAX_GEO_VERTICES,
             "maxBatchItems": *MAX_BATCH_ITEMS,
+            "maxLimit": *MAX_LIMIT,
+            "defaultLimit": *DEFAULT_LIMIT,
+            "temporalInstanceLimit": temporal_instance_limit(),
+            "temporalDefaultInstances": temporal_default_instances(),
+            "maxAnswerBytes": MAX_ANSWER_BYTES,
             "maxFoldDocs": *MAX_FOLD_DOCS,
             "maxFedResponseBytes": *MAX_FED_RESPONSE_BYTES,
             "maxFedFanout": *MAX_FED_FANOUT,
@@ -233,6 +447,10 @@ impl LimitStats {
             "maxRegexCacheBytes": MAX_REGEX_CACHE_BYTES,
             "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
             "changeQueue": CHANGE_QUEUE,
+            "deliveryLane": DELIVERY_LANE,
+            "batchInflight": *BATCH_INFLIGHT,
+            "batchInflightBytes": *BATCH_INFLIGHT_BYTES,
+            "deliveryLaneBytes": *DELIVERY_LANE_BYTES,
             "deliveryWidth": *DELIVERY_WIDTH,
             "deliveryWidthPerTenant": *DELIVERY_WIDTH_PER_TENANT,
             "maxTrackedDestinations": MAX_TRACKED_DESTINATIONS,
@@ -245,7 +463,7 @@ impl LimitStats {
 
 /// Maximum brace/bracket nesting of a JSON byte stream, string-aware.
 /// A scan, not a parse — depth is checked before serde ever runs.
-pub(crate) fn json_depth(bytes: &[u8]) -> usize {
+pub fn json_depth(bytes: &[u8]) -> usize {
     let (mut depth, mut max, mut in_str, mut esc) = (0usize, 0usize, false, false);
     for &b in bytes {
         if in_str {
@@ -261,7 +479,7 @@ pub(crate) fn json_depth(bytes: &[u8]) -> usize {
         match b {
             b'"' => in_str = true,
             b'{' | b'[' => {
-                depth += 1;
+                depth = depth.saturating_add(1);
                 max = max.max(depth);
             }
             b'}' | b']' => depth = depth.saturating_sub(1),
@@ -466,9 +684,15 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "batchInflight",
+                "batchInflightBytes",
                 "changeQueue",
+                "defaultLimit",
+                "deliveryLane",
+                "deliveryLaneBytes",
                 "deliveryWidth",
                 "deliveryWidthPerTenant",
+                "maxAnswerBytes",
                 "maxBatchItems",
                 "maxBodyBytes",
                 "maxContextFetches",
@@ -480,6 +704,7 @@ mod tests {
                 "maxInProcessCallDepth",
                 "maxJoinLevel",
                 "maxJsonDepth",
+                "maxLimit",
                 "maxPeerWarnings",
                 "maxQLinkLookups",
                 "maxQNodes",
@@ -491,6 +716,8 @@ mod tests {
                 "rejectedBodyTooDeep",
                 "rejectedBodyTooLarge",
                 "rejectedUriTooLong",
+                "temporalDefaultInstances",
+                "temporalInstanceLimit",
             ],
             "no member beyond the caps, the pipeline ceilings and the counters"
         );
@@ -714,5 +941,62 @@ mod tests {
         );
         let deep = "[".repeat(100) + &"]".repeat(100);
         assert_eq!(json_depth(deep.as_bytes()), 100);
+    }
+
+    /// batches run inside their byte budget. A second one that does
+    /// not fit waits and is refused when nothing frees; a body larger than
+    /// the whole budget still runs alone; a finished batch frees its share.
+    #[tokio::test]
+    async fn batches_wait_for_their_share_of_the_in_flight_budget() {
+        let slots = tokio::sync::Semaphore::new(10);
+        let wait = std::time::Duration::from_millis(50);
+        let first = admit(&slots, 10, 6, wait).await.expect("fits");
+        assert!(
+            admit(&slots, 10, 6, wait).await.is_none(),
+            "6 + 6 is past 10"
+        );
+        let small = admit(&slots, 10, 4, wait).await.expect("6 + 4 fits");
+        drop((first, small));
+        let huge = admit(&slots, 10, 1 << 30, wait)
+            .await
+            .expect("alone, a huge body runs");
+        assert!(
+            admit(&slots, 10, 0, wait).await.is_none(),
+            "an empty body still counts one"
+        );
+        drop(huge);
+        assert!(admit(&slots, 10, 0, wait).await.is_some());
+        assert_eq!(slots.available_permits(), 10, "every share came back");
+    }
+
+    /// small batches each fit the byte budget, yet only as many run
+    /// as there are slots, so the rest of the pool stays with the reads; a
+    /// batch refused a slot gives its byte share back.
+    #[tokio::test]
+    async fn only_so_many_batches_run_at_once_however_small() {
+        let (bytes, running) = (
+            tokio::sync::Semaphore::new(1000),
+            tokio::sync::Semaphore::new(2),
+        );
+        let wait = std::time::Duration::from_millis(50);
+        let admit = || admit_both((&bytes, 1000), (&running, 2), 10, wait);
+        let first = admit().await.expect("a slot");
+        let second = admit().await.expect("a slot");
+        assert!(
+            admit().await.is_none(),
+            "two run, the third waits and is refused"
+        );
+        assert_eq!(
+            bytes.available_permits(),
+            980,
+            "the refused one's share came back"
+        );
+        drop(first);
+        let third = admit().await.expect("a freed slot");
+        drop((second, third));
+        assert_eq!(
+            (bytes.available_permits(), running.available_permits()),
+            (1000, 2)
+        );
     }
 }

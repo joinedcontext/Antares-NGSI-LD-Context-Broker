@@ -23,7 +23,7 @@ new binding attaches to.
 | shape | store | bus | when |
 |---|---|---|---|
 | single binary | `memory` or `file` (redb on a volume) | in-process | development, edge devices, one node, the browser build |
-| postgres | `postgres` (PostGIS) | in-process or NATS | production on one broker |
+| postgres | `postgres` (PostGIS) or `timescale` | in-process or NATS | production on one broker |
 | scaled | `postgres` or `timescale` | NATS JetStream | several stateless broker pods, role split, rolling updates |
 
 Current state and history are chosen independently: `ANTARES_STORE`

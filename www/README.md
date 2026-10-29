@@ -74,7 +74,9 @@ www/
 ├── test/                  # vitest: model invariants, demo idempotence,
 │                          # template round-trip, sheet filtering (RTL)
 └── e2e/smoke.mjs          # playwright-core against the BUILT app: boot,
-                           # auto-demo, node count, sheet filters, history
+                           # auto-demo, node count, sheet filters, history,
+                           # then a 390 px phone pass (tabs, ☰ menu, no
+                           # horizontal overflow); screenshots to $SHOTS
 ```
 
 ### Layering rule
@@ -128,6 +130,7 @@ client knows nothing about React; the vanilla `www/` page could adopt it.
 | **new:** tenant spreadsheet with filters (text / type / origin) | this app |
 | **new:** temporal history chart per attribute | this app |
 | **new:** 📖 API console — ETSI OpenAPI docs, try any NGSI-LD request against the in-tab broker (Postman-in-browser) | this app |
+| **new:** phone layout — below 900 px one pane at a time (🗺 board / 📋 sheet tabs), actions behind ☰, finger-sized controls | this app |
 
 ## Commands
 

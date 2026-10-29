@@ -37,8 +37,10 @@ native `file` store.
 `wasm-file` CI cell runs the serial ETSI suites + IOP against five
 dockerized shims over the redb file store. Per-shim env: `ANTARES_STORE`
 (`memory`/`file`), `ANTARES_FILE` (redb path), `ANTARES_HOST_ALIAS`, and
-`globalThis.ANTARES_PUBLIC_URL` for distributed subscriptions (wasm has no
-process env — the shim wires these through JS globals).
+three the shim copies onto `globalThis` because wasm has no process env:
+`ANTARES_PUBLIC_URL` for distributed subscriptions, `ANTARES_SWEEP_SECS`
+for the 4.22 expiry sweep and `ANTARES_TEMPORAL_INSTANCE_LIMIT` for the
+6.3.10 temporal ceiling.
 
 ## Build it
 

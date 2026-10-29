@@ -1,0 +1,13 @@
+-- The Attributes of a temporal Entity that hold an instance with a datasetId:
+-- lastN reads an Attribute through its newest rows only when none of its rows
+-- is in a dataset (store/pg/temporal.rs `newest_rows`). The write
+-- path records them here, beside the Entity's other temporal metadata, so the
+-- read is one array test on a row it already holds.
+--
+-- Not a partial index on attr_instances: building one reads every
+-- partition under a lock that blocks INSERT, on a large deployment ~145 GB of
+-- history and the broker's pool waiting behind it. A constant default makes
+-- this column a catalog change: no rewrite, no scan.
+--
+-- Instances written before this migration are not recorded.
+ALTER TABLE temporal_entities ADD COLUMN dataset_attrs text[] NOT NULL DEFAULT '{}';

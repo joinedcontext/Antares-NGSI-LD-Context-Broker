@@ -3,8 +3,10 @@
 //!
 //! Strategy is Scorpio's, proven against the ETSI suite: the predicate
 //! becomes `entity @? $n::jsonpath` over the stored expanded document (the
-//! operator spelling of `jsonb_path_exists`, because only the operator form
-//! matches the GIN `jsonb_path_ops` index). One rule is absolute here — **the
+//! operator spelling of `jsonb_path_exists`; no jsonb operator is leakproof,
+//! so under RLS it filters rows an index on the type, id or location found,
+//! and migration 0019 dropped the GIN that only a role bypassing RLS could
+//! use). One rule is absolute here — **the
 //! jsonpath travels as a bind, never
 //! as SQL text**. Nothing a client typed is ever concatenated into a
 //! statement; the compiler emits `$n` placeholders and hands the paths back
@@ -67,12 +69,14 @@ pub struct CompiledSql {
     pub binds: Vec<String>,
 }
 
-/// Compile `node` into a SQL predicate over column `col` (a `jsonb`).
+/// Compile `node` into a SQL predicate over column `col` (a `jsonb`). `col`
+/// is SQL text, so it is `'static`: a column the caller names in its own
+/// code, never a string a request carried.
 /// `first_bind` is the 1-based number of the next free placeholder.
 /// `None` = this expression is outside the exact subset; filter in memory.
 pub fn compile_q(
     node: &QNode,
-    col: &str,
+    col: &'static str,
     first_bind: usize,
     expand: &dyn Fn(&str) -> String,
 ) -> Option<CompiledSql> {
@@ -88,7 +92,7 @@ pub fn compile_q(
 /// `cmp = None` is the existence form.
 pub fn compile_instance_leaf(
     cmp: Option<(CmpOp, &QValue)>,
-    col: &str,
+    col: &'static str,
     first: usize,
 ) -> Option<CompiledSql> {
     let mut binds = Vec::new();
@@ -98,7 +102,7 @@ pub fn compile_instance_leaf(
 
 fn emit(
     node: &QNode,
-    col: &str,
+    col: &'static str,
     first: usize,
     expand: &dyn Fn(&str) -> String,
     binds: &mut Vec<String>,
@@ -136,7 +140,7 @@ fn emit(
 fn join(
     items: &[QNode],
     sep: &str,
-    col: &str,
+    col: &'static str,
     first: usize,
     expand: &dyn Fn(&str) -> String,
     binds: &mut Vec<String>,
@@ -157,7 +161,7 @@ fn join(
 fn value_or(
     prefix: &str,
     cmp: Option<(CmpOp, &QValue)>,
-    col: &str,
+    col: &'static str,
     first: usize,
     binds: &mut Vec<String>,
 ) -> Option<String> {
@@ -165,27 +169,33 @@ fn value_or(
         Some((op, v)) => Some(cmp_filter(op, v)?),
         None => None,
     };
+    // `eval::kind_allows`: a Relationship's object only answers == and !=
+    let objects = !matches!(cmp, Some((CmpOp::Pattern, _)));
     Some(value_or_filter(
         prefix,
         filter.as_deref(),
         col,
         first,
         binds,
+        objects,
     ))
 }
 
 /// The member-OR with a PRE-BUILT jsonpath filter — shared with the
-/// qprefilter's extension leaves (`!=` as NOT-of-Eq).
+/// qprefilter's extension leaves (`!=` as NOT-of-Eq). `objects = false`
+/// leaves out `object`/`objectList`, the members `~=` never reads.
 pub fn value_or_filter(
     prefix: &str,
     filter: Option<&str>,
-    col: &str,
+    col: &'static str,
     first: usize,
     binds: &mut Vec<String>,
+    objects: bool,
 ) -> String {
     let mut parts = Vec::with_capacity(ARMS);
     let steps = VALUE_KEYS
         .iter()
+        .filter(|k| objects || !matches!(**k, "object" | "objectList"))
         .map(|k| format!(".\"{k}\""))
         // C.6: a value written as a JSON-LD typed value carries it under
         // `@value`, and `eval::untyped` compares that member — one more
@@ -198,10 +208,11 @@ pub fn value_or_filter(
             Some(f) => format!("{prefix}{step}{f}"),
             None => format!("{prefix}{step}"),
         };
-        // the OPERATOR form of jsonb_path_exists: identical lax semantics,
-        // but the planner can match `@?` against the GIN jsonb_path_ops
-        // index — the function form never uses it
-        parts.push(format!("{col} @? ${}::jsonpath", first + binds.len()));
+        // the OPERATOR form of jsonb_path_exists: identical lax semantics
+        parts.push(format!(
+            "{col} @? ${}::jsonpath",
+            first.saturating_add(binds.len())
+        ));
         binds.push(jp);
     }
     format!("({})", parts.join(" OR "))
@@ -297,10 +308,18 @@ fn cmp_filter(op: CmpOp, want: &QValue) -> Option<String> {
         CmpOp::Ge => format!(" ? (@ >= {lit})"),
         CmpOp::Lt => format!(" ? (@ < {lit})"),
         CmpOp::Le => format!(" ? (@ <= {lit})"),
-        // ~= / !~= are regexes over strings; jsonpath's like_regex is
-        // POSIX-ish and does not match Rust's `regex` crate on every pattern,
-        // so both are left to the in-memory evaluator.
-        CmpOp::Pattern | CmpOp::NotPattern => return None,
+        // ~= is a regex over strings. jsonpath's `like_regex` is Postgres'
+        // ARE dialect, which reads the `pushable_pattern` subset exactly as
+        // the `regex` crate does; anything else stays in memory.
+        // !~= needs every array element to miss (p.92), which lax jsonpath
+        // quantifies existentially, so it always stays in memory.
+        CmpOp::Pattern => match want {
+            QValue::Str(s) if pushable_pattern(s) => {
+                format!(" ? (@ like_regex {})", jsonpath_string(s))
+            }
+            _ => return None,
+        },
+        CmpOp::NotPattern => return None,
     })
 }
 
@@ -338,6 +357,49 @@ fn literal(v: &QValue) -> Option<String> {
     })
 }
 
+/// Longest `~=` pattern pushed to Postgres; a longer one stays in memory
+/// under the evaluator's own program caps (`crate::regex`).
+const MAX_PUSHED_PATTERN: usize = 128;
+
+/// Whether `~=`'s pattern means the same to Postgres `like_regex` and to the
+/// `regex` crate. Literals, `.`, `^`, `$`, `|`, groups, the
+/// quantifiers `*` `+` `?` (lazy too) and positive bracket lists of
+/// literals and ranges. Refused, so evaluated in memory: escapes (`\`:
+/// class shorthands and back-references differ, and a back-reference is
+/// what makes Postgres backtrack), `{m,n}` counts, `[^…]` (in like_regex it
+/// never matches a newline, in Rust it does), POSIX `[:…:]` classes, inline
+/// flags `(?…)`, a NUL, and every pattern Rust itself refuses.
+/// `like_regex` without flags keeps `.` off newlines and `^`/`$` at the
+/// ends of the string, which are the crate's defaults.
+fn pushable_pattern(p: &str) -> bool {
+    if p.is_empty() || p.len() > MAX_PUSHED_PATTERN || crate::regex::compile(p).is_err() {
+        return false;
+    }
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' | '{' | '}' | '\0' => return false,
+            '(' if chars.peek() == Some(&'?') => return false,
+            '[' => {
+                // a positive list of literals and `a-z` ranges, closed
+                if matches!(chars.peek(), Some('^' | ']' | '[')) {
+                    return false;
+                }
+                loop {
+                    match chars.next() {
+                        Some(']') => break,
+                        Some('[' | '\\' | '\0') | None => return false,
+                        Some(_) => {}
+                    }
+                }
+            }
+            ']' => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
 /// A jsonpath member name: always double-quoted, because attribute keys are
 /// expanded IRIs full of `:` `/` `#` `.` that would otherwise be syntax.
 pub fn quoted(s: &str) -> String {
@@ -345,7 +407,7 @@ pub fn quoted(s: &str) -> String {
 }
 
 fn jsonpath_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
     for c in s.chars() {
         match c {
@@ -458,8 +520,10 @@ mod tests {
     fn unsupported_shapes_refuse_instead_of_guessing() {
         // dotted path: sub-attribute vs value navigation is ambiguous
         assert!(c("address.city==\"Bonn\"").is_none());
-        // ~= is a regex dialect mismatch
-        assert!(c("name~=\"^ab\"").is_none());
+        // ~= outside the subset both regex dialects read alike, and !~=
+        assert!(c("name~=\"\\d\"").is_none());
+        assert!(c("name!~=\"^ab\"").is_none());
+        assert!(c("name~=\"^ab\"").is_some());
         // ordering on strings: Rust byte-wise vs database collation
         assert!(c("name>\"m\"").is_none());
         assert!(c("name<=\"m\"").is_none());
@@ -475,14 +539,14 @@ mod tests {
     #[test]
     fn one_refused_member_refuses_the_whole_expression() {
         assert!(
-            c(r#"a==1;b~="x""#).is_none(),
+            c(r#"a==1;b!~="x""#).is_none(),
             "AND must not drop a conjunct"
         );
-        assert!(c(r#"a==1|b~="x""#).is_none(), "OR must not drop a branch");
-        assert!(c(r#"b~="x"|a==1"#).is_none(), "…in either position");
+        assert!(c(r#"a==1|b!~="x""#).is_none(), "OR must not drop a branch");
+        assert!(c(r#"b!~="x"|a==1"#).is_none(), "…in either position");
         assert!(c(r#"(a==1|b!=2);c==3"#).is_none(), "…nor when nested");
         // and the members that DID compile leave no trace behind them
-        assert!(c(r#"a==1;a==2;b~="x""#).is_none());
+        assert!(c(r#"a==1;a==2;b!~="x""#).is_none());
         // an empty junction has no predicate either — `()` would be a syntax
         // error, and this entry point is public
         assert!(compile_q(&QNode::And(Vec::new()), "entity", 1, &ex).is_none());
@@ -558,7 +622,58 @@ mod tests {
         assert!(compile_instance_leaf(Some((CmpOp::Ne, &want)), "qi.data", 1).is_none());
         let s = QValue::Str("m".to_owned());
         assert!(compile_instance_leaf(Some((CmpOp::Lt, &s)), "qi.data", 1).is_none());
-        assert!(compile_instance_leaf(Some((CmpOp::Pattern, &s)), "qi.data", 1).is_none());
+        assert!(compile_instance_leaf(Some((CmpOp::NotPattern, &s)), "qi.data", 1).is_none());
+        let esc = QValue::Str("\\d".to_owned());
+        assert!(compile_instance_leaf(Some((CmpOp::Pattern, &esc)), "qi.data", 1).is_none());
+        // a pattern both dialects read alike compiles, Relationship members left out
+        let got = compile_instance_leaf(Some((CmpOp::Pattern, &s)), "qi.data", 1).expect("pushed");
+        assert!(
+            got.binds.iter().all(|b| !b.contains("object")),
+            "{:?}",
+            got.binds
+        );
+        assert!(
+            got.binds[0].ends_with("? (@ like_regex \"m\")"),
+            "{:?}",
+            got.binds
+        );
+    }
+
+    /// only the subset Postgres ARE and the `regex` crate read alike
+    /// is pushed; the rest stays with the evaluator.
+    #[test]
+    fn only_patterns_both_dialects_read_alike_are_pushed() {
+        for p in [
+            "^B",
+            "erl",
+            "^b.*n$",
+            "(a|b)+",
+            "[A-Z]erlin",
+            "x y",
+            "é.",
+            "^[a-c0-9_-]+?$",
+            "a|",
+        ] {
+            assert!(pushable_pattern(p), "{p}");
+        }
+        for p in [
+            "",
+            "\\d",
+            "a{2}",
+            "[^a]",
+            "[[:alpha:]]",
+            "(?i)b",
+            "(a)\\1",
+            "[a",
+            "a]",
+            "[a\\d]",
+            "[a[b]]",
+            "a\0",
+            "(",
+            &"a".repeat(MAX_PUSHED_PATTERN + 1),
+        ] {
+            assert!(!pushable_pattern(p), "{p}");
+        }
     }
 
     /// A number that cannot round-trip as a JSON literal is not compiled to
@@ -594,5 +709,59 @@ mod tests {
         assert!(c(r#"name=="a".."m""#).is_none());
         // !~= is a regex — dialect mismatch, in-memory
         assert!(c(r#"name!~="^ab""#).is_none());
+    }
+
+    /// The equality and `[lang]` building blocks share Eq's table: a list
+    /// is an OR, a numeric range a closed interval, a string range and an
+    /// ordering on a list stay in memory.
+    #[test]
+    fn eq_and_lang_filters_follow_the_eq_table() {
+        let n = |x: f64| Box::new(QValue::Num(x));
+        let list = QValue::List(vec![QValue::Num(1.0), QValue::Num(2.0)]);
+        assert!(eq_filter(&list).is_some_and(|f| f.contains("||")));
+        assert!(eq_filter(&QValue::Range(n(1.0), n(2.0))).is_some_and(|f| f.contains(">=")));
+        let s = |x: &str| Box::new(QValue::Str(x.into()));
+        assert!(eq_filter(&QValue::Range(s("a"), s("b"))).is_none());
+        assert!(lang_filter(CmpOp::Ne, &list).is_none());
+        assert!(lang_filter(CmpOp::Ne, &QValue::Range(n(1.0), n(2.0))).is_none());
+        assert_eq!(lang_filter(CmpOp::Eq, &list), eq_filter(&list));
+    }
+
+    /// Linked-entity hops and trailing brackets stay in memory, for an
+    /// existence test as for a comparison; a control character in a
+    /// literal is escaped, a space is not.
+    #[test]
+    fn hops_and_brackets_stay_in_memory_and_controls_are_escaped() {
+        for q in [
+            "sensor{humidity}==40",
+            "sensor{humidity}",
+            "a[b]==1",
+            "a[b]",
+        ] {
+            assert!(c(q).is_none(), "{q}");
+        }
+        let got = c(r#"a=="x\u0001 y""#).expect("compiles");
+        assert!(got.binds[0].contains(r#""x\u0001 y""#), "{}", got.binds[0]);
+    }
+
+    /// The edges of the subset: a bare existence term, `<` and `<=`, a boolean, a
+    /// tab and a carriage return in a string, and the composite values `literal` never renders.
+    #[test]
+    fn existence_ordering_booleans_and_control_characters() {
+        let bound = |q: &str| c(q).map(|got| got.binds[0].clone()).expect(q);
+        assert!(
+            bound("temperature").ends_with(r#"."value""#),
+            "{}",
+            bound("temperature")
+        );
+        assert!(bound("temperature<20").ends_with("? (@ < 20)"));
+        assert!(bound("temperature<=20").ends_with("? (@ <= 20)"));
+        assert!(bound("open==true").ends_with("? (@ == true)"));
+        assert!(
+            bound(r#"a=="x\ty\rz""#).contains(r#""x\ty\rz""#),
+            "{}",
+            bound(r#"a=="x\ty\rz""#)
+        );
+        assert_eq!(literal(&QValue::List(vec![QValue::Num(1.0)])), None);
     }
 }

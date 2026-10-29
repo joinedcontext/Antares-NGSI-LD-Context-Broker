@@ -34,7 +34,7 @@ pub fn paginate(
     matches: Vec<Value>,
     path: &str,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, matches, path, Accept::Json, None)
+    paginate_impl(st, params, matches, path, Accept::Json, None, false)
 }
 
 /// The store already applied ORDER BY id + LIMIT/OFFSET and counted the
@@ -46,11 +46,12 @@ pub fn paginate_pre(
     path: &str,
     total: usize,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, page, path, Accept::Json, Some(total))
+    paginate_impl(st, params, page, path, Accept::Json, Some(total), false)
 }
 
 /// `paginate_pre` for a caller that negotiated a media type: the store
 /// already applied ORDER BY id + LIMIT/OFFSET and counted the match set.
+/// `csource`: a csource resource's Link order (see [`paginate_impl`]).
 pub fn paginate_pre_accept(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -58,8 +59,148 @@ pub fn paginate_pre_accept(
     path: &str,
     accept: Accept,
     total: usize,
+    csource: bool,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, page, path, accept, Some(total))
+    paginate_impl(st, params, page, path, accept, Some(total), csource)
+}
+
+/// The query parameter carrying the keyset cursor of an Entity query's
+/// rel="next" Link. The next page then seeks the primary key past
+/// the last id shown instead of skipping `offset` rows; the Link still
+/// carries `offset`, so the page numbers a client reads stay true.
+pub(crate) const CURSOR: &str = "cursor";
+/// The longest cursor read: an Entity id is at most 256 bytes as hex, plus
+/// the tag.
+const CURSOR_MAX: usize = 1024;
+
+/// Whether an Entity query's next page may be read by keyset: a page the
+/// store keeps in id order whose total nobody asked for (a counted page
+/// still counts the whole set, which the keyset predicate would cut).
+pub(crate) fn keyset_allowed(params: &HashMap<String, String>) -> bool {
+    params.get("count").map(String::as_str) != Some("true") && !params.contains_key("orderBy")
+}
+
+/// The view a cursor is bound to: the plain API.
+pub(crate) fn view_of(_st: &AppState) -> String {
+    String::new()
+}
+
+/// The tag binding a cursor to its view, Tenant, every other parameter of
+/// the request it is sent with, and the id it names. Not a secret: a
+/// forged cursor can only start its own query at another id, which `q` or
+/// `id` already let the caller ask; the tag makes a cursor replayed on
+/// another view, Tenant or query a 400 instead of a silently shifted page.
+fn cursor_tag(view: &str, tenant: &str, params: &HashMap<String, String>, last: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut kv: Vec<(&String, &String)> = params.iter().filter(|(k, _)| *k != CURSOR).collect();
+    kv.sort();
+    let mut h = Sha256::new();
+    for part in [
+        b"antares-cursor-1".as_slice(),
+        view.as_bytes(),
+        tenant.as_bytes(),
+    ] {
+        h.update(part);
+        h.update([0]);
+    }
+    for (k, v) in kv {
+        h.update(k.as_bytes());
+        h.update([0]);
+        h.update(v.as_bytes());
+        h.update([0]);
+    }
+    h.update(last.as_bytes());
+    let digest = h.finalize();
+    hex(digest.get(..12).unwrap_or(&digest))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        },
+    )
+}
+
+/// The cursor of the page after `last` for the request `next` (the
+/// parameters the next Link carries, without the cursor itself).
+pub(crate) fn encode_cursor(
+    view: &str,
+    tenant: &str,
+    next: &HashMap<String, String>,
+    last: &str,
+) -> String {
+    format!(
+        "{}.{}",
+        hex(last.as_bytes()),
+        cursor_tag(view, tenant, next, last)
+    )
+}
+
+/// The id a request's cursor seeks past, `None` without one. A cursor not
+/// made for exactly this view, Tenant and query is BadRequestData.
+pub(crate) fn cursor_after(
+    view: &str,
+    tenant: &str,
+    params: &HashMap<String, String>,
+) -> Result<Option<String>, NgsiError> {
+    let Some(c) = params.get(CURSOR) else {
+        return Ok(None);
+    };
+    let refused = || {
+        NgsiError::BadRequestData(
+            "cursor does not belong to this query; follow the next Link of its first page again"
+                .into(),
+        )
+    };
+    if c.len() > CURSOR_MAX || !keyset_allowed(params) {
+        return Err(refused());
+    }
+    let (id_hex, tag) = c.split_once('.').ok_or_else(refused)?;
+    let bytes = (0..id_hex.len())
+        .step_by(2)
+        .map(|i| {
+            id_hex
+                .get(i..i.saturating_add(2))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
+        .collect::<Option<Vec<u8>>>()
+        .filter(|b| !b.is_empty() && b.len().saturating_mul(2) == id_hex.len())
+        .ok_or_else(refused)?;
+    let last = String::from_utf8(bytes).map_err(|_| refused())?;
+    if cursor_tag(view, tenant, params, &last) != tag {
+        return Err(refused());
+    }
+    Ok(Some(last))
+}
+
+/// The next Link of `links` with the cursor of the page after `last`
+/// added; every other Link unchanged.
+pub(crate) fn with_next_cursor(
+    links: Vec<String>,
+    view: &str,
+    tenant: &str,
+    params: &HashMap<String, String>,
+    last: Option<&str>,
+    next_offset: usize,
+) -> Vec<String> {
+    let Some(last) = last else {
+        return links;
+    };
+    let mut next = params.clone();
+    next.remove(CURSOR);
+    next.insert("offset".into(), next_offset.to_string());
+    let cursor = encode_cursor(view, tenant, &next, last);
+    links
+        .into_iter()
+        .map(|l| match l.split_once(">; rel=\"next\"") {
+            Some((target, rest)) => format!("{target}&{CURSOR}={cursor}>; rel=\"next\"{rest}"),
+            None => l,
+        })
+        .collect()
 }
 
 /// 4.12 Pagination: clients specify a limit (page size), the server defines
@@ -109,7 +250,8 @@ pub fn page_params(
 }
 
 /// 6.3.10: next/prev Links carry the response media type; the suite asserts
-/// `;type="application/ld+json"` on ld+json list responses (031_02).
+/// `;type="application/ld+json"` on ld+json list responses (031_02). The
+/// Links keep a csource resource's order (the registration list's).
 pub fn paginate_accept(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -117,7 +259,17 @@ pub fn paginate_accept(
     path: &str,
     accept: Accept,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, matches, path, accept, None)
+    paginate_impl(st, params, matches, path, accept, None, true)
+}
+
+/// The media type a page Link names: "exactly equal to the media type
+/// resulting from the original request" (6.3.10, TS 104 176 6.4.7.3).
+pub(crate) fn link_media_type(accept: Accept) -> &'static str {
+    match accept {
+        Accept::LdJson => "application/ld+json",
+        Accept::Json => "application/json",
+        Accept::GeoJson => "application/geo+json",
+    }
 }
 
 fn paginate_impl(
@@ -127,6 +279,7 @@ fn paginate_impl(
     path: &str,
     accept: Accept,
     pre: Option<usize>,
+    csource_style: bool,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
     let (offset, limit, count) = page_params(st, params)?;
     let total = pre.unwrap_or(matches.len());
@@ -136,10 +289,8 @@ fn paginate_impl(
     };
     let mut links = Vec::new();
     // csource resources: the suite string-compares links against
-    // `?other…&limit=N&offset=M` order with an unconditional ld+json type
-    // suffix (037_11, 041_03); entity lists keep sorted params + accept-based
-    // suffix (031_02).
-    let csource_style = path.contains("csource");
+    // `?other…&limit=N&offset=M` order (037_11, 041_03); entity lists keep
+    // sorted params (031_02). The type suffix follows Accept for both.
     let mut mk = |off: usize, rel: &str| {
         let mut qp: Vec<String>;
         if csource_style {
@@ -156,7 +307,7 @@ fn paginate_impl(
         } else {
             qp = params
                 .iter()
-                .filter(|(k, _)| k.as_str() != "offset")
+                .filter(|(k, _)| !matches!(k.as_str(), "offset" | CURSOR))
                 .map(|(k, v)| format!("{k}={}", query_value(v)))
                 .collect();
             qp.push(format!("offset={off}"));
@@ -165,16 +316,14 @@ fn paginate_impl(
         // 6.3.10: "At least, the type Link Target Attribute shall be included
         // ... and its value shall be exactly equal to the media type resulting
         // from the original request" — for EVERY media type, not just ld+json.
-        let ty = match accept {
-            _ if csource_style => ";type=\"application/ld+json\"",
-            Accept::LdJson => ";type=\"application/ld+json\"",
-            Accept::Json => ";type=\"application/json\"",
-            Accept::GeoJson => ";type=\"application/geo+json\"",
-        };
-        links.push(format!("<{path}?{}>; rel=\"{rel}\"{ty}", qp.join("&")));
+        let ty = link_media_type(accept);
+        links.push(format!(
+            "<{path}?{}>; rel=\"{rel}\";type=\"{ty}\"",
+            qp.join("&")
+        ));
     };
-    if offset + limit < total && limit > 0 {
-        mk(offset + limit, "next");
+    if offset.saturating_add(limit) < total && limit > 0 {
+        mk(offset.saturating_add(limit), "next");
     }
     if offset > 0 {
         mk(offset.saturating_sub(limit.max(1)), "prev");
@@ -235,6 +384,20 @@ fn build_collator(tag: &str) -> Result<icu_collator::CollatorBorrowed<'static>, 
     }
     icu_collator::Collator::try_new((&locale).into(), opts)
         .map_err(|_| bad(format!("unsupported collation {tag:?} (4.23.3)")))
+}
+
+/// The expanded Attribute each key of an `orderBy` spec reads, as
+/// [`order_entities`] parses it; `id`, `type`, `createdAt` and `modifiedAt`
+/// are core members, no Attribute.
+pub(crate) fn order_heads(spec: &str, ctx: &antares_jsonld::Context) -> Vec<String> {
+    spec.split(',')
+        .filter_map(|part| {
+            let member = part.trim().split(';').next()?.trim();
+            let head = member.split('[').next()?.split('.').next()?;
+            (!matches!(head, "" | "id" | "type" | "createdAt" | "modifiedAt"))
+                .then(|| ctx.expand_key(head))
+        })
+        .collect()
 }
 
 pub fn order_entities(
@@ -326,7 +489,7 @@ pub fn order_entities(
                 let iri = ctx.expand_key(head);
                 let inst = doc.get(&iri).and_then(Value::as_array)?.first()?;
                 let mut cur = inst;
-                for seg in &path[1..] {
+                for seg in path.iter().skip(1) {
                     match seg.as_str() {
                         "createdAt" | "modifiedAt" | "observedAt" | "datasetId" | "unitCode" => {
                             cur = cur.get(seg.as_str())?;
@@ -383,8 +546,8 @@ pub fn order_entities(
     fn is_date(s: &str) -> bool {
         let b = s.as_bytes();
         b.len() == 10
-            && b[4] == b'-'
-            && b[7] == b'-'
+            && b.get(4) == Some(&b'-')
+            && b.get(7) == Some(&b'-')
             && b.iter()
                 .enumerate()
                 .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
@@ -392,13 +555,15 @@ pub fn order_entities(
     /// 4.6.3 Time: hh:mm:ss[.f*]Z.
     fn is_time(s: &str) -> bool {
         let b = s.as_bytes();
+        let digits =
+            |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
         b.len() >= 9
-            && b[b.len() - 1] == b'Z'
-            && b[2] == b':'
-            && b[5] == b':'
-            && b[..2].iter().all(u8::is_ascii_digit)
-            && b[3..5].iter().all(u8::is_ascii_digit)
-            && b[6..8].iter().all(u8::is_ascii_digit)
+            && b.last() == Some(&b'Z')
+            && b.get(2) == Some(&b':')
+            && b.get(5) == Some(&b':')
+            && digits(0..2)
+            && digits(3..5)
+            && digits(6..8)
     }
     fn cmp_vals(
         a: &Option<Value>,
@@ -439,49 +604,58 @@ pub fn order_entities(
             }
         }
     }
-    docs.sort_by(|a, b| {
+    // Each document's ordering values are read once, not twice per comparison:
+    // a comparison sort of n documents compares about n log n pairs, and each
+    // read expands a term and clones a value.
+    let distance = |v: &Option<Value>| {
+        refg.as_ref()
+            .zip(v.as_ref())
+            .and_then(|(g, v)| antares_ql::geo::order_distance_m(g, v))
+    };
+    // per key: the value it reads and, under a distance key, the distance
+    type Read = Vec<(Option<Value>, Option<f64>)>;
+    let mut decorated: Vec<(Read, Value)> = docs
+        .iter_mut()
+        .map(|doc| {
+            let read = keys
+                .iter()
+                .map(|k| {
+                    let v = order_value(doc, k, ctx);
+                    let d = match k.dir {
+                        Dir::DistAsc | Dir::DistDesc => distance(&v),
+                        Dir::Asc | Dir::Desc => None,
+                    };
+                    (v, d)
+                })
+                .collect();
+            (read, std::mem::take(doc))
+        })
+        .collect();
+    decorated.sort_by(|(a, _), (b, _)| {
         use std::cmp::Ordering;
-        for k in &keys {
+        for (k, ((va, da), (vb, db))) in keys.iter().zip(a.iter().zip(b)) {
             let o = match k.dir {
                 Dir::Asc | Dir::Desc => {
-                    let va = order_value(a, k, ctx);
-                    let vb = order_value(b, k, ctx);
-                    let mut o = cmp_vals(&va, &vb, collator.as_ref());
+                    let mut o = cmp_vals(va, vb, collator.as_ref());
                     if k.dir == Dir::Desc {
                         o = o.reverse();
                     }
                     o
                 }
-                Dir::DistAsc | Dir::DistDesc => {
-                    // Set whenever a Dist ordering was accepted. Without it
-                    // there is no distance to compare, and every pair being
-                    // equal leaves the previous order untouched.
-                    let Some(refg) = refg.as_ref() else {
-                        return std::cmp::Ordering::Equal;
-                    };
-                    let da = order_value(a, k, ctx)
-                        .and_then(|v| antares_ql::geo::order_distance_m(refg, &v));
-                    let db = order_value(b, k, ctx)
-                        .and_then(|v| antares_ql::geo::order_distance_m(refg, &v));
-                    match (da, db) {
-                        (Some(x), Some(y)) => {
-                            let mut o = x.total_cmp(&y);
-                            if k.dir == Dir::DistDesc {
-                                o = o.reverse();
-                            }
-                            o
+                Dir::DistAsc | Dir::DistDesc => match (da, db) {
+                    (Some(x), Some(y)) => {
+                        let mut o = x.total_cmp(y);
+                        if k.dir == Dir::DistDesc {
+                            o = o.reverse();
                         }
-                        // 4.23.2 distance order: GeoProperties (by distance)
-                        // rank before non-GeoProperties (by value)
-                        (Some(_), None) => Ordering::Less,
-                        (None, Some(_)) => Ordering::Greater,
-                        (None, None) => {
-                            let va = order_value(a, k, ctx);
-                            let vb = order_value(b, k, ctx);
-                            cmp_vals(&va, &vb, collator.as_ref())
-                        }
+                        o
                     }
-                }
+                    // 4.23.2 distance order: GeoProperties (by distance)
+                    // rank before non-GeoProperties (by value)
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => cmp_vals(va, vb, collator.as_ref()),
+                },
             };
             if o != Ordering::Equal {
                 return o;
@@ -489,6 +663,9 @@ pub fn order_entities(
         }
         Ordering::Equal
     });
+    for (slot, (_, doc)) in docs.iter_mut().zip(decorated) {
+        *slot = doc;
+    }
     Ok(())
 }
 
@@ -545,7 +722,7 @@ pub(crate) fn query_doc_params(
                     Some(Value::String(s)) => {
                         antares_model::EntityId::new(s)?;
                         ids.push(s.clone());
-                        with_id += 1;
+                        with_id = with_id.saturating_add(1);
                     }
                     Some(Value::Array(a)) => {
                         for i in a {
@@ -555,7 +732,7 @@ pub(crate) fn query_doc_params(
                             antares_model::EntityId::new(s)?;
                             ids.push(s.to_owned());
                         }
-                        with_id += 1;
+                        with_id = with_id.saturating_add(1);
                     }
                     Some(_) => {
                         return Err(bad(
@@ -567,7 +744,7 @@ pub(crate) fn query_doc_params(
                     None => {}
                     Some(Value::String(s)) => {
                         pats.push(s.clone());
-                        with_pat += 1;
+                        with_pat = with_pat.saturating_add(1);
                     }
                     Some(_) => {
                         return Err(bad(
@@ -614,6 +791,9 @@ pub(crate) fn query_doc_params(
         match q.get(k) {
             None => {}
             Some(Value::String(s)) => {
+                if k == "scopeQ" {
+                    antares_ql::scope::check_scope_q(s)?;
+                }
                 vp.insert(k.into(), capped(k, s.clone())?);
             }
             Some(_) => return Err(bad(format!("Query {k} must be a string (5.2.23)"))),
@@ -895,12 +1075,20 @@ pub(crate) fn temporal_q_params(
             Some(_) => return Err(bad(format!("temporalQ {k} must be a string (5.2.21)"))),
         }
     }
-    if let Some(n) = tq.get("lastN") {
-        let v = n
-            .as_u64()
-            .filter(|v| *v >= 1)
-            .ok_or_else(|| bad("temporalQ lastN must be a positive integer (5.2.21)".into()))?;
-        out.insert("lastN".into(), v.to_string());
+    // TS 104 175 5.2.5: firstN, lastN and offsetN are TemporalParams
+    // scoped within temporalQ; the query-string parser judges the pair
+    for (k, min, what) in [
+        ("lastN", 1, "a positive"),
+        ("firstN", 1, "a positive"),
+        ("offsetN", 0, "a non-negative"),
+    ] {
+        if let Some(n) = tq.get(k) {
+            let v = n
+                .as_u64()
+                .filter(|v| *v >= min)
+                .ok_or_else(|| bad(format!("temporalQ {k} must be {what} integer (5.2.21)")))?;
+            out.insert(k.into(), v.to_string());
+        }
     }
     match tq.get("aggrMethods") {
         None => {}
@@ -1008,9 +1196,29 @@ mod tests {
     #[test]
     fn limit_above_the_ceiling_is_too_many_results() {
         let st = state();
+        // the ceiling is the one setting, 1,000 unless ANTARES_MAX_LIMIT says otherwise
+        assert_eq!((st.max_limit, *crate::bounds::MAX_LIMIT), (1000, 1000));
+        let at_max = st.max_limit.to_string();
+        assert!(paginate(&st, &params(&[("limit", &at_max)]), items(1), "/e").is_ok());
         let over = (st.max_limit + 1).to_string();
         let err = paginate(&st, &params(&[("limit", &over)]), items(1), "/e").unwrap_err();
         assert!(format!("{err:?}").contains("TooManyResults"));
+    }
+
+    /// Default 100, maximum 1,000: a request naming no
+    /// `limit` gets 100 Entities and a next Link; `limit=1000` gets 1,000.
+    #[test]
+    fn no_limit_answers_the_default_100_and_limit_1000_answers_1000() {
+        let st = state();
+        assert_eq!(
+            (st.default_limit, *crate::bounds::DEFAULT_LIMIT),
+            (100, 100)
+        );
+        let (page, _, links) = paginate(&st, &params(&[]), items(1001), "/e").unwrap();
+        assert_eq!(page.len(), 100);
+        assert!(links.iter().any(|l| l.contains("rel=\"next\"")));
+        let (page, _, _) = paginate(&st, &params(&[("limit", "1000")]), items(1001), "/e").unwrap();
+        assert_eq!(page.len(), 1000);
     }
 
     /// 4.13: the result count is relayed "whenever this is requested by the
@@ -1082,6 +1290,24 @@ mod tests {
                 "urn:absent"
             ]
         );
+    }
+
+    /// each document's ordering value is read once, before the sort;
+    /// the order is the comparison's, and Entities that tie keep the order
+    /// the store gave them.
+    #[test]
+    fn a_tie_keeps_the_store_order_and_desc_reverses_the_values() {
+        let ctx = Loader::new().core();
+        let mut docs: Vec<Value> = (0..200)
+            .map(|n| ent(&format!("urn:{n:03}"), "level", json!(n % 7)))
+            .collect();
+        let mut want: Vec<String> = ids(&docs).into_iter().map(str::to_owned).collect();
+        want.sort_by_key(|id| {
+            let n: i64 = id.trim_start_matches("urn:").parse().unwrap_or(0);
+            std::cmp::Reverse(n % 7)
+        });
+        order_entities(&mut docs, "level;desc", &params(&[]), &ctx).expect("order");
+        assert_eq!(ids(&docs), want);
     }
 
     /// 4.23.3 EXAMPLES 8/9: dist-asc / dist-desc rank by haversine distance

@@ -15,7 +15,6 @@ use axum::middleware::Next;
 use axum::response::Response;
 use serde_json::Value;
 
-/// Members of an entity that are NOT attributes.
 /// `"major.minor"` (4.3.6.8; a patch part as in `1.9.1` is tolerated).
 pub(crate) fn parse_version(s: &str) -> Option<(u32, u32)> {
     let mut it = s.trim().split('.');
@@ -322,7 +321,7 @@ pub async fn prefer_version_layer(req: Request<Body>, next: Next) -> Response {
                 return Response::from_parts(parts, Body::empty());
             }
             Some(Ok(chunk)) => {
-                if buf.len() + chunk.len() > *crate::bounds::MAX_BODY_BYTES {
+                if buf.len().saturating_add(chunk.len()) > *crate::bounds::MAX_BODY_BYTES {
                     // stitch the already-read prefix back in front of the
                     // untouched remainder of the stream
                     let read = futures_util::stream::iter([

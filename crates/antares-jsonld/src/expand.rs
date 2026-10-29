@@ -204,6 +204,15 @@ pub fn expand_entity(
         None if opts.fragment => {}
         None => return Err(bad("entity type is required")),
     }
+    // TS 104 175 Annex B: the type-scoped core contexts of the Entity's
+    // types name its own members. A fragment without a type has none in
+    // force, as a JSON-LD processor sees the same body.
+    let types: Vec<&str> = out
+        .get("type")
+        .and_then(Value::as_array)
+        .map(|ts| ts.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let members = ctx.within_types(&types);
 
     // scope
     if let Some(v) = doc.get("scope") {
@@ -309,7 +318,7 @@ pub fn expand_entity(
         if key.is_empty() {
             return Err(bad("empty attribute name"));
         }
-        let iri = expand_attr_name(key, ctx)?;
+        let iri = expand_attr_name(key, &members)?;
         // 4.5.1: core non-reified terms shall not be used as Attribute names.
         if iri
             .strip_prefix(crate::context::NGSI_LD_BASE)
@@ -319,7 +328,7 @@ pub fn expand_entity(
                 "{key} is a core non-reified term and cannot be used as an Attribute name (4.5.1)"
             )));
         }
-        let instances = expand_attribute(key, v, ctx, opts, 0)?;
+        let instances = expand_attribute(key, v, &ctx.within(&iri), opts, 0)?;
         if GEO_ENTITY_MEMBERS.contains(&iri.as_str()) {
             for inst in &instances {
                 let t = inst.get("type").and_then(Value::as_str);
@@ -357,6 +366,11 @@ pub fn expand_types(v: &Value, ctx: &Context) -> Result<Vec<Value>, NgsiError> {
     // is a JSON-LD-keyword alias in the @context (e.g. "type" → "@type") is
     // invalid (001_02_04).
     let one = |t: &str| -> Result<Value, NgsiError> {
+        // 4.5.0: the NGSI-LD Null asks for a deletion, and an Entity's type
+        // is mandatory (4.5.1): it is never a type, not even on a merge.
+        if is_ngsi_null(&Value::String(t.to_owned())) {
+            return Err(bad("the NGSI-LD Null is no Entity Type (4.5.0, 4.5.1)"));
+        }
         // 4.6.2: Entity Type names obey the name grammar (BadRequestData).
         if !valid_name(t) {
             return Err(bad(&format!(
@@ -401,6 +415,21 @@ pub fn expanded_id(v: &Value) -> Result<&str, NgsiError> {
     v.get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| NgsiError::InternalError("expanded entity carries no id".into()))
+}
+
+/// The `id` of an expanded Entity about to be created. 5.7.2 names Entities
+/// by a comma-separated `id` list, so an id holding a comma could never be
+/// queried by id and splits in two on every page rebuilt from such a list
+/// (EntityMap, temporal pages, federation forwards): refused at create.
+pub fn new_entity_id(v: &Value) -> Result<&str, NgsiError> {
+    let id = expanded_id(v)?;
+    if id.contains(',') {
+        return Err(NgsiError::BadRequestData(format!(
+            "entity id {id:?} holds a comma: an id query (5.7.2) names Entities as a comma-separated list, so such an id cannot be created; use another character, e.g. {:?}",
+            id.replace(',', "-")
+        )));
+    }
+    Ok(id)
 }
 
 /// 4.5.1/5.5.4: an Attribute or sub-Attribute name shall expand to an
@@ -511,9 +540,7 @@ pub fn is_ngsi_null_langmap(v: &Value) -> bool {
 /// 4.5.21.2/4.5.22.2: a List deletion is "an array consisting of a single
 /// NGSI-LD Null" as the valueList/objectList (bare null tolerated too).
 pub fn is_ngsi_null_list(v: &Value) -> bool {
-    is_ngsi_null(v)
-        || v.as_array()
-            .is_some_and(|a| a.len() == 1 && is_ngsi_null(&a[0]))
+    is_ngsi_null(v) || matches!(v.as_array().map(Vec::as_slice), Some([only]) if is_ngsi_null(only))
 }
 
 /// Whole-instance deletion marker (merge patch, 5.5.12).
@@ -527,6 +554,16 @@ pub fn is_deletion_instance(inst: &Value) -> bool {
                 || o.get("vocab").is_some_and(is_ngsi_null)
                 || o.get("valueList").is_some_and(is_ngsi_null_list)
                 || o.get("objectList").is_some_and(is_ngsi_null_list)
+        })
+}
+
+/// Whether a fragment member removes its target member (5.5.12, 10.2.5.4): JSON null, the
+/// NGSI-LD Null, or a sub-Attribute every instance of which is a deletion instance.
+pub fn removes_member(v: &Value) -> bool {
+    v.is_null()
+        || is_ngsi_null(v)
+        || v.as_array().is_some_and(|instances| {
+            !instances.is_empty() && instances.iter().all(is_deletion_instance)
         })
 }
 
@@ -548,7 +585,7 @@ pub fn valid_scope_value(s: &str) -> bool {
 /// (the spec's prefix:name production) and is outside the term grammar.
 // Known ceiling: colon-keys are exempt wholesale — a malformed "pre fix:x" slips
 // through as an IRI; tighten to per-part validation if it ever matters.
-pub(crate) fn valid_name(s: &str) -> bool {
+pub fn valid_name(s: &str) -> bool {
     if s.contains(':') {
         return true;
     }
@@ -638,6 +675,13 @@ fn check_prohibited_members(
                 "attribute {name}: {m} is not allowed on a {attr_type} (4.5.2.2)"
             )));
         }
+    }
+    // 5.2.6/5.2.37: a Relationship's members name an object, never a
+    // datatype; valueType belongs to a Property value (4.5.2.2).
+    if obj.contains_key("valueType") && matches!(attr_type, "Relationship" | "ListRelationship") {
+        return Err(bad(format!(
+            "attribute {name}: valueType is not allowed on a {attr_type} (5.2.6)"
+        )));
     }
     if let Some(m) = OUTPUT_ONLY.iter().find(|m| obj.contains_key(**m)) {
         return Err(bad(format!(
@@ -729,20 +773,30 @@ fn expand_common_members(
             out.insert("datasetId".into(), d);
         }
     }
-    if let Some(o) = obj.get("observedAt") {
+    // 5.5.12: in a merge (or partial update) input the NGSI-LD Null removes the member
+    let nulls = opts.allow_null || opts.merge;
+    for k in ["observedAt", "expiresAt"] {
+        if let Some(v) = obj.get(k).filter(|v| nulls && is_ngsi_null(v)) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    if let Some(o) = obj
+        .get("observedAt")
+        .filter(|v| !(nulls && is_ngsi_null(v)))
+    {
         let s = o
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid observedAt")))?;
-        out.insert("observedAt".into(), Value::String(s.to_owned()));
+        out.insert("observedAt".into(), Value::String(point_fraction(s)));
     }
-    if let Some(e) = obj.get("expiresAt") {
+    if let Some(e) = obj.get("expiresAt").filter(|v| !(nulls && is_ngsi_null(v))) {
         // 4.22 transient attribute instances carry their own expiresAt.
         let s = e
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid expiresAt")))?;
-        out.insert("expiresAt".into(), Value::String(s.to_owned()));
+        out.insert("expiresAt".into(), Value::String(point_fraction(s)));
     }
     if opts.sys {
         // 4.8/4.5.7: deletedAt marks a deletion instance in a Temporal
@@ -839,8 +893,37 @@ fn expand_instance(
             return Ok(json!({"type": "Property", "value": prim.clone()}));
         }
     };
+    // The core @context aliases type to @type: an Attribute written with the
+    // keyword is the same document, one with both names collides (JSON-LD
+    // 1.1 API expansion "colliding keywords").
+    let aliased;
+    let obj = match obj.get("@type") {
+        Some(_) if obj.contains_key("type") => {
+            return Err(bad(format!("attribute {name}: both type and @type given")))
+        }
+        Some(t) => {
+            let mut m = obj.clone();
+            m.remove("@type");
+            m.insert("type".into(), t.clone());
+            aliased = m;
+            &aliased
+        }
+        None => obj,
+    };
+    let core;
+    let obj = match core_members(name, obj, ctx)? {
+        Some(m) => {
+            core = m;
+            &core
+        }
+        None => obj,
+    };
 
-    let declared = obj.get("type").and_then(Value::as_str);
+    let declared = match obj.get("type") {
+        None => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(t) => return Err(bad(format!("attribute {name}: type {t} is not a string"))),
+    };
     let attr_type: &str = match declared {
         Some(t) if ATTR_TYPES.contains(&t) => t,
         Some(t) if GEO_TYPES.contains(&t) && obj.contains_key("coordinates") => {
@@ -890,6 +973,11 @@ fn expand_instance(
             } else {
                 // whole object is a Property value (4.5.2.3)
                 check_value_nulls(name, v, opts)?;
+                if embeds_context(v) {
+                    return Err(bad(format!(
+                        "attribute {name}: embedded @context is not allowed (4.5.1/5.5.7)"
+                    )));
+                }
                 return Ok(json!({"type": "Property", "value": v.clone()}));
             }
         }
@@ -909,6 +997,16 @@ fn expand_instance(
             if val.is_null() {
                 return Err(bad(format!(
                     "attribute {name}: JSON null is not a valid value (use \"urn:ngsi-ld:null\")"
+                )));
+            }
+            if let Some(vo) = val.as_object().filter(|o| o.contains_key("@value")) {
+                check_value_object(name, vo, ctx)?;
+            }
+            // 5.5.7: no part of a user @context below the top level, a
+            // structured Property value included
+            if embeds_context(val) {
+                return Err(bad(format!(
+                    "attribute {name}: embedded @context is not allowed (4.5.1/5.5.7)"
                 )));
             }
             out.insert("value".into(), val.clone());
@@ -973,13 +1071,7 @@ fn expand_instance(
             let ok = if is_ngsi_null_langmap(lm) {
                 opts.allow_null
             } else {
-                lm.as_object().is_some_and(|m| {
-                    m.keys().all(|k| !k.is_empty())
-                        && m.values().all(|v| {
-                            v.is_string()
-                                || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
-                        })
-                })
+                valid_language_map(lm)
             };
             if !ok {
                 return Err(bad(format!("attribute {name}: invalid languageMap")));
@@ -987,18 +1079,23 @@ fn expand_instance(
             out.insert("languageMap".into(), lm.clone());
         }
         "JsonProperty" => {
-            // 4.5.24.2: json is "a raw JSON object (or array of objects)" —
-            // never expanded or compacted; kept verbatim. The bare NGSI-LD
-            // Null deletion form passes through under allow_null.
+            // TS 104 175 5.2.6.4.10 types json by the NGSI-LD Value of 3.1:
+            // "JSON value (i.e. a string, a number, true or false, an object,
+            // an array)" — CIM 009 4.5.24.2's object-only rule is lifted.
+            // Never expanded or compacted; kept verbatim. JSON null
+            // is no NGSI-LD Value; the bare NGSI-LD Null is the deletion form
+            // and passes only under allow_null.
             let j = obj
                 .get("json")
                 .ok_or_else(|| bad(format!("attribute {name}: needs json")))?;
-            let ok = j.is_object()
-                || j.as_array().is_some_and(|a| a.iter().all(Value::is_object))
-                || (opts.allow_null && is_ngsi_null(j));
+            let ok = if is_ngsi_null(j) {
+                opts.allow_null
+            } else {
+                !j.is_null()
+            };
             if !ok {
                 return Err(bad(format!(
-                    "attribute {name}: json must be an object or array of objects"
+                    "attribute {name}: json must be a JSON value (string, number, boolean, object or array), not null"
                 )));
             }
             out.insert("json".into(), j.clone());
@@ -1097,7 +1194,7 @@ fn expand_instance(
             return Err(bad(format!("attribute {name}: empty sub-attribute name")));
         }
         let iri = expand_attr_name(k, ctx)?;
-        let instances = expand_attribute(k, sub, ctx, opts, depth + 1)?;
+        let instances = expand_attribute(k, sub, &ctx.within(&iri), opts, depth.saturating_add(1))?;
         // 4.5.5.1 again, one level down: two sub-attribute names expanding to
         // one IRI would drop whichever the map orders first.
         if out.insert(iri.clone(), Value::Array(instances)).is_some() {
@@ -1151,6 +1248,126 @@ fn expand_instance(
     Ok(Value::Object(out))
 }
 
+/// 5.5.7: "The term to URI expansion or compaction shall be performed using a
+/// @context as described by the JSON-LD specification", so a core member
+/// written as its full IRI (`https://uri.etsi.org/ngsi-ld/observedAt`,
+/// `.../hasValue`) or an Attribute type written as one
+/// (`https://uri.etsi.org/ngsi-ld/Property`) is the same document as the one
+/// using the term. Matched by the short key alone, the IRI spelling became a
+/// sub-Property. `None` when nothing is spelled out.
+fn core_members(
+    name: &str,
+    obj: &Map<String, Value>,
+    ctx: &Context,
+) -> Result<Option<Map<String, Value>>, NgsiError> {
+    let core = |k: &str| -> Option<&'static str> {
+        if !k.starts_with(crate::context::NGSI_LD_BASE) {
+            return None;
+        }
+        RESERVED_MEMBERS
+            .iter()
+            .copied()
+            .find(|r| *r != "type" && ctx.expand_key(r) == k)
+    };
+    let type_iri = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(|t| t.strip_prefix(crate::context::NGSI_LD_BASE))
+        .filter(|t| ATTR_TYPES.contains(t));
+    if type_iri.is_none() && !obj.keys().any(|k| core(k).is_some()) {
+        return Ok(None);
+    }
+    let mut out = Map::new();
+    for (k, v) in obj {
+        let (key, v) = match (k.as_str(), core(k)) {
+            ("type", _) => (
+                "type",
+                type_iri.map_or_else(|| v.clone(), |t| Value::String(t.into())),
+            ),
+            (_, Some(term)) => (term, v.clone()),
+            (k, None) => (k, v.clone()),
+        };
+        if out.insert(key.to_owned(), v).is_some() {
+            return Err(NgsiError::BadRequestData(format!(
+                "attribute {name}: {key} given both as a term and as its IRI (5.5.7)"
+            )));
+        }
+    }
+    Ok(Some(out))
+}
+
+/// 4.5.18.2: "a JSON object consisting of a set of non-empty language tags
+/// ... or the language tag "@none"", each a string or an array of strings.
+fn valid_language_map(lm: &Value) -> bool {
+    lm.as_object().is_some_and(|m| {
+        m.keys().all(|k| k == "@none" || is_language_tag(k))
+            && m.values().all(|v| {
+                v.is_string() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+            })
+    })
+}
+
+/// Whether a JSON value holds an `@context` member at any depth.
+fn embeds_context(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.contains_key("@context") || m.values().any(embeds_context),
+        Value::Array(a) => a.iter().any(embeds_context),
+        _ => false,
+    }
+}
+
+/// A Property value carrying `@value` is a JSON-LD value object (JSON-LD
+/// 1.1 section 9.5): "MUST NOT contain any other keys" than `@type`,
+/// `@language`, `@direction`, `@index` and `@context`, and a typed one's
+/// `@type` is an IRI string. Typed as `DateTime`, its `@value` is a 4.6.3
+/// DateTime.
+fn check_value_object(name: &str, vo: &Map<String, Value>, ctx: &Context) -> Result<(), NgsiError> {
+    let bad = |m: &str| Err(NgsiError::BadRequestData(format!("attribute {name}: {m}")));
+    if let Some(k) = vo.keys().find(|k| {
+        !matches!(
+            k.as_str(),
+            "@value" | "@type" | "@language" | "@direction" | "@index" | "@context"
+        )
+    }) {
+        return bad(&format!(
+            "value object member {k:?} is not allowed (JSON-LD 1.1 9.5)"
+        ));
+    }
+    match vo.get("@type") {
+        None => Ok(()),
+        Some(Value::String(t)) => {
+            let datetime = format!("{}DateTime", crate::context::NGSI_LD_BASE);
+            let is_datetime = ctx.expand_key(t) == datetime || *t == datetime;
+            if is_datetime
+                && !vo
+                    .get("@value")
+                    .and_then(Value::as_str)
+                    .is_some_and(parse_datetime)
+            {
+                return bad("a DateTime value object needs an ISO 8601 DateTime @value (4.6.3)");
+            }
+            Ok(())
+        }
+        Some(_) => bad("value object @type must be a string (JSON-LD 1.1 9.5)"),
+    }
+}
+
+/// RFC 5646 section 2.1 well-formedness, as far as the shape goes: hyphen
+/// separated subtags of 1-8 letters or digits, led by a 2-8 letter language
+/// or the `x`/`i` singleton of a private-use or grandfathered tag.
+// No registry lookup, so a well-formed but unregistered subtag passes
+fn is_language_tag(tag: &str) -> bool {
+    let mut subtags = tag.split('-');
+    let first = subtags.next().unwrap_or_default();
+    let lead = (2..=8).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_alphabetic());
+    let singleton = matches!(first, "x" | "X" | "i" | "I");
+    let rest: Vec<&str> = subtags.collect();
+    (lead || (singleton && !rest.is_empty()))
+        && rest
+            .iter()
+            .all(|t| (1..=8).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
 /// Expand a PARTIAL-UPDATE attribute fragment (5.6.4): reserved members are
 /// kept, others become sub-attributes — and crucially NO attribute-type
 /// inference happens (a fragment `{providedBy: …}` patches the sub-attribute,
@@ -1178,6 +1395,11 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
             }
             // 4.6.3: both members are ISO 8601 DateTimes (4.8 observedAt,
             // 4.22 expiresAt) — the same check the full-instance path runs.
+            // 10.2.5.4: "NGSI-LD Nulls should be supported by this operation": the Null
+            // removes the member from the patched instance (5.5.12).
+            "observedAt" | "expiresAt" if is_ngsi_null(v) => {
+                out.insert(k.clone(), v.clone());
+            }
             "observedAt" | "expiresAt" => {
                 let sdt = v
                     .as_str()
@@ -1207,6 +1429,11 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                     out.insert("datasetId".into(), d);
                 }
             }
+            "languageMap"
+                if !(is_ngsi_null(v) || is_ngsi_null_langmap(v) || valid_language_map(v)) =>
+            {
+                return Err(bad("invalid languageMap in fragment (4.5.18.2)".into()));
+            }
             _ if RESERVED_MEMBERS.contains(&k.as_str()) => {
                 out.insert(k.clone(), v.clone());
             }
@@ -1215,7 +1442,7 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                 let instances = expand_attribute(
                     k,
                     v,
-                    ctx,
+                    &ctx.within(&iri),
                     ExpandOpts {
                         fragment: true,
                         allow_null: true,
@@ -1255,7 +1482,7 @@ fn validate_dataset_ids(name: &str, instances: &[Value]) -> Result<(), NgsiError
                     )));
                 }
             }
-            None => default_count += 1,
+            None => default_count = default_count.saturating_add(1),
         }
     }
     if default_count > 1 {
@@ -1379,28 +1606,26 @@ pub fn validate_geojson(name: &str, v: &Value) -> Result<(), NgsiError> {
 /// the right places, and letting it through let one write make every later
 /// temporal query in that tenant fail on the `::timestamptz` cast.
 pub fn parse_datetime(s: &str) -> bool {
-    let b = s.as_bytes();
-    // shortest legal form is 19 chars + the mandatory Z
-    if b.len() < 20 || b.last() != Some(&b'Z') {
+    // the mandatory Z, then at least YYYY-MM-DDThh:mm:ss
+    let Some(body) = s.strip_suffix('Z') else {
+        return false;
+    };
+    let [y0, y1, y2, y3, b'-', mo0, mo1, b'-', d0, d1, b'T', h0, h1, b':', mi0, mi1, b':', s0, s1, ..] =
+        body.as_bytes()
+    else {
+        return false;
+    };
+    if ![y0, y1, y2, y3, mo0, mo1, d0, d1, h0, h1, mi0, mi1, s0, s1]
+        .iter()
+        .all(|c| c.is_ascii_digit())
+    {
         return false;
     }
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
-    let shape = digits(0..4)
-        && b[4] == b'-'
-        && digits(5..7)
-        && b[7] == b'-'
-        && digits(8..10)
-        && b[10] == b'T'
-        && digits(11..13)
-        && b[13] == b':'
-        && digits(14..16)
-        && b[16] == b':'
-        && digits(17..19);
-    if !shape {
+    // the 19 bytes matched above are ASCII, so both cuts are char boundaries
+    let (Some(seconds), Some(frac)) = (body.get(..19), body.get(19..)) else {
         return false;
-    }
+    };
     // between second 19 and the trailing Z: nothing, or a fraction of 1..=6
-    let frac = &s[19..s.len() - 1];
     if !frac.is_empty() {
         let Some(rest) = frac.strip_prefix('.').or_else(|| frac.strip_prefix(',')) else {
             return false;
@@ -1410,14 +1635,22 @@ pub fn parse_datetime(s: &str) -> bool {
         }
     }
     // real calendar date/time, not just digits in the right slots
-    let normalized = format!("{}Z", &s[..19]);
+    let normalized = format!("{seconds}Z");
     chrono::DateTime::parse_from_rfc3339(&normalized).is_ok()
+}
+
+/// A DateTime `parse_datetime` accepted, with a comma fraction separator
+/// turned into the decimal point (4.6.3: the comma only "In requests").
+fn point_fraction(s: &str) -> String {
+    match s.get(19..20) {
+        Some(",") => format!("{}.{}", &s[..19], &s[20..]),
+        _ => s.to_owned(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     /// 4.5.5.1: explicit "datasetId": "@none" designates the default
@@ -1798,10 +2031,97 @@ mod tests {
                                  "@context": {"x": "https://e/x"}}}
         });
         assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err());
+        // inside a structured Property value, normalized and concise
+        for speed in [
+            json!({"type": "Property", "value": {"street": "Main", "@context": "https://e/c"}}),
+            json!({"street": "Main", "n": [{"@context": "https://e/c"}]}),
+        ] {
+            let doc = json!({"id": "urn:x", "type": "T", "speed": speed});
+            assert!(
+                expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err()
+            );
+        }
+        // a JsonProperty's json is opaque (@json): an @context there is data
+        let doc = json!({"id": "urn:x", "type": "T",
+                         "cfg": {"type": "JsonProperty", "json": {"@context": "https://e/c"}}});
+        assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_ok());
+    }
+
+    /// The core @context aliases type to @type (Coraine
+    /// duplicate_id_type_alias_every_level 01, 02, 04).
+    #[test]
+    fn attribute_type_keyword_alias() {
+        let doc = json!({"id": "urn:x", "type": "T", "p": {"@type": "Property", "value": 1}});
+        let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).unwrap();
+        let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
+        assert_eq!(p["type"], json!("Property"));
+        assert_eq!(p.get("@type"), None);
+        for p in [
+            json!({"type": "Property", "@type": "Property", "value": 1}),
+            json!({"type": "Property", "value": 1, "s": {"type": "Property", "@type": "Property", "value": 2}}),
+        ] {
+            let doc = json!({"id": "urn:x", "type": "T", "p": p});
+            assert!(
+                expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err()
+            );
+        }
+    }
+
+    /// 5.2.6: a Relationship has no valueType member (Coraine value_type_subattr 03).
+    #[test]
+    fn value_type_on_a_relationship_rejected() {
+        for r in [
+            json!({"type": "Relationship", "object": "urn:o", "valueType": "Integer"}),
+            json!({"type": "ListRelationship", "objectList": [{"object": "urn:o"}], "valueType": "Integer"}),
+        ] {
+            let doc = json!({"id": "urn:x", "type": "T", "r": r});
+            assert!(
+                expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err()
+            );
+        }
+        let ok = json!({"id": "urn:x", "type": "T", "p": {"type": "Property", "value": 1, "valueType": "Integer"}});
+        assert!(expand_entity(ok.as_object().unwrap(), &core(), ExpandOpts::default()).is_ok());
+    }
+
+    /// 5.5.7: a core member or Attribute type spelled as its full IRI
+    /// expands to the same document as the term.
+    #[test]
+    fn a_core_member_iri_is_the_member() {
+        let iri = |t: &str| format!("{}{t}", crate::context::NGSI_LD_BASE);
+        let pairs = [
+            (
+                json!({"type": "Property", "value": 1, iri("observedAt"): "2026-01-01T00:00:00Z"}),
+                json!({"type": "Property", "value": 1, "observedAt": "2026-01-01T00:00:00Z"}),
+            ),
+            (
+                json!({"type": iri("Relationship"), iri("hasObject"): "urn:o"}),
+                json!({"type": "Relationship", "object": "urn:o"}),
+            ),
+            (
+                json!({"type": iri("Unknown"), "value": 1}),
+                json!({"type": iri("Unknown"), "value": 1}),
+            ),
+        ];
+        for (sent, same) in pairs {
+            let a = json!({"id": "urn:x", "type": "T", "p": sent});
+            let b = json!({"id": "urn:x", "type": "T", "p": same});
+            let got = expand_entity(a.as_object().unwrap(), &core(), ExpandOpts::default())
+                .map_err(|e| e.to_string());
+            let want = expand_entity(b.as_object().unwrap(), &core(), ExpandOpts::default())
+                .map_err(|e| e.to_string());
+            assert_eq!(got, want);
+        }
+        let both = json!({"id": "urn:x", "type": "T", "p": {"type": "Property", "value": 1, iri("hasValue"): 2}});
+        let err = expand_entity(both.as_object().unwrap(), &core(), ExpandOpts::default())
+            .map_err(|e| e.to_string());
+        let refused = err
+            .err()
+            .map(|e| e.contains("given both as a term and as its IRI"));
+        assert_eq!(refused, Some(true));
     }
 
     fn core() -> std::sync::Arc<Context> {
-        Loader::new().core()
+        std::sync::Arc::new(crate::core_context())
     }
 
     #[test]
@@ -1860,6 +2180,136 @@ mod tests {
         assert_eq!(speed[0]["value"], 55);
         let brand = &out["https://uri.etsi.org/ngsi-ld/default-context/brand"];
         assert_eq!(brand.as_array().unwrap().len(), 2);
+    }
+
+    /// 4.5.2.2: "type": "Equal to "Property""; a type that is no string
+    /// names no attribute type (Coraine attribute_type_invalid).
+    #[test]
+    fn rejects_an_attribute_type_that_is_no_string() {
+        for t in [
+            serde_json::json!(42),
+            serde_json::json!(["Property"]),
+            serde_json::json!({}),
+        ] {
+            let doc = serde_json::json!({"id": "urn:a", "type": "T", "p": {"type": t, "value": 1}});
+            let err = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default());
+            assert!(err.is_err(), "{t}");
+        }
+    }
+
+    /// 4.6.3: the fraction separator is "a decimal point"; "In requests, also
+    /// a comma ... may be used", so what is stored, and later answered, uses
+    /// the point (Coraine datetime_comma_separator).
+    #[test]
+    fn a_comma_fraction_is_stored_with_a_decimal_point() {
+        let doc = serde_json::json!({"id": "urn:a", "type": "T", "p": {"type": "Property", "value": 1,
+            "observedAt": "2026-04-28T10:00:00,5Z", "expiresAt": "2099-01-01T00:00:00,25Z"}});
+        let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default())
+            .expect("expand");
+        let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
+        assert_eq!(p["observedAt"], "2026-04-28T10:00:00.5Z");
+        assert_eq!(p["expiresAt"], "2099-01-01T00:00:00.25Z");
+    }
+
+    /// 4.5.18.2: languageMap is "a JSON object"; a partial update fragment
+    /// is held to it as a create is (Coraine langprop_patch_attribute).
+    #[test]
+    fn a_fragment_language_map_is_an_object_of_strings() {
+        for bad in [
+            serde_json::json!(13),
+            serde_json::json!({"en": 1}),
+            serde_json::json!({"": "x"}),
+        ] {
+            let f = serde_json::json!({"languageMap": bad});
+            assert!(
+                expand_attr_fragment(f.as_object().unwrap(), &core()).is_err(),
+                "{bad}"
+            );
+        }
+        for ok in [
+            serde_json::json!({"en": "x", "es": ["y"]}),
+            serde_json::json!({"@none": "urn:ngsi-ld:null"}),
+            serde_json::json!("urn:ngsi-ld:null"),
+        ] {
+            let f = serde_json::json!({"languageMap": ok});
+            assert!(
+                expand_attr_fragment(f.as_object().unwrap(), &core()).is_ok(),
+                "{ok}"
+            );
+        }
+    }
+
+    /// JSON-LD 1.1 9.5 value objects and 4.6.3 DateTime in a Property value
+    /// (Coraine value_type_atvalue_validation, entity_attr_typed_value_object).
+    #[test]
+    fn a_property_value_object_is_checked() {
+        let attempt = |value: serde_json::Value| {
+            let doc = serde_json::json!({"id": "urn:ngsi-ld:E:1", "type": "T",
+                "p": {"type": "Property", "value": value}});
+            expand_entity(
+                doc.as_object().expect("object"),
+                &core(),
+                ExpandOpts::default(),
+            )
+        };
+        for bad in [
+            serde_json::json!({"@type": 1, "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "DateTime", "a": 19, "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "DateTime", "@value": 12}),
+            serde_json::json!({"@type": "DateTime", "@value": "banana"}),
+        ] {
+            assert!(attempt(bad.clone()).is_err(), "{bad}");
+        }
+        for ok in [
+            serde_json::json!({"@type": "DateTime", "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "xsd:integer", "@value": 42}),
+            serde_json::json!({"@value": "plain", "@language": "en"}),
+            serde_json::json!({"a": 1, "b": 2}),
+        ] {
+            assert!(attempt(ok.clone()).is_ok(), "{ok}");
+        }
+    }
+
+    /// 4.5.18.2: languageMap keys are RFC 5646 language tags (Coraine
+    /// languagemap_key_rfc5646).
+    #[test]
+    fn language_map_keys_are_rfc_5646_tags() {
+        for ok in [
+            "en",
+            "en-US",
+            "zh-Hans-CN",
+            "x-private",
+            "i-klingon",
+            "@none",
+        ] {
+            assert!(valid_language_map(&serde_json::json!({ok: "t"})), "{ok}");
+        }
+        for bad in [
+            "",
+            "123",
+            "!!",
+            "en_US",
+            "en-",
+            "e",
+            "x",
+            "this is not a language",
+            "en-toolongsubtag",
+        ] {
+            assert!(!valid_language_map(&serde_json::json!({bad: "t"})), "{bad}");
+        }
+    }
+
+    /// 4.5.0, 4.5.1: the NGSI-LD Null is never an Entity Type, alone or in
+    /// an array (Coraine entity_member_delete_and_null 12-13).
+    #[test]
+    fn the_ngsi_null_is_no_entity_type() {
+        for v in [
+            serde_json::json!("urn:ngsi-ld:null"),
+            serde_json::json!(["T", "urn:ngsi-ld:null"]),
+        ] {
+            assert!(expand_types(&v, &core()).is_err(), "{v}");
+        }
+        assert!(expand_types(&serde_json::json!("T"), &core()).is_ok());
     }
 
     #[test]
@@ -2021,8 +2471,8 @@ mod tests {
         assert!(!parse_datetime("2020-09-09T16:40:00.1234567Z"), "7 digits");
         assert!(!parse_datetime("2020-09-09T16:40:00123Z"), "no separator");
         // calendar reality — digit-shape alone let this through, and one such
-        // write made every later temporal query in the tenant 500 on the
-        // ::timestamptz cast
+        // write made every later temporal query in the tenant 500 on the:
+        // :timestamptz cast
         assert!(!parse_datetime("2026-13-45T00:00:00Z"), "month 13, day 45");
         assert!(
             !parse_datetime("2021-02-29T00:00:00Z"),
@@ -2497,8 +2947,8 @@ mod tests {
         ty(json!("Škola")).expect("unicode-letter type");
     }
 
-    /// 4.5.24.2/4.5.24.3: JsonProperty — json is a raw object or array of
-    /// objects (kept verbatim), unitCode and value prohibited, concise
+    /// 4.5.24.2/4.5.24.3, TS 104 175 5.2.6.4.10: JsonProperty — json is any
+    /// NGSI-LD Value (kept verbatim), unitCode and value prohibited, concise
     /// inference from json.
     #[test]
     fn json_property_rules() {
@@ -2524,8 +2974,26 @@ mod tests {
             out["https://uri.etsi.org/ngsi-ld/default-context/tickets"][0]["type"],
             "JsonProperty"
         );
-        // scalar json rejected
-        let doc = mk(json!({"type": "JsonProperty", "json": 5}));
+        // TS 104 175 5.2.6.4.10: every NGSI-LD Value kind, kept verbatim
+        for j in [
+            json!(5),
+            json!("x"),
+            json!(true),
+            json!(["a"]),
+            json!([1, {"a": 1}]),
+        ] {
+            let doc = mk(json!({"type": "JsonProperty", "json": j}));
+            let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default())
+                .expect("any JSON value");
+            assert_eq!(
+                out["https://uri.etsi.org/ngsi-ld/default-context/tickets"][0]["json"],
+                j
+            );
+        }
+        // JSON null is no NGSI-LD Value; the NGSI-LD Null only deletes
+        let doc = mk(json!({"type": "JsonProperty", "json": null}));
+        assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err());
+        let doc = mk(json!({"type": "JsonProperty", "json": "urn:ngsi-ld:null"}));
         assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err());
         // unitCode prohibited
         let doc = mk(json!({"type": "JsonProperty", "json": {"a": 1}, "unitCode": "MTR"}));
@@ -2677,12 +3145,11 @@ mod bench {
     /// The go/no-go threshold for a hand-rolled JSON-LD processor was
     /// ≥5k expansions/s/core. Antares hand-rolled its processor from day one
     /// rather than forking a `json-ld` crate — this measures it. Run with
-    /// `cargo test -p antares-jsonld --release -- --ignored bench_expansion`.
+    /// `cargo test -p ngsild-jsonld --release -- --ignored bench_expansion`.
     #[test]
     #[ignore = "benchmark — run explicitly in release"]
     fn bench_expansion_rate() {
-        let loader = crate::Loader::new();
-        let ctx = loader.core();
+        let ctx = crate::core_context();
         let entity: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
             r#"{
             "id": "urn:ngsi-ld:Vehicle:bench-1", "type": "Vehicle",
@@ -2720,13 +3187,12 @@ mod bench {
 #[cfg(test)]
 mod clause_4_18 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -2788,7 +3254,7 @@ mod clause_4_18 {
         let merge = |s: serde_json::Value| {
             expand_entity(
                 with_scope(s).as_object().expect("obj"),
-                &Loader::new().core(),
+                &std::sync::Arc::new(crate::core_context()),
                 ExpandOpts {
                     allow_null: true,
                     ..ExpandOpts::default()
@@ -2811,13 +3277,12 @@ mod clause_4_18 {
 #[cfg(test)]
 mod clause_5_2_1 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand_create(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(), // create: allow_null = false
         )
     }
@@ -2851,7 +3316,7 @@ mod clause_5_2_1 {
         let doc = json!({"p": {"type": "Property", "value": "urn:ngsi-ld:null"}});
         let out = expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts {
                 fragment: true,
                 allow_null: true,
@@ -2881,7 +3346,7 @@ mod clause_5_2_1 {
         });
         let e = expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts {
                 allow_null: true,
                 temporal: true,
@@ -2896,7 +3361,7 @@ mod clause_5_2_1 {
         let frag = json!({"expiresAt": "urn:ngsi-ld:null"});
         let out = expand_entity(
             frag.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts {
                 fragment: true,
                 allow_null: true,
@@ -2911,13 +3376,12 @@ mod clause_5_2_1 {
 #[cfg(test)]
 mod clause_5_2_4 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -2960,13 +3424,12 @@ mod clause_5_2_4 {
 #[cfg(test)]
 mod clause_5_2_5 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3024,13 +3487,12 @@ mod clause_5_2_5 {
 #[cfg(test)]
 mod clause_5_2_6 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3081,13 +3543,12 @@ mod clause_5_2_6 {
 #[cfg(test)]
 mod clause_5_2_32 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3148,13 +3609,12 @@ mod clause_5_2_32 {
 #[cfg(test)]
 mod clause_5_2_35 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3211,13 +3671,12 @@ mod clause_5_2_35 {
 #[cfg(test)]
 mod clause_5_2_36 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3253,13 +3712,12 @@ mod clause_5_2_36 {
 #[cfg(test)]
 mod clause_5_2_37 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3322,13 +3780,12 @@ mod clause_5_2_37 {
 #[cfg(test)]
 mod clause_5_2_38 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3337,8 +3794,8 @@ mod clause_5_2_38 {
         json!({"id": "urn:x", "type": "T", "payload": jp})
     }
 
-    /// Table 5.2.38-1: json is a mandatory raw JSON object or array of
-    /// objects, never expanded; unitCode prohibited (4.5.24.2); concise form
+    /// Table 5.2.38-1 / TS 104 175 Table 5.2.6.4.10-1: json is a mandatory
+    /// NGSI-LD Value, never expanded; unitCode prohibited (4.5.24.2); concise form
     /// infers JsonProperty from the json member.
     #[test]
     fn json_property_member_table_restrictions() {
@@ -3358,13 +3815,15 @@ mod clause_5_2_38 {
         .expect("array-of-objects form");
         let attr = &ok["https://uri.etsi.org/ngsi-ld/default-context/payload"][0];
         assert_eq!(attr["json"].as_array().map(Vec::len), Some(2));
-        assert!(
-            expand(with_jp(json!({"type": "JsonProperty", "json": 5}))).is_err(),
-            "json must be an object or array of objects"
+        let ok = expand(with_jp(json!({"type": "JsonProperty", "json": [1, 2]})))
+            .expect("TS 104 175 5.2.6.4.10: any JSON value");
+        assert_eq!(
+            ok["https://uri.etsi.org/ngsi-ld/default-context/payload"][0]["json"],
+            json!([1, 2])
         );
         assert!(
-            expand(with_jp(json!({"type": "JsonProperty", "json": [1, 2]}))).is_err(),
-            "array entries must be objects"
+            expand(with_jp(json!({"type": "JsonProperty", "json": null}))).is_err(),
+            "JSON null is no NGSI-LD Value"
         );
         assert!(
             expand(with_jp(json!({"type": "JsonProperty"}))).is_err(),
@@ -3386,13 +3845,12 @@ mod clause_5_2_38 {
 #[cfg(test)]
 mod clause_5_5_4 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3442,13 +3900,12 @@ mod clause_5_5_4 {
 #[cfg(test)]
 mod clause_5_2_7 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3483,7 +3940,6 @@ mod clause_5_2_7 {
 #[cfg(test)]
 mod reserved_member_guards {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     /// 4.5.1: an Attribute name is expanded against the @context, and the
@@ -3491,11 +3947,9 @@ mod reserved_member_guards {
     /// is a bare word stays a RELATIVE IRI. Expanding an attribute onto
     /// "id" must not be allowed to replace the Entity id (5.5.4
     /// BadRequestData), the same rule expand_types applies to type names.
-    #[tokio::test]
-    async fn attribute_name_must_expand_to_an_absolute_iri() {
-        let ctx = Loader::new()
-            .resolve_quiet(&json!({"hostile": {"@id": "id"}}))
-            .await
+    #[test]
+    fn attribute_name_must_expand_to_an_absolute_iri() {
+        let ctx = crate::resolve_with(&crate::PinnedOnly, &json!({"hostile": {"@id": "id"}}))
             .expect("inline @context");
         assert_eq!(ctx.expand_key("hostile"), "id", "term maps to a bare word");
 
@@ -3506,22 +3960,18 @@ mod reserved_member_guards {
             out.is_err(),
             "an attribute name that does not expand to an absolute IRI is BadRequestData, got {out:?}"
         );
-        // negative: the Entity id must still be its own URI string — never
-        // the attribute's instance array.
-        if let Ok(v) = &out {
-            assert_eq!(v["id"], "urn:ngsi-ld:Vehicle:1");
-        }
     }
 
     /// 4.5.1/5.5.4: the same at sub-attribute level — a term expanding onto
     /// "observedAt" would replace the validated DateTime with an instance
     /// array, bypassing the 4.6.3 DateTime check.
-    #[tokio::test]
-    async fn sub_attribute_name_must_not_overwrite_observed_at() {
-        let ctx = Loader::new()
-            .resolve_quiet(&json!({"hostile": {"@id": "observedAt"}}))
-            .await
-            .expect("inline @context");
+    #[test]
+    fn sub_attribute_name_must_not_overwrite_observed_at() {
+        let ctx = crate::resolve_with(
+            &crate::PinnedOnly,
+            &json!({"hostile": {"@id": "observedAt"}}),
+        )
+        .expect("inline @context");
         assert_eq!(ctx.expand_key("hostile"), "observedAt");
 
         let doc = json!({"id": "urn:ngsi-ld:Vehicle:1", "type": "T",
@@ -3533,10 +3983,11 @@ mod reserved_member_guards {
 
         // negative: with a well-behaved @context the sub-attribute lands on
         // its own IRI and observedAt still holds the DateTime string.
-        let ctx = Loader::new()
-            .resolve_quiet(&json!({"hostile": {"@id": "https://example.org/hostile"}}))
-            .await
-            .expect("inline @context");
+        let ctx = crate::resolve_with(
+            &crate::PinnedOnly,
+            &json!({"hostile": {"@id": "https://example.org/hostile"}}),
+        )
+        .expect("inline @context");
         let out = expand_entity(doc.as_object().expect("obj"), &ctx, ExpandOpts::default())
             .expect("absolute IRI is fine");
         let inst = &out["https://uri.etsi.org/ngsi-ld/default-context/speed"][0];
@@ -3563,10 +4014,6 @@ mod reserved_member_guards {
                 out.is_err(),
                 "datasetId {bad} must be rejected, got {out:?}"
             );
-            // negative: no non-string datasetId ever reaches the output.
-            if let Ok(Value::Object(m)) = &out {
-                assert!(m.get("datasetId").is_none_or(Value::is_string));
-            }
         }
         let frag = json!({"type": "Property", "value": 1, "datasetId": "urn:ngsi-ld:Dataset:a"});
         let out = expand_attr_fragment(frag.as_object().expect("obj"), &core())
@@ -3686,10 +4133,6 @@ mod reserved_member_guards {
             matches!(out, Err(NgsiError::BadRequestData(_))),
             "an invalid expiresAt is BadRequestData, got {out:?}"
         );
-        // negative: no unvalidated expiresAt ever reaches the output.
-        if let Ok(Value::Object(m)) = &out {
-            assert!(m.get("expiresAt").is_none());
-        }
         let frag = json!({"type": "Property", "value": 1, "expiresAt": "2026-01-01T00:00:00Z"});
         let out = expand_attr_fragment(frag.as_object().expect("obj"), &core())
             .expect("a valid DateTime is kept");
@@ -3718,10 +4161,6 @@ mod reserved_member_guards {
                 matches!(out, Err(NgsiError::BadRequestData(_))),
                 "{term} as an Attribute name is BadRequestData, got {out:?}"
             );
-            // negative: the poisoned value never reaches the expanded entity.
-            if let Ok(v) = &out {
-                assert_ne!(v[term], "pwned");
-            }
         }
         // negative: the system members themselves still expand normally.
         let doc = json!({"id": "urn:ngsi-ld:V:1", "type": "T",
@@ -3823,14 +4262,6 @@ mod reserved_member_guards {
             matches!(out, Err(NgsiError::BadRequestData(_))),
             "duplicate expanded Attribute name is BadRequestData, got {out:?}"
         );
-        // negative: neither value may survive alone as the single instance.
-        if let Ok(v) = &out {
-            assert!(
-                v["https://uri.etsi.org/ngsi-ld/default-context/temperature"]
-                    .as_array()
-                    .is_none_or(|a| a.len() != 1)
-            );
-        }
         // the same collision one level down, on sub-attributes.
         let doc = json!({"id": "urn:ngsi-ld:V:1", "type": "T",
             "speed": {"type": "Property", "value": 1,
@@ -3849,7 +4280,7 @@ mod reserved_member_guards {
     }
 
     fn core() -> std::sync::Arc<Context> {
-        Loader::new().core()
+        std::sync::Arc::new(crate::core_context())
     }
 
     /// `expand_instance` dispatches on `attr_type` and closes the match with
@@ -3890,5 +4321,430 @@ mod reserved_member_guards {
                 );
             }
         }
+    }
+}
+
+/// The refusals and pass-throughs no clause test above reaches: each case is
+/// one malformed (or one borderline legal) input and the answer it gets.
+#[cfg(test)]
+mod edges {
+    use super::*;
+    use serde_json::json;
+
+    const MERGE: ExpandOpts = ExpandOpts {
+        fragment: true,
+        allow_null: true,
+        merge: true,
+        temporal: false,
+        sys: false,
+    };
+
+    fn run(doc: Value, opts: ExpandOpts) -> Result<Value, NgsiError> {
+        expand_entity(
+            doc.as_object().expect("obj"),
+            &std::sync::Arc::new(crate::core_context()),
+            opts,
+        )
+    }
+
+    fn ok(doc: Value, opts: ExpandOpts) -> Value {
+        run(doc.clone(), opts).unwrap_or_else(|e| panic!("{doc} refused: {e:?}"))
+    }
+
+    fn refused(doc: Value, opts: ExpandOpts) {
+        let out = run(doc.clone(), opts);
+        assert!(
+            matches!(out, Err(NgsiError::BadRequestData(_))),
+            "{doc} must be BadRequestData, got {out:?}"
+        );
+    }
+
+    fn with(attr: Value) -> Value {
+        json!({"id": "urn:ngsi-ld:T:1", "type": "T", "a": attr})
+    }
+
+    const A: &str = "https://uri.etsi.org/ngsi-ld/default-context/a";
+
+    #[test]
+    fn entity_members() {
+        let d = ExpandOpts::default();
+        refused(json!({"id": 5, "type": "T"}), d);
+        refused(json!({"type": "T"}), d);
+        refused(json!({"id": "urn:x", "type": ["T", 5]}), d);
+        refused(json!({"id": "urn:x", "type": ["T", ""]}), d);
+        refused(
+            json!({"id": "urn:x", "type": "T", "": {"type": "Property", "value": 1}}),
+            d,
+        );
+        refused(
+            with(
+                json!([{"type": "Property", "value": 1, "datasetId": "urn:d"},
+                        {"type": "Property", "value": 2, "datasetId": "urn:d"}]),
+            ),
+            d,
+        );
+        let sys = ExpandOpts { sys: true, ..d };
+        let out = ok(
+            json!({"id": "urn:x", "type": "T", "createdAt": "2020-01-01T00:00:00Z",
+                   "modifiedAt": "yesterday", "deletedAt": 5}),
+            sys,
+        );
+        assert_eq!(out["createdAt"], "2020-01-01T00:00:00Z");
+        assert!(out.get("modifiedAt").is_none());
+        assert!(out.get("deletedAt").is_none());
+        refused(json!({"id": "urn:x", "type": ""}), d);
+        refused(json!({"id": "urn:x", "type": []}), d);
+        // temporal input repeats datasetIds legally (4.5.6)
+        ok(
+            with(
+                json!([{"type": "Property", "value": 1, "datasetId": "urn:d"},
+                        {"type": "Property", "value": 2, "datasetId": "urn:d"}]),
+            ),
+            ExpandOpts {
+                temporal: true,
+                ..d
+            },
+        );
+        // a merge may delete the location
+        ok(
+            json!({"id": "urn:x", "type": "T", "location": "urn:ngsi-ld:null"}),
+            MERGE,
+        );
+        // a merge of a whole Entity may remove its expiry too
+        let whole_merge = ExpandOpts {
+            allow_null: true,
+            merge: true,
+            ..d
+        };
+        ok(
+            json!({"id": "urn:x", "type": "T", "expiresAt": "urn:ngsi-ld:null"}),
+            whole_merge,
+        );
+    }
+
+    /// 4.5.6: temporal input carries scope as Property instances.
+    #[test]
+    fn temporal_scope_instances() {
+        let t = ExpandOpts {
+            temporal: true,
+            ..Default::default()
+        };
+        let scope = |s: Value| json!({"id": "urn:x", "type": "T", "scope": s});
+        let out = ok(scope(json!([{"value": "/a"}, {"value": ["/b", "/c"]}])), t);
+        assert_eq!(out["scope"].as_array().map(Vec::len), Some(2));
+        refused(scope(json!([{"value": 5}])), t);
+        refused(scope(json!([{"value": ["/a", 5]}])), t);
+        refused(scope(json!([{"value": "/a b"}])), t);
+        refused(scope(json!([5])), t);
+        refused(scope(json!([{"value": "/a"}])), ExpandOpts::default());
+        refused(scope(json!(5)), ExpandOpts::default());
+    }
+
+    #[test]
+    fn expanded_accessors_name_the_wiring_mistake() {
+        assert!(matches!(
+            expanded_object(&json!(1)),
+            Err(NgsiError::InternalError(_))
+        ));
+        assert!(expanded_object(&json!({})).is_ok());
+        assert!(matches!(
+            expanded_id(&json!({})),
+            Err(NgsiError::InternalError(_))
+        ));
+        assert_eq!(expanded_id(&json!({"id": "urn:x"})).ok(), Some("urn:x"));
+    }
+
+    #[test]
+    fn a_new_entity_id_holding_a_comma_is_refused() {
+        assert_eq!(
+            new_entity_id(&json!({"id": "urn:x:a"})).ok(),
+            Some("urn:x:a")
+        );
+        let err = format!("{:?}", new_entity_id(&json!({"id": "urn:x:a,b"})));
+        assert!(err.starts_with("Err(BadRequestData("), "{err}");
+        assert!(err.contains("urn:x:a-b"), "{err}");
+        let none = format!("{:?}", new_entity_id(&json!({})));
+        assert!(none.starts_with("Err(InternalError("), "{none}");
+    }
+
+    #[test]
+    fn deletion_markers() {
+        let n = "urn:ngsi-ld:null";
+        for inst in [
+            json!(n),
+            json!({"value": n}),
+            json!({"object": n}),
+            json!({"languageMap": {"@none": n}}),
+            json!({"languageMap": n}),
+            json!({"json": n}),
+            json!({"vocab": n}),
+            json!({"valueList": [n]}),
+            json!({"objectList": n}),
+        ] {
+            assert!(is_deletion_instance(&inst), "{inst}");
+        }
+        for inst in [
+            json!({"value": 1}),
+            json!(5),
+            json!({"languageMap": {"en": n, "@none": n}}),
+            json!({"valueList": ["x"]}),
+        ] {
+            assert!(!is_deletion_instance(&inst), "{inst}");
+        }
+        assert!(check_value_nulls("a", &json!(n), ExpandOpts::default()).is_err());
+        assert!(check_value_nulls("a", &json!([1, n]), ExpandOpts::default()).is_err());
+        assert!(check_value_nulls("a", &json!(n), MERGE).is_ok());
+    }
+
+    #[test]
+    fn nesting_and_instance_arrays() {
+        let mut attr = json!({"type": "Property", "value": 1});
+        for _ in 0..10 {
+            attr = json!({"type": "Property", "value": 1, "s": attr});
+        }
+        refused(with(attr), ExpandOpts::default());
+        // members without "type" still mark an array element as an instance
+        let out = ok(
+            with(json!([{"value": 1, "datasetId": "urn:d1"}, {"value": 2, "datasetId": "urn:d2"}])),
+            ExpandOpts::default(),
+        );
+        assert_eq!(out[A].as_array().map(Vec::len), Some(2));
+        // an array of plain objects is one Property value
+        let out = ok(with(json!([{"x": 1}])), ExpandOpts::default());
+        assert_eq!(out[A].as_array().map(Vec::len), Some(1));
+        let out = ok(with(json!([])), ExpandOpts::default());
+        assert_eq!(out[A][0]["value"], json!([]));
+    }
+
+    #[test]
+    fn instance_members() {
+        let d = ExpandOpts::default();
+        let p = |extra: Value| {
+            let mut o = json!({"type": "Property", "value": 1});
+            o.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            with(o)
+        };
+        refused(
+            json!({"id": "urn:x", "type": "T",
+                       "ngsildproof": {"type": "Property", "entityIdSealed": "urn:x"}}),
+            d,
+        );
+        let out = ok(p(json!({"expiresAt": "2030-01-01T00:00:00Z"})), d);
+        assert_eq!(out[A][0]["expiresAt"], "2030-01-01T00:00:00Z");
+        refused(p(json!({"expiresAt": "soon"})), d);
+        refused(p(json!({"valueType": 5})), d);
+        let sys = ExpandOpts { sys: true, ..d };
+        let out = ok(
+            p(json!({"createdAt": "2020-01-01T00:00:00Z", "modifiedAt": "no", "deletedAt": 1})),
+            sys,
+        );
+        assert_eq!(out[A][0]["createdAt"], "2020-01-01T00:00:00Z");
+        assert!(out[A][0].get("modifiedAt").is_none());
+        assert!(out[A][0].get("deletedAt").is_none());
+        // a geometry type without coordinates is no geometry: a Property
+        let out = ok(with(json!({"value": {"type": "Point"}})), d);
+        assert_eq!(out[A][0]["type"], "Property");
+        refused(p(json!({"s": "urn:ngsi-ld:null"})), d);
+        refused(p(json!({"": {"type": "Property", "value": 2}})), d);
+        refused(
+            with(json!({"type": "LanguageProperty", "languageMap": {"en": "urn:ngsi-ld:null"}})),
+            d,
+        );
+    }
+
+    #[test]
+    fn typed_values() {
+        let d = ExpandOpts::default();
+        let n = "urn:ngsi-ld:null";
+        refused(
+            with(json!({"type": "GeoProperty",
+                        "value": "{\"type\":\"Point\",\"coordinates\":[200,0]}"})),
+            d,
+        );
+        assert_eq!(
+            ok(with(json!({"type": "GeoProperty", "value": n})), MERGE)[A][0]["value"],
+            n
+        );
+        refused(
+            with(json!({"type": "Relationship", "object": "not a uri"})),
+            d,
+        );
+        refused(with(json!({"type": "Relationship", "object": [5]})), d);
+        refused(with(json!({"type": "Relationship", "object": 5})), d);
+        refused(with(json!({"type": "Relationship", "object": []})), d);
+        assert_eq!(
+            ok(with(json!({"type": "Relationship", "object": n})), MERGE)[A][0]["object"],
+            n
+        );
+        assert_eq!(
+            ok(with(json!({"type": "JsonProperty", "json": n})), MERGE)[A][0]["json"],
+            n
+        );
+        // merge inputs that carry no null take the ordinary checks
+        ok(
+            with(
+                json!({"type": "GeoProperty", "value": "{\"type\":\"Point\",\"coordinates\":[1,2]}"}),
+            ),
+            MERGE,
+        );
+        ok(
+            with(json!({"type": "Relationship", "object": "urn:a"})),
+            MERGE,
+        );
+        ok(with(json!({"type": "ListProperty", "valueList": n})), MERGE);
+        refused(with(json!({"type": "ListProperty", "valueList": 5})), MERGE);
+        ok(
+            with(json!({"type": "ListRelationship", "objectList": ["urn:a"]})),
+            MERGE,
+        );
+        ok(
+            json!({"id": "urn:x", "type": "T", "ngsildproof": {"type": "Property", "value": n}}),
+            MERGE,
+        );
+        refused(
+            json!({"id": "urn:x", "type": "T", "ngsildproof": {"type": "Property", "value": 5}}),
+            MERGE,
+        );
+        let point = run(with(json!({"type": "Point"})), d);
+        assert!(point.is_err(), "{point:?}");
+        for list in [
+            json!([5]),
+            json!([{"object": "urn:a", "x": 1}]),
+            json!([{"object": 5}]),
+        ] {
+            refused(
+                with(json!({"type": "ListRelationship", "objectList": list})),
+                d,
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_fragments() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let frag = |v: Value| expand_attr_fragment(v.as_object().expect("obj"), &ctx);
+        assert!(frag(json!({"type": "Foo"})).is_err());
+        assert!(frag(json!({"value": null})).is_err());
+        assert!(frag(json!({"value": {"x": "urn:ngsi-ld:null"}})).is_err());
+        let out = frag(json!({"datasetId": "@none", "unitCode": "C",
+                              "s": {"type": "Property", "value": 1}}))
+        .expect("fragment");
+        assert!(out.get("datasetId").is_none());
+        assert_eq!(out["unitCode"], "C");
+        assert_eq!(
+            out["https://uri.etsi.org/ngsi-ld/default-context/s"][0]["value"],
+            1
+        );
+        assert!(frag(json!({"s": {"type": "Property", "value": 1},
+                            "https://uri.etsi.org/ngsi-ld/default-context/s":
+                                {"type": "Property", "value": 2}}))
+        .is_err());
+    }
+
+    #[test]
+    fn geometry_shapes() {
+        assert!(check_position(&json!([1, 2, "x"])).is_err());
+        assert!(check_ring(&json!([[0, 0], [1, 0], [0, 1], [1, 1]])).is_err());
+        for t in ["MultiPoint", "MultiLineString", "Polygon", "MultiPolygon"] {
+            assert!(check_geometry(t, &json!(5)).is_err(), "{t}");
+        }
+        assert!(check_geometry("MultiPolygon", &json!([5])).is_err());
+        assert!(check_geometry("Foo", &json!([0, 0])).is_err());
+    }
+
+    #[test]
+    fn datetimes() {
+        assert!(!parse_datetime("2020Z"));
+        assert!(!parse_datetime("2020-01-0xT00:00:00Z"));
+        assert!(parse_datetime("2020-01-01T00:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod null_member_tests {
+    use super::*;
+    use serde_json::json;
+
+    const SPEED: &str = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+
+    /// 5.5.12, 10.2.5.4: what removes a member from the patched instance.
+    #[test]
+    fn removes_member_is_null_the_ngsi_null_or_only_deletion_instances() {
+        assert!(removes_member(&Value::Null));
+        assert!(removes_member(&json!("urn:ngsi-ld:null")));
+        assert!(removes_member(&json!([
+            {"type": "Relationship", "object": "urn:ngsi-ld:null"},
+            "urn:ngsi-ld:null"
+        ])));
+        // an empty list deletes nothing, one live instance keeps the member
+        assert!(!removes_member(&json!([])));
+        assert!(!removes_member(&json!([
+            {"type": "Property", "value": "urn:ngsi-ld:null"},
+            {"type": "Property", "value": 1}
+        ])));
+        assert!(!removes_member(&json!({"type": "Property", "value": 1})));
+        assert!(!removes_member(&json!("urn:ngsi-ld:Thing:1")));
+    }
+
+    /// 10.2.5.4 / 10.2.9.4: observedAt and expiresAt set to the Null are kept as the deletion
+    /// marker in a partial update or merge input, and stay invalid DateTimes on create.
+    #[test]
+    fn observed_at_and_expires_at_null_only_in_null_allowing_inputs() {
+        let ctx = crate::core_context();
+        let doc = json!({"id": "urn:x", "type": "T",
+            "speed": {"type": "Property", "value": 1,
+                      "observedAt": "urn:ngsi-ld:null", "expiresAt": "urn:ngsi-ld:null"}});
+        let doc = doc.as_object().unwrap();
+        assert!(
+            expand_entity(doc, &ctx, ExpandOpts::default()).is_err(),
+            "create refuses the Null"
+        );
+        for opts in [
+            ExpandOpts {
+                fragment: true,
+                allow_null: true,
+                ..Default::default()
+            },
+            ExpandOpts {
+                fragment: true,
+                merge: true,
+                ..Default::default()
+            },
+        ] {
+            let out = expand_entity(doc, &ctx, opts).expect("the Null is a deletion marker here");
+            assert_eq!(out[SPEED][0]["observedAt"], "urn:ngsi-ld:null", "{opts:?}");
+            assert_eq!(out[SPEED][0]["expiresAt"], "urn:ngsi-ld:null", "{opts:?}");
+        }
+        // a real DateTime passes through, anything else is still refused under allow_null
+        let opts = ExpandOpts {
+            fragment: true,
+            allow_null: true,
+            ..Default::default()
+        };
+        let ok = json!({"speed": {"type": "Property", "value": 1, "observedAt": "2026-10-15T00:00:00Z"}});
+        let out = expand_entity(ok.as_object().unwrap(), &ctx, opts).expect("DateTime accepted");
+        assert_eq!(out[SPEED][0]["observedAt"], "2026-10-15T00:00:00Z");
+        for k in ["observedAt", "expiresAt"] {
+            let bad = json!({"speed": {"type": "Property", "value": 1, k: "urn:ngsi-ld:Thing:1"}});
+            assert!(
+                expand_entity(bad.as_object().unwrap(), &ctx, opts).is_err(),
+                "{k}"
+            );
+        }
+    }
+
+    /// 10.2.5.4 on the attribute path (5.6.4): the Null is kept for the patch to remove.
+    #[test]
+    fn attr_fragment_keeps_a_null_observed_at_and_expires_at() {
+        let ctx = crate::core_context();
+        let frag = json!({"type": "Property", "value": 1,
+            "observedAt": "urn:ngsi-ld:null", "expiresAt": "urn:ngsi-ld:null"});
+        let out = expand_attr_fragment(frag.as_object().unwrap(), &ctx).expect("Null accepted");
+        assert_eq!(out["observedAt"], "urn:ngsi-ld:null");
+        assert_eq!(out["expiresAt"], "urn:ngsi-ld:null");
+        let bad = json!({"type": "Property", "value": 1, "observedAt": "not a date"});
+        assert!(expand_attr_fragment(bad.as_object().unwrap(), &ctx).is_err());
     }
 }

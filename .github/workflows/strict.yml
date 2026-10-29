@@ -169,7 +169,7 @@ jobs:
       # figures are the ones in unit-cov.txt and api-cov.txt.
       - name: Publish the coverage map
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-map
           path: |
@@ -202,14 +202,20 @@ jobs:
       ANTARES_TEST_SANITIZER: thread
       RUST_BACKTRACE: 1
       CARGO_TERM_COLOR: always
+      # Pinned: from nightly-2026-10-16 (rustc 4ebd25825, LLVM 23.1.4) every
+      # TSan test binary on aarch64 segfaults before its first test;
+      # nightly-2026-10-15 (rustc 7df81381d, LLVM 23.1.3) passes. Move the
+      # pin forward once a newer nightly runs the antares-api lib tests here.
+      TSAN_TOOLCHAIN: nightly-2026-10-15
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.TSAN_TOOLCHAIN }}
           components: rust-src
       - uses: Swatinem/rust-cache@v2
       - run: >
-          cargo +nightly test -Zbuild-std
+          cargo +${{ env.TSAN_TOOLCHAIN }} test -Zbuild-std
           --target aarch64-unknown-linux-gnu
           --workspace --exclude antares-broker --tests
 
@@ -237,7 +243,7 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p antares-model -p antares-ql -p antares-matcher
+      - run: cargo +nightly miri test -p ngsild-model -p ngsild-ql -p ngsild-matcher
 
   alarm:
     # A red scheduled wall auto-files a deduped issue (the shared

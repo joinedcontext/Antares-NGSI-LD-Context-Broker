@@ -2,6 +2,10 @@
 //! PgDocStore integration. Skips loudly without
 //! ANTARES_TEST_DATABASE_URL (see tests/pg.rs recipe).
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing.
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::doc::{DocKind, PgDocStore};
@@ -930,4 +934,128 @@ async fn bookkeeping_only_registration_writes_leave_the_index_rows_alone() {
     s.delete(&t, DocKind::Registration, id)
         .await
         .expect("cleanup");
+}
+
+/// the view reload's read. An unchanged document keeps its digest,
+/// a changed one moves it, and the body never leaves the database.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_digests_move_only_with_the_body() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone());
+    let t = TenantId::new("pgdigest").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    for (id, n) in [("a", 1), ("b", 2)] {
+        s.upsert(&t, DocKind::View, id, &json!({"id": id, "n": n}))
+            .await
+            .expect("insert");
+    }
+    let first = s.list_digests(&t, DocKind::View).await.expect("digests");
+    assert_eq!(
+        first.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        s.list_digests(&t, DocKind::View).await.expect("again"),
+        first
+    );
+    s.upsert(&t, DocKind::View, "b", &json!({"id": "b", "n": 3}))
+        .await
+        .expect("update");
+    let next = s.list_digests(&t, DocKind::View).await.expect("digests");
+    assert_eq!(next[0], first[0]);
+    assert_ne!(next[1].1, first[1].1);
+}
+
+/// `views.digest` is a stored generated column. It moves with a
+/// changed body, stays with an unchanged one, equals the expression an older
+/// release computes in its query, and is what `list_digests` answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_digest_column_follows_upsert() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone());
+    let t = TenantId::new("pgdigestcol").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let stored = || async {
+        let (digest, computed): (String, String) = sqlx::query_as(
+            "SELECT digest, left(md5(doc::text), 16) FROM views WHERE tenant_id = $1 AND id = 'v'",
+        )
+        .bind(t.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("digest");
+        assert_eq!(digest, computed);
+        digest
+    };
+    s.upsert(&t, DocKind::View, "v", &json!({"id": "v", "n": 1}))
+        .await
+        .expect("insert");
+    let first = stored().await;
+    let listed = s.list_digests(&t, DocKind::View).await.expect("digests");
+    assert_eq!(
+        listed,
+        [(
+            "v".to_owned(),
+            u64::from_str_radix(&first, 16).expect("hex")
+        )]
+    );
+    s.upsert(&t, DocKind::View, "v", &json!({"id": "v", "n": 1}))
+        .await
+        .expect("same");
+    assert_eq!(stored().await, first);
+    s.upsert(&t, DocKind::View, "v", &json!({"id": "v", "n": 2}))
+        .await
+        .expect("update");
+    assert_ne!(stored().await, first);
+    s.delete(&t, DocKind::View, "v").await.expect("cleanup");
+}
+
+/// `record_deliveries` books several subscriptions in one statement,
+/// each with its own stamp and its own pre-image; a subscription that is gone
+/// has no entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn record_deliveries_books_each_subscription_once() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone());
+    let t = TenantId::new("pgbatchbook").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let (a, b) = (
+        "urn:ngsi-ld:Subscription:batch-a",
+        "urn:ngsi-ld:Subscription:batch-b",
+    );
+    let t0 = "2026-01-01T00:00:00.000Z";
+    for (id, last) in [(a, Some(t0)), (b, None)] {
+        let mut n = json!({"endpoint": {"uri": "urn:antares:ws:c"}, "timesSent": 4});
+        if let Some(last) = last {
+            n["lastSuccess"] = json!(last);
+        }
+        s.upsert(
+            &t,
+            DocKind::Subscription,
+            id,
+            &json!({"id": id, "type": "Subscription", "notification": n}),
+        )
+        .await
+        .expect("seed");
+    }
+    let (ta, tb) = ("2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z");
+    let found = s
+        .record_deliveries(
+            &t,
+            DocKind::Subscription,
+            &[(b, tb), ("urn:ngsi-ld:Subscription:gone", ta), (a, ta)],
+        )
+        .await
+        .expect("book");
+    assert_eq!(found.len(), 2, "the gone subscription books nothing");
+    let (doc_a, prev_a) = found.get(a).expect("a booked");
+    assert_eq!(prev_a, &Some(json!(t0)));
+    assert_eq!(doc_a["notification"]["timesSent"], json!(5));
+    assert_eq!(doc_a["notification"]["lastNotification"], json!(ta));
+    let (doc_b, prev_b) = found.get(b).expect("b booked");
+    assert_eq!(prev_b, &None);
+    assert_eq!(doc_b["notification"]["lastSuccess"], json!(tb));
+    assert_eq!(doc_b["notification"]["status"], json!("ok"));
 }

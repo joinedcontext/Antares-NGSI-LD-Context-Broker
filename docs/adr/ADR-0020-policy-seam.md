@@ -3,7 +3,8 @@
 Date: 2026-09-02. Status: accepted, amended (the narrowing marker header).
 Reverses the "no policy code in the
 broker" reading of the standing PEP decision (SECURITY.md,
-`docs/roadmap-1.0.md`, `docs/policies.md`), which otherwise stands.
+`docs/roadmap-1.0.md`, `docs/policies.md`; the last two are internal design
+notes, not part of this repository), which otherwise stands.
 
 ## Context
 

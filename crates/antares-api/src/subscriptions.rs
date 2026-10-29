@@ -4,6 +4,7 @@
 //! Subscription data type (5.2.12).
 
 use crate::negotiate::*;
+use crate::notify::endpoint_uri;
 use crate::state::{now_iso, AppState};
 use antares_jsonld::{parse_datetime, Context};
 use antares_model::{NgsiError, TenantId};
@@ -40,6 +41,16 @@ fn norm_entity_selectors(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
         let eo = e
             .as_object()
             .ok_or_else(|| bad("entities entries must be objects".into()))?;
+        // the core @context aliases id to @id and type to @type: both names
+        // in one selector collide (JSON-LD 1.1 API expansion)
+        if let Some(k) = ["id", "type"]
+            .into_iter()
+            .find(|k| eo.contains_key(*k) && eo.contains_key(&format!("@{k}")))
+        {
+            return Err(bad(format!(
+                "EntitySelector carries both {k} and @{k} (5.2.33)"
+            )));
+        }
         let mut ne = Map::new();
         for (ek, ev) in eo {
             match ek.as_str() {
@@ -325,6 +336,23 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
         {
             return Err(bad(format!("invalid endpoint accept {acc:?}")));
         }
+        // TS 104 243 5.2, Table 5.2-2: an MQTT message's metadata
+        // Content-Type is "application/json" or "application/ld+json"; the
+        // binding has no GeoJSON. Refused here, at create and at update,
+        // rather than published under a Content-Type the table forbids.
+        let scheme = ep
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(|uri| uri.split_once("://"))
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        if acc == "application/geo+json" && matches!(scheme.as_deref(), Some("mqtt" | "mqtts")) {
+            return Err(bad(format!(
+                "endpoint.accept {acc:?} is not available for an {} endpoint: the MQTT \
+                 binding sends \"application/json\" or \"application/ld+json\" \
+                 (TS 104 243 Table 5.2-2)",
+                scheme.as_deref().unwrap_or_default()
+            )));
+        }
     }
     Ok(())
 }
@@ -404,14 +432,9 @@ fn norm_member(
         }
         "q" => {
             let q = v.as_str().ok_or_else(|| bad("q must be a string".into()))?;
-            // Validate the string the MATCHER will parse. `conditions_match`
-            // percent-decodes first (4.9, 046_05), so validating the raw
-            // form would let `%28%28%28…` through create-time checks and
-            // only become thousands of real parens at notification time —
-            // inside a spawned task, where the parser's own limits are the
-            // last line of defence.
-            let decoded = crate::negotiate::percent_decode(q.as_bytes());
-            antares_ql::parse_q(&decoded)?;
+            // Validate the string the MATCHER will parse: a JSON string,
+            // read as written (5.2.12, 046_05), never percent-decoded.
+            antares_ql::parse_q(q)?;
             out.insert("q".into(), v.clone());
         }
         "geoQ" => {
@@ -519,8 +542,29 @@ fn norm_member(
         // is __subject. The prefix as a whole is the broker's, so a member
         // added later cannot be forgotten here.
         k if k.starts_with("__") => return Ok(()),
-        "scopeQ" | "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
-        | "ngsildConformance" | "datasetId" => {
+        "scopeQ" => {
+            let q = v
+                .as_str()
+                .ok_or_else(|| bad("scopeQ must be a string (5.2.12)".into()))?;
+            antares_ql::scope::check_scope_q(q)?;
+            out.insert(k.to_owned(), v.clone());
+        }
+        "ngsildConformance" => {
+            // Table 5.2.12-1: "a semantically versioned string in the form major.minor"
+            let ok = v
+                .as_str()
+                .and_then(|s| s.split_once('.'))
+                .is_some_and(|(a, b)| {
+                    [a, b]
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+                });
+            if !ok {
+                return Err(bad("ngsildConformance must be major.minor (5.2.12)".into()));
+            }
+            out.insert(k.to_owned(), v.clone());
+        }
+        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext" | "datasetId" => {
             out.insert(k.to_owned(), v.clone());
         }
         // tolerant reader: keep unknown members
@@ -552,6 +596,13 @@ fn check_subscription_members(out: &Map<String, Value>, is_patch: bool) -> Resul
             return Err(bad("notification is required (5.2.12)".into()));
         }
     }
+    check_exclusive_pairs(out)
+}
+
+/// The Table 5.2.12-1 member pairs a Subscription may not carry together,
+/// checked on a fragment and again on the Subscription it updates.
+fn check_exclusive_pairs(out: &Map<String, Value>) -> Result<(), NgsiError> {
+    let bad = NgsiError::BadRequestData;
     if out.contains_key("timeInterval") && out.contains_key("watchedAttributes") {
         return Err(bad(
             "timeInterval and watchedAttributes are mutually exclusive (5.2.12)".into(),
@@ -644,6 +695,7 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
                         .collect();
                     n.insert("attributes".into(), Value::Array(na));
                 }
+                mask_receiver_info(&mut n);
                 out.insert("notification".into(), Value::Object(n));
             }
             "geoQ" => {
@@ -666,7 +718,9 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
             serde_json::json!(["attributeCreated", "attributeUpdated"]),
         );
     }
-    // status (5.2.12 output): active | paused | expired
+    // status (Table 5.2.12-2): active | paused | expired; a failed delivery
+    // is notification.status (5.8.6). Only a CSR subscription itself turns
+    // "failed" (5.11.7: "Update the subscription status to "failed"").
     let expired = obj
         .get("expiresAt")
         .and_then(Value::as_str)
@@ -676,13 +730,117 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
         "expired"
     } else if paused {
         "paused"
-    } else if obj.get("status").and_then(Value::as_str) == Some("failed") {
-        "failed" // 5.8.6 / 5.11.7 delivery-failure status
+    } else if csource && obj.get("status").and_then(Value::as_str) == Some("failed") {
+        "failed"
     } else {
         "active"
     };
     out.insert("status".into(), Value::String(status.into()));
     Value::Object(out)
+}
+
+/// What a read answers in place of each `endpoint.receiverInfo` value.
+const MASKED: &str = "***";
+
+/// `receiverInfo` carries the credentials a notification is sent with (6.3.8: each pair is a
+/// header, the Authorization header the example). No read answers them: the keys stay, the
+/// values are [`MASKED`].
+fn mask_receiver_info(notification: &mut Map<String, Value>) {
+    // 7.2 userinfo in the endpoint URI is a credential too.
+    if let Some(uri) = notification
+        .get_mut("endpoint")
+        .and_then(|e| e.get_mut("uri"))
+    {
+        if let Some(masked) = uri.as_str().and_then(masked_uri) {
+            *uri = Value::String(masked);
+        }
+    }
+    let pairs = notification
+        .get_mut("endpoint")
+        .and_then(|e| e.get_mut("receiverInfo"))
+        .and_then(Value::as_array_mut);
+    for pair in pairs.into_iter().flatten() {
+        if let Some(v) = pair.get_mut("value") {
+            *v = Value::String(MASKED.into());
+        }
+    }
+}
+
+/// The endpoint URI with its userinfo replaced by [`MASKED`]; `None` when it
+/// carries none.
+fn masked_uri(uri: &str) -> Option<String> {
+    let bare = antares_notifier::redact_userinfo(uri);
+    if bare == uri {
+        return None;
+    }
+    let (scheme, host) = bare.split_once("//")?;
+    Some(format!("{scheme}//{MASKED}@{host}"))
+}
+
+/// A client that reads a Subscription and writes its `notification` back sends the
+/// [`MASKED`] values it was answered. Such a value keeps the credential stored under the same
+/// key instead of overwriting it; a key the stored endpoint lacks keeps the literal value.
+/// The stored credential stays with the stored URI: a masked value under a stored key beside
+/// another URI is refused, or an update-right holder could redirect the credential.
+fn keep_masked_receiver_info(
+    fragment: &mut Map<String, Value>,
+    stored: &Map<String, Value>,
+) -> Result<(), NgsiError> {
+    // The masked URI it was answered keeps the stored one, credentials and all.
+    let stored_uri = stored
+        .get("notification")
+        .and_then(|n| n.get("endpoint"))
+        .and_then(|e| e.get("uri"))
+        .and_then(Value::as_str);
+    if let (Some(stored_uri), Some(uri)) = (
+        stored_uri,
+        fragment
+            .get_mut("notification")
+            .and_then(|n| n.get_mut("endpoint"))
+            .and_then(|e| e.get_mut("uri")),
+    ) {
+        if masked_uri(stored_uri).as_deref() == uri.as_str() {
+            *uri = Value::String(stored_uri.to_owned());
+        }
+    }
+    let held = stored
+        .get("notification")
+        .and_then(|n| n.get("endpoint"))
+        .and_then(|e| e.get("receiverInfo"))
+        .and_then(Value::as_array);
+    let Some(held) = held else {
+        return Ok(());
+    };
+    let endpoint = fragment
+        .get_mut("notification")
+        .and_then(|n| n.get_mut("endpoint"));
+    let moved = endpoint
+        .as_ref()
+        .and_then(|e| e.get("uri"))
+        .is_some_and(|uri| uri.as_str() != stored_uri);
+    let pairs = endpoint
+        .and_then(|e| e.get_mut("receiverInfo"))
+        .and_then(Value::as_array_mut);
+    for pair in pairs.into_iter().flatten() {
+        if pair.get("value").and_then(Value::as_str) != Some(MASKED) {
+            continue;
+        }
+        let key = pair.get("key").cloned();
+        let previous = held
+            .iter()
+            .find(|h| h.get("key") == key.as_ref())
+            .and_then(|h| h.get("value"))
+            .cloned();
+        if let (Some(previous), Some(v)) = (previous, pair.get_mut("value")) {
+            if moved {
+                return Err(NgsiError::BadRequestData(
+                    "receiverInfo: a masked value cannot move to another uri: send the credential again".into(),
+                ));
+            }
+            *v = previous;
+        }
+    }
+    Ok(())
 }
 
 // ---------- handlers (parameterized by Kind) ----------
@@ -747,12 +905,86 @@ async fn check_jsonld_context(
 /// clauses: 5.8 for Subscriptions, 5.11 for Context Source Registration
 /// Subscriptions. The seam is asked about the operation the caller actually
 /// made.
+/// What a Subscription names, for the policy gate (ADR-0020): the types of
+/// its entity selectors, its watchedAttributes, its q and its geoQ, as
+/// normalization expanded them.
+fn sub_members(norm: &Map<String, Value>) -> crate::entities::ReadMembers {
+    let strings = |key: &str, member: Option<&str>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for v in norm
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let s = match member {
+                Some(m) => v.get(m).and_then(Value::as_str),
+                None => v.as_str(),
+            };
+            if let Some(s) = s.filter(|s| !out.iter().any(|o| o == s)) {
+                out.push(s.to_owned());
+            }
+        }
+        out
+    };
+    crate::entities::ReadMembers {
+        types: strings("entities", Some("type")),
+        attrs: strings("watchedAttributes", None),
+        q: norm
+            .get("q")
+            .and_then(Value::as_str)
+            .and_then(|q| antares_ql::parse_q(q).ok()),
+        geo: norm
+            .get("geoQ")
+            .and_then(Value::as_object)
+            .and_then(|g| {
+                antares_ql::geo::GeoQuery::from_params(&crate::notify::geo_params(g)).ok()
+            })
+            .flatten(),
+    }
+}
+
 fn clause_of(kind: Kind, sub: &'static str, csub: &'static str) -> &'static str {
     if kind == Kind::CSourceSubscription {
         csub
     } else {
         sub
     }
+}
+
+/// Query Entities: the clause a socket's own Subscription is decided as.
+const WATCH: &str = "5.7.2";
+
+/// whether `uri` is the endpoint of the
+/// connection making this very call. The sink is the test, as it is for
+/// the endpoint itself: it accepts a socket URI only inside that
+/// connection's call, so HTTP and any other connection answer `false`.
+fn own_socket(st: &AppState, uri: Option<&str>) -> bool {
+    uri.is_some_and(|u| u.starts_with(SOCKET_ENDPOINT) && st.sinks.require(u, &[]).is_ok())
+}
+
+/// The clause an operation on the stored Subscription `id` is decided as:
+/// [`WATCH`] when its endpoint is the calling socket, `sub` otherwise.
+async fn clause_on(
+    st: &AppState,
+    tenant: &TenantId,
+    kind: Kind,
+    id: &str,
+    sub: &'static str,
+    csub: &'static str,
+) -> Result<&'static str, ApiError> {
+    if kind == Kind::Subscription {
+        let doc = st.store.get(tenant, kind, id).await?;
+        if own_socket(
+            st,
+            doc.as_ref()
+                .and_then(Value::as_object)
+                .and_then(endpoint_uri),
+        ) {
+            return Ok(WATCH);
+        }
+    }
+    Ok(clause_of(kind, sub, csub))
 }
 
 pub async fn create(
@@ -764,7 +996,7 @@ pub async fn create(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, &["local"])?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::Standard).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::Standard).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "subscription must be a JSON object".into(),
     ))?;
@@ -773,12 +1005,22 @@ pub async fn create(
     // told which one is being claimed. A body that names none leaves the
     // list empty, which is right: there is no client choice to decide about.
     let named = obj.get("id").and_then(Value::as_str);
+    let mut norm = normalize_subscription(obj, &parsed.ctx, false)?;
+    let shown = match &st.policy {
+        Some(_) => sub_members(&norm),
+        None => crate::entities::ReadMembers::default(),
+    };
+    let watch = kind == Kind::Subscription && own_socket(st, endpoint_uri(&norm));
     gate!(
-        st, &tenant, headers, clause_of(kind, "5.8.1", "5.11.2"),
+        st, &tenant, headers, if watch { WATCH } else { clause_of(kind, "5.8.1", "5.11.2") },
         ids: named.as_slice(),
+        types: &shown.types,
+        attrs: &shown.attrs,
+        q: shown.q.as_ref(),
+        scope_q: norm.get("scopeQ").and_then(Value::as_str),
+        geo: shown.geo.as_ref(),
     )
     .await?;
-    let mut norm = normalize_subscription(obj, &parsed.ctx, false)?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
     let id = match norm.get("id").and_then(Value::as_str) {
@@ -822,33 +1064,46 @@ pub async fn create(
     {
         norm.insert(crate::policy::SUBJECT_MEMBER.into(), subject);
     }
-    // Array @context (>1 entry): the broker must host it at its own URL as an
-    // ImplicitlyCreated @context, surfaced via jsonldContext (5.13.1, 050_03)
-    if !norm.contains_key("jsonldContext") {
-        if let Value::Array(a) = &parsed.ctx.source {
-            if a.len() > 1 {
-                let local_id = uuid::Uuid::new_v4().to_string();
-                let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
-                st.store
-                    .context_put(
-                        Some(&tenant),
-                        &local_id,
-                        serde_json::json!({
-                            "url": url,
-                            "localId": local_id,
-                            "kind": "ImplicitlyCreated",
-                            "createdAt": ts,
-                            // owned by the tenant whose subscription created it
-                            "owner": tenant.as_str(),
-                            "body": {"@context": parsed.ctx.source.clone()},
-                        }),
-                    )
-                    .await?;
-                st.loader
-                    .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
-                    .await;
-                norm.insert("jsonldContext".into(), Value::String(url));
-            }
+    // 5.8.1.4: "If not present, the jsonldContext field shall be initialized
+    // with the @context applicable for the Subscription" (5.5.5 when it has
+    // none). One URL is that URL; anything inline the broker hosts at its own
+    // URL as an ImplicitlyCreated @context (5.13.1, 050_03). A Context Source
+    // Registration Subscription (5.2.13) has no such initialisation.
+    if kind == Kind::Subscription && !norm.contains_key("jsonldContext") {
+        let one_url = match &parsed.ctx.source {
+            Value::Null => Some(antares_jsonld::CORE_CONTEXT.to_owned()),
+            Value::String(u) => Some(u.clone()),
+            Value::Array(a) => match a.as_slice() {
+                [one] => one.as_str().map(str::to_owned),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(url) = one_url {
+            norm.insert("jsonldContext".into(), Value::String(url));
+        } else {
+            // 5.13.2.4: "a locally unique identifier (URI)"
+            let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+            let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
+            st.store
+                .context_put(
+                    Some(&tenant),
+                    &local_id,
+                    serde_json::json!({
+                        "url": url,
+                        "localId": local_id,
+                        "kind": "ImplicitlyCreated",
+                        "createdAt": ts,
+                        // owned by the tenant whose subscription created it
+                        "owner": tenant.as_str(),
+                        "body": {"@context": parsed.ctx.source.clone()},
+                    }),
+                )
+                .await?;
+            st.loader
+                .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
+                .await;
+            norm.insert("jsonldContext".into(), Value::String(url));
         }
     }
     let doc = Value::Object(norm);
@@ -889,7 +1144,8 @@ pub async fn retrieve(
     check_params(params, &["options", "format", "sysAttrs", "local"])?;
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.3", "5.11.4"), ids: &[id]).await?;
+    let clause = clause_on(st, &tenant, kind, id, "5.8.3", "5.11.4").await?;
+    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     let doc = st
         .store
         .get(&tenant, kind, id)
@@ -915,7 +1171,8 @@ pub async fn list(
     )?;
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    let narrowing = gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    let cond = crate::policy::Condition::of(&narrowing);
     // 5.5.9.1: "only up to a maximum of L NGSI-LD Elements are RETRIEVED
     // and returned". 5.8.4 takes no filter parameters — `check_params`
     // above is the whole list — so the tenant IS the match set and the
@@ -923,7 +1180,23 @@ pub async fn list(
     // here made a tenant at the document ceiling unable to list at all,
     // because that read is the one carrying the ceiling for client queries.
     let (offset, limit, _) = crate::paging::page_params(st, params)?;
-    let (page_docs, total) = st.store.list_slice(&tenant, kind, offset, limit).await?;
+    // A policy narrowing selects among the tenant's Subscriptions, so the
+    // count and the window are over that selection.
+    let (page_docs, total) = if cond.is_some() {
+        // A scan of the tenant's Subscriptions; an indexed column
+        // when narrowings hold many.
+        let own: Vec<Value> = st
+            .store
+            .list(&tenant, kind)
+            .await?
+            .into_iter()
+            .filter(|d| cond.as_ref().is_none_or(|c| c.holds_for_record(d)))
+            .collect();
+        let total = own.len();
+        (own.into_iter().skip(offset).take(limit).collect(), total)
+    } else {
+        st.store.list_slice(&tenant, kind, offset, limit).await?
+    };
     let (page, count_hdr, links) = crate::paging::paginate_pre_accept(
         st,
         params,
@@ -931,6 +1204,7 @@ pub async fn list(
         &format!("/ngsi-ld/v1/{}", resource_path(kind)),
         accept,
         total,
+        kind == Kind::CSourceSubscription,
     )?;
     let sys = sys_attrs_asked(params);
     let payload: Vec<Value> = page
@@ -959,8 +1233,8 @@ pub async fn update(
     antares_model::EntityId::new(id)
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.2", "5.11.3"), ids: &[id]).await?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::MergePatch).await?;
+    let clause = clause_on(st, &tenant, kind, id, "5.8.2", "5.11.3").await?;
+    let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
@@ -970,15 +1244,74 @@ pub async fn update(
         }
     }
     let norm = normalize_subscription(obj, &parsed.ctx, true)?;
+    // a fragment that moves the endpoint off the socket is no watch
+    let mut watch = clause == WATCH;
+    if watch && endpoint_uri(&norm).is_some_and(|u| !own_socket(st, Some(u))) {
+        watch = false;
+    }
+    // the engine decides the Subscription as it will be, as
+    // create does, so a fragment cannot move a permitted Subscription onto
+    // types, attributes or a q the engine refuses; one that moved the
+    // endpoint off the socket is a plain 5.8.2.
+    // Decided on the stored document read here; an update racing
+    // between this read and the write below is decided on its own merge.
+    let decided = if clause == WATCH && !watch {
+        "5.8.2"
+    } else {
+        clause
+    };
+    let mut stored = match &st.policy {
+        Some(_) => st.store.get(&tenant, kind, id).await?,
+        None => None,
+    };
+    let merged = match stored.as_mut() {
+        Some(doc) => {
+            let merged = antares_store::stored_object(doc)?;
+            crate::apply_doc_fragment(merged, &norm, &now_iso());
+            Some(merged)
+        }
+        None => None,
+    };
+    let shown = merged.as_deref().map(sub_members).unwrap_or_default();
+    gate!(
+        st, &tenant, headers, decided,
+        ids: &[id],
+        types: &shown.types,
+        attrs: &shown.attrs,
+        q: shown.q.as_ref(),
+        scope_q: merged.as_deref().and_then(|m| m.get("scopeQ")).and_then(Value::as_str),
+        geo: shown.geo.as_ref(),
+    )
+    .await?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
     let ts = now_iso();
     let res = st
         .store
         .mutate(&tenant, kind, id, |doc| {
+            // a watch decided on the stored socket endpoint holds only
+            // while it is still that endpoint
+            if watch && !own_socket(st, doc.as_object().and_then(endpoint_uri)) {
+                return Err(NgsiError::ResourceNotFound(format!(
+                    "subscription {id} not found"
+                )));
+            }
             let target = antares_store::stored_object(doc)?;
+            let mut norm = norm.clone();
+            keep_masked_receiver_info(&mut norm, target)?;
             crate::apply_doc_fragment(target, &norm, &ts);
-            Ok::<(), NgsiError>(())
+            // 5.2.12 holds for the updated Subscription too: deleting both
+            // selectors is refused and nothing is written
+            let local_only = target.get("localOnly").and_then(Value::as_bool) == Some(true);
+            if !local_only
+                && !target.contains_key("entities")
+                && !target.contains_key("watchedAttributes")
+            {
+                return Err(NgsiError::BadRequestData(
+                    "one of entities or watchedAttributes is required (5.2.12)".into(),
+                ));
+            }
+            check_exclusive_pairs(target)
         })
         .await?;
     match res {
@@ -1019,7 +1352,8 @@ pub async fn delete(
     antares_model::EntityId::new(id)
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.5", "5.11.6"), ids: &[id]).await?;
+    let clause = clause_on(st, &tenant, kind, id, "5.8.5", "5.11.6").await?;
+    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     if st.store.delete(&tenant, kind, id).await? {
         st.sub_changed(&tenant, kind, id, None);
         if kind == Kind::Subscription {
@@ -1114,11 +1448,140 @@ route4!(
     "5.11 Context Source Registration Subscription"
 );
 
+/// The endpoint of a Subscription made over a socket.
+const SOCKET_ENDPOINT: &str = "urn:antares:ws:";
+
+/// a Subscription made over a socket carries a lease
+/// its socket renews; one whose lease passed belongs to a connection no
+/// process holds any more (it died without its grace) and is deleted as the
+/// grace would have. A client's own expired Subscription stays, readable as
+/// `expired` (5.8.1.4).
+pub(crate) async fn sweep_expired_socket_subscriptions(st: &AppState, tenant: &TenantId) -> usize {
+    let mut dead: Vec<String> = Vec::new();
+    let walked = crate::csource::walk_docs(st, tenant, Kind::Subscription, |doc| {
+        let socket = doc
+            .pointer("/notification/endpoint/uri")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| uri.starts_with(SOCKET_ENDPOINT));
+        if socket && crate::registry::reg_expired(&doc) {
+            if let Some(id) = doc.get("id").and_then(Value::as_str) {
+                dead.push(id.to_owned());
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if walked.is_err() {
+        return 0;
+    }
+    let mut n: usize = 0;
+    for id in dead {
+        if st
+            .store
+            .delete(tenant, Kind::Subscription, &id)
+            .await
+            .unwrap_or(false)
+        {
+            st.sub_changed(tenant, Kind::Subscription, &id, None);
+            crate::distsub::on_subscription_deleted(st, tenant, &id).await;
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use antares_jsonld::Loader;
     use serde_json::json;
+
+    fn receiver_info(pairs: Value) -> Map<String, Value> {
+        let doc =
+            json!({"notification": {"endpoint": {"uri": "http://h/n", "receiverInfo": pairs}}});
+        doc.as_object().cloned().unwrap_or_default()
+    }
+
+    /// a masked value keeps the stored one only under the same key;
+    /// with nothing stored, or a key the stored endpoint lacks, the literal
+    /// value is what the client wrote.
+    #[test]
+    fn a_masked_value_keeps_only_a_credential_stored_under_its_key() {
+        let written = json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": MASKED}]);
+        let mut fragment = receiver_info(written.clone());
+        assert!(keep_masked_receiver_info(&mut fragment, &Map::new()).is_ok());
+        assert_eq!(fragment, receiver_info(written));
+
+        let stored = receiver_info(json!([{"key": "A", "value": "Bearer s"}]));
+        let mut fragment = receiver_info(
+            json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": MASKED}]),
+        );
+        assert!(keep_masked_receiver_info(&mut fragment, &stored).is_ok());
+        let expected =
+            json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": "Bearer s"}]);
+        assert_eq!(fragment, receiver_info(expected));
+    }
+
+    /// a masked value under a stored key stays with the stored uri;
+    /// beside another uri the update is refused naming receiverInfo, and a
+    /// literal value may go anywhere.
+    #[test]
+    fn a_masked_value_does_not_follow_a_new_uri() {
+        let stored = receiver_info(json!([{"key": "A", "value": "Bearer s"}]));
+        let mut fragment = json!({"notification": {"endpoint": {
+            "uri": "https://elsewhere/n",
+            "receiverInfo": [{"key": "A", "value": MASKED}]
+        }}})
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        let refused = keep_masked_receiver_info(&mut fragment, &stored);
+        let detail = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(detail.starts_with("receiverInfo:"), "{detail}");
+        assert!(!detail.contains("Bearer s"), "{detail}");
+
+        let mut literal = json!({"notification": {"endpoint": {
+            "uri": "https://elsewhere/n",
+            "receiverInfo": [{"key": "A", "value": "Bearer new"}]
+        }}})
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        let before = literal.clone();
+        assert!(keep_masked_receiver_info(&mut literal, &stored).is_ok());
+        assert_eq!(literal, before);
+    }
+
+    /// a read masks the endpoint URI's userinfo, and the masked
+    /// URI written back keeps the stored credentials.
+    #[test]
+    fn the_endpoint_uri_credentials_are_masked_and_kept() {
+        let mut n = json!({"endpoint": {"uri": "mqtt://u:secret@h:1883/t"}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        mask_receiver_info(&mut n);
+        assert_eq!(n["endpoint"]["uri"], "mqtt://***@h:1883/t");
+        let stored = json!({"notification": {"endpoint": {"uri": "mqtt://u:secret@h:1883/t"}}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut back = json!({"notification": n})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        assert!(keep_masked_receiver_info(&mut back, &stored).is_ok());
+        assert_eq!(
+            back["notification"]["endpoint"]["uri"],
+            "mqtt://u:secret@h:1883/t"
+        );
+        let mut plain = json!({"endpoint": {"uri": "http://h/n"}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        mask_receiver_info(&mut plain);
+        assert_eq!(plain["endpoint"]["uri"], "http://h/n");
+    }
 
     /// Table 5.2.33-1 `type`: "To indicate a request for all Entities (with
     /// implied local scope), \"*\" is also allowed as a value." It is neither
@@ -1151,6 +1614,26 @@ mod tests {
                 &ctx,
             ),
             "a stored \"*\" subscription must match every Entity"
+        );
+    }
+
+    /// Table 5.2.12-1 ngsildConformance: "A semantically versioned string in
+    /// the form major.minor" (Coraine subscription_ngsild_conformance).
+    #[test]
+    fn ngsild_conformance_is_major_dot_minor() {
+        let ctx = Loader::new().core();
+        let sub = |v: Value| {
+            json!({"type": "Subscription", "entities": [{"type": "Building"}], "ngsildConformance": v,
+                   "notification": {"endpoint": {"uri": "http://localhost:1111/notify"}}})
+        };
+        for bad in [json!("oneDotFive"), json!("1"), json!("1.8.1"), json!(1.8)] {
+            assert!(
+                normalize_subscription(sub(bad.clone()).as_object().unwrap(), &ctx, false).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            normalize_subscription(sub(json!("1.8")).as_object().unwrap(), &ctx, false).is_ok()
         );
     }
 
@@ -1621,17 +2104,16 @@ mod tests {
         }
     }
 
-    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9". The
-    /// matcher percent-decodes before parsing (4.9), so the DECODED form is
-    /// what must be validated here — otherwise an encoded paren bomb passes
-    /// creation and only unfolds inside the notification task.
+    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9", the
+    /// same string the matcher parses — read as written, so an encoded form
+    /// is not a query the matcher could ever run.
     #[test]
-    fn clause_5_2_12_q_is_validated_in_its_decoded_form() {
+    fn clause_5_2_12_q_is_validated_as_written() {
         assert!(norm(&sub(json!({"q": "temperature>20"}))).is_ok());
         assert!(norm(&sub(json!({"q": "(("}))).is_err());
         assert!(
             norm(&sub(json!({"q": "%28%28%28"}))).is_err(),
-            "a percent-encoded unbalanced expression must be rejected at creation"
+            "percent signs are not part of the 4.9 grammar"
         );
         assert!(norm(&sub(json!({"q": 5}))).is_err());
     }
@@ -1693,6 +2175,9 @@ mod tests {
             json!([{"type": "Building", "idPattern": r"(?:\p{Any}{100}){100}"}]),
             json!([{"type": "Building", "idPattern": 7}]),
             json!(["Building"]),
+            // id and its keyword alias collide (Coraine duplicate_id_type_alias_every_level 03)
+            json!([{"type": "Building", "id": "urn:ngsi-ld:B:1", "@id": "urn:ngsi-ld:B:2"}]),
+            json!([{"type": "Building", "@type": "Room"}]),
         ] {
             assert!(
                 norm(&sub(json!({ "entities": bad }))).is_err(),
@@ -1702,6 +2187,36 @@ mod tests {
     }
 
     // ---------- 5.2.14 / 5.2.15 notification parameters ----------
+
+    /// TS 104 243 5.2, Table 5.2-2: an MQTT notification's
+    /// `metadata.Content-Type` is "application/json" or
+    /// "application/ld+json", taken from `endpoint.accept`. A Subscription
+    /// asking an mqtt[s] endpoint for GeoJSON is refused at create and at
+    /// update (a fragment replaces `notification` whole); an HTTP endpoint
+    /// keeps it (TS 104 175 5.2.15).
+    #[test]
+    fn ts104243_5_2_mqtt_endpoint_refuses_geojson_accept() {
+        let doc = |uri: &str, accept: &str| {
+            sub(json!({"notification": {"endpoint": {"uri": uri, "accept": accept}}}))
+        };
+        for uri in ["mqtt://broker:1883/topic", "MQTTS://broker/t/sub"] {
+            for normalize in [norm, frag] {
+                let err = normalize(&doc(uri, "application/geo+json"))
+                    .expect_err("an mqtt endpoint cannot carry GeoJSON");
+                assert!(
+                    matches!(&err, NgsiError::BadRequestData(why)
+                        if why.contains("application/json") && why.contains("application/ld+json")),
+                    "{err:?}"
+                );
+                for accept in ["application/json", "application/ld+json"] {
+                    assert!(normalize(&doc(uri, accept)).is_ok(), "{uri} {accept}");
+                }
+            }
+        }
+        for normalize in [norm, frag] {
+            assert!(normalize(&doc("http://a/x", "application/geo+json")).is_ok());
+        }
+    }
 
     /// Table 5.2.15-1 Endpoint: uri is mandatory and a valid URI; cooldown
     /// and timeout are Numbers "Greater than 0"; accept is one of the three

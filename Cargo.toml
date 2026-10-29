@@ -18,24 +18,24 @@ members = [
 ]
 # Fuzz harness: own lockfile/profile, built only by cargo-fuzz on
 # nightly (.github/workflows/fuzz.yml) — never part of the normal build.
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/rumqttc"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 license = "EUPL-1.2"
 repository = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker"
 rust-version = "1.97"
 
 [workspace.dependencies]
-antares-model = { path = "crates/antares-model" }
+antares-model = { package = "ngsild-model", path = "crates/antares-model", version = "0.2" }
 antares-store = { path = "crates/antares-store" }
-antares-jsonld = { path = "crates/antares-jsonld" }
-antares-ql = { path = "crates/antares-ql" }
+antares-jsonld = { package = "ngsild-jsonld", path = "crates/antares-jsonld", version = "0.2" }
+antares-ql = { package = "ngsild-ql", path = "crates/antares-ql", version = "0.2" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }
-antares-matcher = { path = "crates/antares-matcher" }
+antares-matcher = { package = "ngsild-matcher", path = "crates/antares-matcher", version = "0.2" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
 
@@ -58,14 +58,26 @@ icu_collator = "2"
 icu_locale_core = "2"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"
+regex-syntax = "0.8"
+# Property tests: the q/scopeQ/geoQ pushdown against the evaluator.
+proptest = { version = "1", default-features = false, features = ["std"] }
 axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["normalize-path", "cors"] }
+tower-http = { version = "0.7", features = ["cors", "catch-panic", "compression-gzip", "compression-br"] }
+# the compression tests decode what the layer sends
+flate2 = "1"
+brotli = "9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 digests (antares-api)
+sha2 = { version = "0.10", default-features = false }
 redb = "4.1"
+# the at-rest seal of notification credentials (antares-sql); both
+# already in the tree through rustls and sqlx
+ring = "0.17"
+base64 = "0.23"
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 # The crypto provider for mqtts. rumqttc is built provider-less
 # (use-rustls-no-provider) so the workspace stays on ONE rustls stack with
@@ -85,7 +97,9 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "json", "chrono", "uuid", "migrate", "macros"] }
 # The JetStream change spine — official client, KV + streams in core
 # (0.50; pre-1.0 pin — upgrade in dedicated PRs)
-async-nats = "0.50"
+# Default features minus "websockets": the bus dials nats:// only, and that
+# transport pulled webpki-roots 0.26 (RUSTSEC-2026-0381) via tokio-websockets.
+async-nats = { version = "0.50", default-features = false, features = ["server_2_10", "server_2_11", "server_2_12", "server_2_14", "service", "ring", "jetstream", "nkeys", "crypto", "object-store", "kv", "nuid"] }
 futures-util = { version = "0.3", default-features = false }
 thiserror = "2"
 tracing = "0.1"
@@ -93,16 +107,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 # Observability: antares_ Prometheus metrics, env-gated OTLP traces
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
-opentelemetry = "0.32"
-opentelemetry_sdk = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry = "0.33"
+opentelemetry_sdk = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
     "http-proto",
     "reqwest-blocking-client",
 ] }
-opentelemetry-appender-tracing = "0.32"
-tracing-opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.33"
+tracing-opentelemetry = "0.34"
 console-subscriber = "0.5"
 
 # dev
@@ -140,9 +154,14 @@ debug = "line-tables-only"
 [profile.release]
 # Resident code is the largest idle-RSS consumer (measured 10.9 MiB
 # of a 37.5 MB unstripped binary). Symbols stripped (cargo-auditable's
-# .dep-v0 section survives), thin LTO for smaller + slightly faster code.
+# .dep-v0 section survives). Fat LTO: one module drops the copies
+# thin LTO imports into each unit; 32.3 -> 27.0 MB,
+# 3-9 % less broker CPU per request on every shape, +3 min per release link.
 strip = "symbols"
-lto = "thin"
+lto = "fat"
+# Integer overflow panics instead of wrapping: within 3 % of unchecked on
+# the stable perf-baseline shapes (docs/src/perf-baseline.md).
+overflow-checks = true
 
 [profile.wasm-release]
 inherits = "release"
@@ -164,3 +183,7 @@ unwrap_used = "warn"
 # clippy 1.98.0 runs this lint into >14 GB on the antares-api test target
 # (the CI runner dies with a bare SIGTERM); every other style lint stays on.
 needless_borrows_for_generic_args = "allow"
+
+# rumqttc 0.25.1 with rustls-webpki 0.103 until a release has it (vendor/rumqttc/README.md).
+[patch.crates-io]
+rumqttc = { path = "vendor/rumqttc" }
