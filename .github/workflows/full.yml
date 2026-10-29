@@ -1,9 +1,8 @@
 name: full
 
-# The EVERYTHING pipeline — twice a week on schedule, on every v* tag, when
-# a PR into main opens or leaves draft (the promotion of dev, which cannot merge without
-# the whole grid green; ci.yml's quick preset gates dev itself), and on
-# manual dispatch: workspace tests, the
+# The EVERYTHING pipeline — twice a week on schedule and on manual
+# dispatch; a dispatch with `release` set IS the release (see below; ci.yml's
+# quick preset gates dev itself): workspace tests, the
 # browser/wasm artifact proven in both runtimes, the wasm Node tier, and
 # the reusable cell matrix at the FULL preset (all seven cells — memory/file/postgres/timescale, both
 # rolling -nats fleets, wasm-file — each serial-all-suites against one
@@ -16,9 +15,14 @@ name: full
 # 7-cell run (per-commit quick bundles are named ETSI-quick-results and
 # never folded).
 #
-# Publishing: a green v* tag mints the release image (:<version> +
-# :latest); schedule/dispatch runs publish only the ETSI-proven wasm dev
-# image (the native :dev ships per-commit from ci.yml).
+# Releasing: Actions → full → Run workflow on dev with `release` = 0.MINOR.PATCH.
+# The grid runs once on that commit; only when all of it is green does the
+# run tag v<release> on the tested commit, publish the image (:<version> +
+# :<minor> + :latest), binaries, wasm bundle and SBOM from the bytes it
+# tested, and move main to the release. A red run creates no tag, so the
+# same version is simply run again after the fix. Schedule and plain
+# dispatch runs publish only the ETSI-proven wasm dev image (the native
+# :dev ships per-commit from ci.yml).
 # Moved out: the roll-under-suite drill lives in roll-weekly.yml
 # (weekly + dispatch), the k8s manifest smoke in k8s-smoke.yml (dispatch).
 
@@ -27,38 +31,34 @@ on:
     # Wed + Sat 03:23 UTC — the twice-a-week full proof, offset from
     # strict's daily 02:41, fuzz's Mon+Thu 03:17 and roll-weekly's Tue 04:17.
     - cron: "23 3 * * 3,6"
-  push:
-    tags: ["v*"]
-  pull_request:
-    branches: [main] # the promotion gate; PRs into dev run ci.yml
-    # No `synchronize`: while the promotion PR is open, a push to dev moves
-    # its head and would rerun the whole grid per commit. The grid runs when
-    # the PR opens, reopens or leaves draft. The required checks hang on the
-    # head commit, so after later pushes prove the final head once: close and
-    # reopen the PR, or flip it to draft and back. A workflow_dispatch run on
-    # dev does not count: the ruleset only credits runs tied to the PR.
-    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Release version, e.g. 0.2.1 (must equal the Cargo.toml workspace version). Empty: test run, nothing published."
+        type: string
+        default: ""
 
 # The default for every job here; the ones that publish an image, cut a
 # release or file an issue declare their own wider set.
 permissions:
   contents: read
 
+# A release run is never cancelled, and a schedule on dev never cancels it.
 concurrency:
-  group: full-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: full-${{ github.ref }}-${{ inputs.release || 'test' }}
+  cancel-in-progress: ${{ !inputs.release }}
 
 env:
   MEM_LIMIT_MB: 350
+  # 0.2.1 and v0.2.1 for a release run, empty otherwise
+  RELEASE: ${{ inputs.release }}
+  TAG: ${{ inputs.release && format('v{0}', inputs.release) || '' }}
 
 jobs:
   source:
-    # The branch model, held before a runner is spent on the grid: a pull
-    # request into main is the promotion of this repository's dev, and a
-    # v* tag names a commit on main carrying the workspace version. It
-    # always runs and passes on schedule and dispatch, because a skipped
-    # job would satisfy the required check it is on main.
+    # The release rules, held before a runner is spent on the grid: a
+    # release runs on dev, carries the workspace version and names a tag
+    # that does not exist yet. Every other run passes.
     name: Source of the change
     runs-on: ubuntu-latest
     steps:
@@ -66,8 +66,6 @@ jobs:
         with:
           fetch-depth: 0
       - run: dev/check-source.sh --self-test && dev/check-source.sh
-        env:
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
 
   workspace:
     # The shared workspace-test gate (workflow_call) — one definition for
@@ -95,7 +93,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        if: ${{ !inputs.release }}
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: wasm-bindgen (lockfile-matched) + binaryen
@@ -161,7 +159,7 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        if: ${{ !inputs.release }}
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: wasm toolchain
@@ -219,24 +217,51 @@ jobs:
 
   build-arm:
     # The arm64 half of the released manifest — BUILT, never tested; the
-    # rationale lives in the shared build-image.yml. Tag runs only.
+    # rationale lives in the shared build-image.yml. Release runs only.
     name: Build the arm64 image (untested)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release != ''
     uses: ./.github/workflows/build-image.yml
     with:
       arch: arm64
 
+  tag:
+    # The release exists from here on: every gate and every artifact of
+    # this run is green, so the tag names exactly the commit they tested.
+    # It is final (protect-tags), which is why nothing creates it earlier.
+    # A tag pushed with GITHUB_TOKEN starts no workflow, so the examples
+    # run that used to follow a tag push is dispatched here.
+    name: Tag the release
+    if: inputs.release != '' && success()
+    needs: [source, workspace, wasm, matrix, etsi-wasm, upgrade-path, release-binaries, build-arm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          git config user.name "$ACTOR"
+          git config user.email "$ACTOR_ID+$ACTOR@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$TAG"
+          gh workflow run examples.yml --ref "$TAG"
+          echo "Tagged $TAG on ${GITHUB_SHA::7}." >> "$GITHUB_STEP_SUMMARY"
+
   publish-release:
-    # A version tag is the only thing that mints a production image, and it
+    # A release run is the only thing that mints a production image, and it
     # needs the full cell matrix green (each cell is serial-all-suites).
     # The roll drill (roll-weekly.yml) and k8s smoke (k8s-smoke.yml) run on
     # their own cadence and no longer gate the release.
     name: Publish the release image to GHCR
-    if: startsWith(github.ref, 'refs/tags/v') && success()
+    if: inputs.release != '' && success()
     # The binaries and the browser proof are in the set on purpose: the
     # image and :latest move only when the whole release can ship, so a red
     # binary never leaves a version on the registry that has no release.
-    needs: [matrix, build-arm, release-binaries, wasm]
+    needs: [tag, matrix, build-arm, release-binaries, wasm]
     runs-on: ubuntu-latest
     permissions:
       packages: write
@@ -265,7 +290,7 @@ jobs:
           # Image tags carry the bare version (the git tag is v0.1.1, the
           # image is :0.1.1, as registries name images), plus the minor
           # (:0.1 follows the newest patch) and :latest.
-          VER="${GITHUB_REF_NAME#v}"
+          VER="$RELEASE"
           MINOR="${VER%.*}"
           SHA=${GITHUB_SHA::7}
           docker tag antares-local:latest "$IMG:$SHA-amd64"
@@ -283,7 +308,7 @@ jobs:
     # turn, so the proof is the real artifact pair rather than a migration
     # read by eye. Nothing to prove on the FIRST tag: there is no N-1.
     name: Upgrade path from the previous release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release != ''
     needs: workspace
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -307,7 +332,7 @@ jobs:
       - name: Resolve the previous release tag
         id: prev
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
+          VER="$TAG"
           PREV=$(git tag --list 'v*' --sort=-v:refname | grep -v "^$VER$" | head -1)
           echo "tag=$PREV" >> "$GITHUB_OUTPUT"
           if [ -z "$PREV" ]; then
@@ -342,7 +367,7 @@ jobs:
   release-binaries:
     # Static musl binaries per arch — release assets.
     name: Release binary (${{ matrix.target }})
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.release != ''
     needs: workspace
     strategy:
       matrix:
@@ -378,7 +403,7 @@ jobs:
           # from the same dependency set (the Dockerfile builds locked too).
           cargo build --locked --release --target ${{ matrix.target }} -p antares-broker
           strip "target/${{ matrix.target }}/release/antares"
-          VER="${GITHUB_REF#refs/tags/}"
+          VER="$TAG"
           tar czf "antares-$VER-${{ matrix.target }}.tar.gz"             -C "target/${{ matrix.target }}/release" antares             -C "$GITHUB_WORKSPACE" LICENSE README.md
       - uses: actions/upload-artifact@v7
         with:
@@ -389,7 +414,7 @@ jobs:
     # The GitHub Release — gated on the SAME green the image needed,
     # with binaries, the wasm bundle, an SBOM, and a signed image.
     name: GitHub Release (assets + SBOM + signature)
-    if: startsWith(github.ref, 'refs/tags/v') && success()
+    if: inputs.release != '' && success()
     needs: [publish-release, release-binaries, wasm]
     runs-on: ubuntu-latest
     permissions:
@@ -400,7 +425,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: The image tag is the bare version
         id: image
-        run: echo "tag=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$RELEASE" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v8
         with:
           pattern: release-bin-*
@@ -412,14 +437,14 @@ jobs:
           path: wasm-pkg
       - name: Zip the wasm bundle
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
+          VER="$TAG"
           (cd wasm-pkg && zip -qr "../antares-wasm-$VER.zip" .)
       - name: SBOM (syft, spdx-json) of the released image
         uses: anchore/sbom-action@v0
         with:
           image: ghcr.io/${{ github.repository_owner }}/antares-broker:${{ steps.image.outputs.tag }}
           format: spdx-json
-          output-file: antares-${{ github.ref_name }}.sbom.spdx.json
+          output-file: antares-${{ env.TAG }}.sbom.spdx.json
           upload-artifact: false
       - name: Sign the image (cosign keyless)
         uses: sigstore/cosign-installer@v3
@@ -430,19 +455,43 @@ jobs:
           cosign sign --yes "ghcr.io/${{ github.repository_owner }}/antares-broker:${{ steps.image.outputs.tag }}"
       - name: Release notes from the commit log
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
-          # --force, or the fetch dies silently: checkout pins the tag by
-          # sha (+<sha>:refs/tags/<tag>), leaving a lightweight local tag
-          # where the remote has an annotated object, and git rejects the
-          # update as "would clobber existing tag" — exit 1, no output,
-          # since -q swallows the rejection.
+          VER="$TAG"
           git fetch -q --tags --force --unshallow 2>/dev/null || git fetch -q --tags --force
-          PREV=$(git describe --tags --abbrev=0 "$VER^" 2>/dev/null || true)
+          # the newest other release by version, not `git describe`: tags up
+          # to v0.2.0 sit on main's merge commits, which dev never reaches
+          PREV=$(git tag --list 'v*' --sort=-v:refname | grep -v "^$VER$" | head -1)
           git log --no-merges --format='- %s' ${PREV:+$PREV..}"$VER" > notes.md
           [ -s notes.md ] || echo "Antares $VER." > notes.md
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VER="${GITHUB_REF#refs/tags/}"
+          VER="$TAG"
           gh release create "$VER"             --title "Antares $VER" --notes-file notes.md             antares-*.tar.gz "antares-wasm-$VER.zip" "antares-$VER.sbom.spdx.json"
+
+  main:
+    # main is the latest release: a merge commit of the released commit on
+    # top of the previous release, pushed by this job (the protect-main
+    # ruleset lets GitHub Actions, and nobody else, update it). The docs
+    # link tree/main for the reference manifests and ADRs of the release.
+    name: Move main to the release
+    if: inputs.release != '' && success()
+    needs: github-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - env:
+          ACTOR: ${{ github.actor }}
+          ACTOR_ID: ${{ github.actor_id }}
+        run: |
+          git config user.name "$ACTOR"
+          git config user.email "$ACTOR_ID+$ACTOR@users.noreply.github.com"
+          git fetch -q origin "$GITHUB_SHA"
+          git merge --no-ff -X theirs -m "Release $TAG" "$GITHUB_SHA"
+          git diff --quiet "$GITHUB_SHA" HEAD || { echo "::error::main's tree differs from the release"; exit 1; }
+          git push origin HEAD:main

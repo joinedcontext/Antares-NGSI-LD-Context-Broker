@@ -1,7 +1,8 @@
 name: examples
 
 # Every example's run script executes against a freshly built image —
-# release gate on v* tags, weekly drift catch, and manual dispatch.
+# after every release (full.yml's release run dispatches it on the new tag),
+# weekly drift catch, and manual dispatch.
 on:
   push:
     tags: ["v*"]

@@ -4,7 +4,7 @@
 
 ## Proof
 
-- [ ] Base branch is `dev` (only a release promotion targets `main`)
+- [ ] Base branch is `dev` (`main` only moves with a release)
 - [ ] Targeted tests green (`cargo test -p <crate> <filter> -j 2`) — paste the tail
 - [ ] Normative change: clause's Robot TPs green against a local broker (CONTRIBUTING recipe)
 - [ ] New test seen red first (test-first) or one invert→fail→restore cycle
