@@ -143,6 +143,11 @@ if (process.env.ANTARES_SWEEP_SECS) {
 if (process.env.ANTARES_PUBLIC_URL) {
   globalThis.ANTARES_PUBLIC_URL = process.env.ANTARES_PUBLIC_URL;
 }
+// 6.3.10: the temporal instance ceiling, same route; the ETSI cells set 9
+// for the suite's 206 cases, absent leaves the native default.
+if (process.env.ANTARES_TEMPORAL_INSTANCE_LIMIT) {
+  globalThis.ANTARES_TEMPORAL_INSTANCE_LIMIT = Number(process.env.ANTARES_TEMPORAL_INSTANCE_LIMIT);
+}
 const hostAlias = process.env.ANTARES_HOST_ALIAS ?? `antares-wasm-${port}`;
 
 const storeMode = process.env.ANTARES_STORE ?? "memory";
