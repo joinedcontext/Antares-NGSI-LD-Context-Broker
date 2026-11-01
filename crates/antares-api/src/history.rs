@@ -671,6 +671,74 @@ pub(crate) async fn drain(st: &AppState, evs: Vec<TemporalEvent>) {
     }
 }
 
+/// What one request buffered: its history events and its changes for the
+/// matcher. They stand for writes that already committed, so they are
+/// handed on however the request ends — a handler that panicked, or a
+/// request whose future was dropped (a client that went away) still leaves
+/// its history and its notifications, which dropping the buffers with the
+/// task-locals lost.
+#[cfg(not(target_arch = "wasm32"))]
+struct Buffered {
+    st: AppState,
+    evs: Vec<TemporalEvent>,
+    changes: Vec<crate::mirror::Change>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Buffered {
+    /// Takes what the request's buffers hold; called inside their scope.
+    fn collect(&mut self) {
+        if let Ok(evs) = BUFFER.try_with(std::cell::RefCell::take) {
+            self.evs.extend(evs);
+        }
+        if let Ok(changes) = CHANGES.try_with(std::cell::RefCell::take) {
+            self.changes.extend(changes);
+        }
+    }
+
+    /// The drain and the hand-over to the matcher as a task of their own:
+    /// once started they finish whether or not anybody still waits for them,
+    /// so a request dropped in the middle of the drain loses neither half.
+    /// `None` when there is nothing to hand on.
+    fn hand_on(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        if self.evs.is_empty() && self.changes.is_empty() {
+            return None;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                events = self.evs.len(),
+                changes = self.changes.len(),
+                "no runtime left to record a request's history"
+            );
+            return None;
+        };
+        let (st, evs, changes) = (
+            self.st.clone(),
+            std::mem::take(&mut self.evs),
+            std::mem::take(&mut self.changes),
+        );
+        Some(rt.spawn(async move {
+            drain(&st, evs).await;
+            if !changes.is_empty() {
+                if let Some(flush) = &st.change_flush {
+                    flush(changes);
+                }
+            }
+        }))
+    }
+}
+
+/// Dropped before [`layer`] took it out of the buffers' scope: the request
+/// ended without an answer. Tokio drops a scoped future with its
+/// task-locals set, so the buffers are still there to collect.
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Buffered {
+    fn drop(&mut self) {
+        self.collect();
+        let _ = self.hand_on();
+    }
+}
+
 /// Router layer: scopes the buffer over the handler and drains it once the
 /// response is built. Drained BEFORE the response is returned so
 /// read-your-writes holds at any store latency (the ETSI temporal suites
@@ -683,7 +751,7 @@ pub(crate) async fn layer(
 ) -> axum::response::Response {
     let provenance = crate::provenance::of_request(req.headers(), st.provenance_from.as_deref());
     let tenant = crate::negotiate::tenant_from(req.headers()).ok();
-    let (resp, evs, changes) = BUFFER
+    let (resp, mut buffered) = BUFFER
         .scope(std::cell::RefCell::new(Vec::new()), async {
             STAGED
                 .scope(
@@ -693,8 +761,14 @@ pub(crate) async fn layer(
                             .scope(
                                 provenance,
                                 TENANT.scope(tenant, async {
+                                    let mut buffered = Buffered {
+                                        st: st.clone(),
+                                        evs: Vec::new(),
+                                        changes: Vec::new(),
+                                    };
                                     let resp = next.run(req).await;
-                                    (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
+                                    buffered.collect();
+                                    (resp, buffered)
                                 }),
                             )
                             .await
@@ -703,10 +777,9 @@ pub(crate) async fn layer(
                 .await
         })
         .await;
-    drain(&st, evs).await;
-    if !changes.is_empty() {
-        if let Some(flush) = &st.change_flush {
-            flush(changes);
+    if let Some(task) = buffered.hand_on() {
+        if let Err(e) = task.await {
+            tracing::warn!("recording a request's history failed: {e}");
         }
     }
     resp
@@ -731,8 +804,16 @@ pub(crate) async fn mirror_delete_entity(st: &AppState, tenant: &TenantId, id: &
         return;
     }
     if let Err(e) = st.temporal.delete(tenant, id).await {
+        note_mirror_error();
         tracing::warn!("temporal mirror delete failed: {e}");
     }
+}
+
+/// A history write of the delete mirror failed: counted with the drain's,
+/// because the history it should have recorded is lost the same way.
+fn note_mirror_error() {
+    DRAIN_ERRORS.fetch_add(1, Ordering::Relaxed);
+    metrics::counter!("antares_temporal_drain_errors_total").increment(1);
 }
 
 /// 4.5.7/4.5.8: "In case the Property is deleted, an instance of the
@@ -832,6 +913,7 @@ pub(crate) async fn mirror_delete_attr(
         })
         .await;
     if let Err(e) = r {
+        note_mirror_error();
         tracing::warn!("temporal attr mirror failed: {e}");
     }
 }
@@ -839,6 +921,131 @@ pub(crate) async fn mirror_delete_attr(
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// A history store whose writes all fail.
+    struct Down;
+
+    #[async_trait::async_trait]
+    impl antares_store::TemporalDriver for Down {
+        async fn event_list(&self, _evs: &[TemporalEvent]) -> Result<(), antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn temporal_append(
+            &self,
+            _t: &TenantId,
+            _id: &str,
+            _shell: &Value,
+            _additions: &Value,
+        ) -> Result<(), antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn query_temporal(
+            &self,
+            _t: &TenantId,
+            _f: &antares_store::filter::TemporalFilter<'_>,
+        ) -> Result<antares_store::filter::TemporalOutcome, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn get_temporal(
+            &self,
+            _t: &TenantId,
+            _id: &str,
+            _f: &antares_store::filter::TemporalFilter<'_>,
+        ) -> Result<Option<Value>, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn get(
+            &self,
+            _t: &TenantId,
+            _id: &str,
+        ) -> Result<Option<Value>, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn create(
+            &self,
+            _t: &TenantId,
+            _id: &str,
+            _doc: Value,
+        ) -> Result<bool, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn upsert(
+            &self,
+            _t: &TenantId,
+            _id: &str,
+            _doc: Value,
+        ) -> Result<bool, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn delete(&self, _t: &TenantId, _id: &str) -> Result<bool, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn list(&self, _t: &TenantId) -> Result<Vec<Value>, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+        async fn mutate_boxed<'a>(
+            &self,
+            _t: &TenantId,
+            _id: &str,
+            _f: antares_store::MutateFn<'a>,
+        ) -> Result<Option<Result<(), ()>>, antares_model::NgsiError> {
+            Err(antares_model::NgsiError::InternalError(
+                "history store down".into(),
+            ))
+        }
+    }
+
+    /// The delete mirrors lose history exactly as a failed drain does, so
+    /// they are counted in the same `temporalDrainErrors`.
+    #[tokio::test]
+    async fn a_failed_delete_mirror_is_counted_as_a_drain_error() {
+        let base = AppState::new("antares-mirror-errors".into());
+        let st = AppState::with_drivers(
+            "antares-mirror-errors".into(),
+            base.store.clone(),
+            std::sync::Arc::new(Down),
+            "memory",
+        );
+        let t = TenantId::new("mirrorerrors").expect("tenant");
+        let before = drain_errors();
+        mirror_delete_entity(&st, &t, "urn:ngsi-ld:T:1").await;
+        let after_entity = drain_errors();
+        assert!(
+            after_entity > before,
+            "the entity delete mirror was not counted"
+        );
+        mirror_delete_attr(
+            &st,
+            &t,
+            "urn:ngsi-ld:T:1",
+            "https://x/a",
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        assert!(
+            drain_errors() > after_entity,
+            "the attribute delete mirror was not counted"
+        );
+    }
 
     fn ev(id: &str) -> TemporalEvent {
         TemporalEvent {
@@ -881,5 +1088,90 @@ mod tests {
             .await;
         let ids: Vec<&str> = buffered.iter().map(|e| e.entity_id.as_str()).collect();
         assert_eq!(ids, ["urn:b"]);
+    }
+
+    /// A handler behind [`layer`] that commits a write, buffers its history
+    /// event and its change, and then ends as `end` does; the matcher's
+    /// hand-over is counted.
+    fn committed_then(
+        end: fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) -> (AppState, axum::Router, std::sync::Arc<AtomicU64>) {
+        let mut st = AppState::new("t".into());
+        let flushed = std::sync::Arc::new(AtomicU64::new(0));
+        let counter = flushed.clone();
+        st.change_flush = Some(std::sync::Arc::new(move |changes| {
+            counter.fetch_add(changes.len() as u64, Ordering::SeqCst);
+        }));
+        let handler = move |axum::extract::State(st): axum::extract::State<AppState>| async move {
+            let tenant = TenantId::new("t").expect("tenant");
+            let doc =
+                serde_json::json!({"id": "urn:ngsi-ld:T:1", "type": ["https://example.org/T"]});
+            st.store
+                .upsert(&tenant, antares_store::Kind::Entity, "urn:ngsi-ld:T:1", doc)
+                .await
+                .expect("commit");
+            push(&st, ev("urn:ngsi-ld:T:1")).await;
+            assert!(buffer_change(("urn:ngsi-ld:T:1".to_owned(), None, None)).is_none());
+            end().await;
+        };
+        let app = axum::Router::new()
+            .route("/w", axum::routing::post(handler))
+            .layer(axum::middleware::from_fn_with_state(st.clone(), layer))
+            .layer(tower_http::catch_panic::CatchPanicLayer::new())
+            .with_state(st.clone());
+        (st, app, flushed)
+    }
+
+    /// Whether the event `committed_then` buffered reached history and its
+    /// change the matcher, waiting a moment for the task that hands them on.
+    async fn handed_on(st: &AppState, flushed: &AtomicU64) -> bool {
+        let tenant = TenantId::new("t").expect("tenant");
+        for _ in 0..200 {
+            let recorded = st
+                .temporal
+                .get(&tenant, "urn:ngsi-ld:T:1")
+                .await
+                .expect("read")
+                .is_some();
+            if recorded && flushed.load(Ordering::SeqCst) == 1 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    fn post() -> axum::extract::Request {
+        axum::http::Request::post("/w")
+            .body(axum::body::Body::empty())
+            .expect("request")
+    }
+
+    /// A client that goes away drops its request's future: what the
+    /// handler already committed is still recorded and still notified.
+    #[tokio::test]
+    async fn a_dropped_request_still_records_and_notifies_what_it_committed() {
+        use tower::ServiceExt as _;
+        let (st, app, flushed) = committed_then(|| Box::pin(std::future::pending()));
+        let answer = tokio::time::timeout(Duration::from_millis(200), app.oneshot(post())).await;
+        assert!(answer.is_err(), "the handler never answers");
+        assert!(
+            handed_on(&st, &flushed).await,
+            "the committed write was lost"
+        );
+    }
+
+    /// So is a handler that panics after its write committed (the 500
+    /// comes from a layer outside this one).
+    #[tokio::test]
+    async fn a_panicking_handler_still_records_and_notifies_what_it_committed() {
+        use tower::ServiceExt as _;
+        let (st, app, flushed) = committed_then(|| Box::pin(async { panic!("after the commit") }));
+        let resp = app.oneshot(post()).await.expect("response");
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            handed_on(&st, &flushed).await,
+            "the committed write was lost"
+        );
     }
 }

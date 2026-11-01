@@ -854,6 +854,7 @@ impl PgDocStore {
         for kind in [
             DocKind::Subscription,
             DocKind::CSourceSubscription,
+            DocKind::Snapshot,
             DocKind::DeadLetter,
         ] {
             let Some(path) = super::seal::plaintext_path(kind) else {

@@ -364,3 +364,71 @@ async fn table_6_4_3_2_2_a_repeated_entitymap_header_names_no_map() {
         "an unreadable NGSILD-EntityMap must not be treated as absent: {body}"
     );
 }
+
+/// 5.7.4.4 with a projection: which Entities a temporal query matches does
+/// not depend on whether the client asked to see their `id`. A map built
+/// by a picked query holds its Entities, and a map paged with `pick` or
+/// `omit=id` keeps them through the recheck ("Entities not or no longer
+/// fitting the query shall be removed" — these still fit).
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_7_4_4_a_projected_query_keeps_its_temporal_entity_map() {
+    let st = state().await;
+    create_vehicle(&st, "urn:ngsi-ld:Vehicle:pk1", 30).await;
+    let q = "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after\
+             &timeAt=2000-01-01T00:00:00Z&timeproperty=createdAt";
+    let held = |map: Value| map["entityMap"].get("urn:ngsi-ld:Vehicle:pk1").is_some();
+
+    // built by a picked query
+    let (status, headers, body) = get(&st, &format!("{q}&pick=speed&entityMap=true")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let loc = map_header(&headers).expect("map location");
+    let (status, _, map) = get(&st, &loc).await;
+    assert_eq!(status, StatusCode::OK, "{map}");
+    assert!(held(map.clone()), "pick=speed emptied the new map: {map}");
+
+    // a map built plainly, then paged under projections
+    let (status, headers, body) = get(&st, &format!("{q}&entityMap=true")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let loc = map_header(&headers).expect("map location");
+    for projection in ["pick=speed", "omit=id"] {
+        let (status, _, body) = get_with_map(&st, &format!("{q}&{projection}"), &loc).await;
+        assert_eq!(status, StatusCode::OK, "{projection}: {body}");
+        assert_eq!(
+            body.as_array().map(Vec::len),
+            Some(1),
+            "{projection}: {body}"
+        );
+        let (status, _, map) = get(&st, &loc).await;
+        assert_eq!(status, StatusCode::OK, "{map}");
+        assert!(
+            held(map.clone()),
+            "{projection} pruned a fitting Entity: {map}"
+        );
+    }
+}
+
+/// 4.21 writes the disjunction of a projection as `,` or `|`. The EntityMap
+/// walks add `id` to a `pick` and take it out of an `omit`, and they split
+/// the projection on `,` alone: `pick=id|speed` gained a second `id` and was
+/// refused as a duplicate member, and `omit=id|brand` kept `id` out of the
+/// rendered answer, so the map read as empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_21_a_pipe_projection_keeps_its_temporal_entity_map() {
+    let st = state().await;
+    create_vehicle(&st, "urn:ngsi-ld:Vehicle:pp1", 30).await;
+    let q = "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after\
+             &timeAt=2000-01-01T00:00:00Z&timeproperty=createdAt";
+    // `brand` is no Attribute of the Vehicle: omitting `speed`, its only
+    // one, would leave nothing temporal and rightly drop it from the window
+    for projection in ["pick=id%7Cspeed", "omit=id%7Cbrand"] {
+        let (status, headers, body) = get(&st, &format!("{q}&{projection}&entityMap=true")).await;
+        assert_eq!(status, StatusCode::CREATED, "{projection}: {body}");
+        let loc = map_header(&headers).expect("map location");
+        let (status, _, map) = get(&st, &loc).await;
+        assert_eq!(status, StatusCode::OK, "{map}");
+        assert!(
+            map["entityMap"].get("urn:ngsi-ld:Vehicle:pp1").is_some(),
+            "{projection} emptied the map: {map}"
+        );
+    }
+}

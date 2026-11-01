@@ -62,6 +62,7 @@ pub(super) async fn query_temporal_outer(
     // second temporal query per map-using request, same shape as the entity
     // query's filter re-run.
     let mut matching: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let id_headers = ids_shown(headers);
     for chunk in candidates.chunks(st.max_limit.max(1)) {
         let mut eff = params.clone();
         for k in ["limit", "offset", "count"] {
@@ -69,7 +70,8 @@ pub(super) async fn query_temporal_outer(
         }
         eff.insert("limit".into(), st.max_limit.to_string());
         eff.insert("id".into(), chunk.join(","));
-        let resp = query_temporal_inner(st, &eff, headers, &filter).await?;
+        show_ids(&mut eff);
+        let resp = query_temporal_inner(st, &eff, &id_headers, &filter).await?;
         let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
             .await
             .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
@@ -124,6 +126,65 @@ pub(super) async fn query_temporal_outer(
     Ok(resp)
 }
 
+/// The EntityMap walks above read the matching Entities' ids off a rendered
+/// answer, so it has to show them: a `pick` without `id` or an `omit=id`
+/// rendered Entities with none, and the walk read the map as empty. `id`
+/// is added to `pick` and taken out of `omit`; every other term stays,
+/// since `pick`'s and `omit`'s Attributes decide which Entities the window
+/// keeps.
+fn show_ids(params: &mut HashMap<String, String>) {
+    if let Some(pick) = params.get_mut("pick") {
+        if !top_level_terms(pick).contains(&"id") {
+            *pick = format!("id,{pick}");
+        }
+    }
+    if let Some(omit) = params.get("omit") {
+        let rest: Vec<&str> = top_level_terms(omit)
+            .into_iter()
+            .filter(|t| *t != "id")
+            .collect();
+        if rest.is_empty() {
+            params.remove("omit");
+        } else {
+            let rest = rest.join(",");
+            params.insert("omit".into(), rest);
+        }
+    }
+}
+
+/// The terms of a 4.21 projection outside any `{…}`, trimmed. 4.21 writes
+/// the disjunction as `,` or `|` (`orOp`), and `parse_projection` splits on
+/// both: split here on `,` alone, `pick=id|speed` was one term, gained a
+/// second `id` and was refused as a duplicate member.
+fn top_level_terms(projection: &str) -> Vec<&str> {
+    let (mut terms, mut depth, mut start) = (Vec::new(), 0usize, 0usize);
+    for (i, c) in projection.char_indices() {
+        match c {
+            '{' => depth = depth.saturating_add(1),
+            '}' => depth = depth.saturating_sub(1),
+            ',' | '|' if depth == 0 => {
+                terms.push(projection.get(start..i).unwrap_or_default().trim());
+                start = i.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    terms.push(projection.get(start..).unwrap_or_default().trim());
+    terms
+}
+
+/// The request's headers with the answer asked for as plain JSON, whose
+/// Entities carry their `id` at the top: a GeoJSON FeatureCollection is no
+/// array, and the walk read it as no Entity at all.
+fn ids_shown(headers: &HeaderMap) -> HeaderMap {
+    let mut h = headers.clone();
+    h.insert(
+        axum::http::header::ACCEPT,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    h
+}
+
 /// The 5.7.4.4 preconditions of a temporal query, before any store is
 /// touched: the filter must qualify, Linked Entity conditions are not
 /// defined for it, a context source filter must parse, and ordering may
@@ -136,21 +197,9 @@ pub(super) async fn check_temporal_query(
     ctx: &Context,
     q_ast: Option<&antares_ql::QNode>,
 ) -> ApiResult<()> {
-    let attrs_qualify = params.get("attrs").is_some_and(|a| {
-        a.split(',')
-            .any(|n| antares_ql::is_non_system_attr(n.trim()))
-    });
-    let q_qualifies = q_ast.is_some_and(|ast| {
-        ast.attribute_paths()
-            .iter()
-            .any(|h| antares_ql::is_non_system_attr(h))
-    });
-    let has_filter = params.contains_key("type")
-        || attrs_qualify
-        || q_qualifies
-        || params.contains_key("georel")
-        || params.get("local").map(String::as_str) == Some("true");
-    if !has_filter {
+    // Table 6.4.3.2-1, as on the entity query (5.7.2.4)
+    crate::entities::star_type_local(params)?;
+    if !crate::entities::qualifies_non_wide(params, q_ast) {
         return Err(NgsiError::BadRequestData(
             "temporal query needs at least one of type, attrs, q, georel (5.7.4)".into(),
         )
@@ -267,15 +316,17 @@ pub(super) fn respond_aggregated(
 /// not narrow away itself.
 pub(super) fn type_and_attrs_match(
     doc: &Value,
-    types: Option<&Vec<String>>,
+    type_sel: Option<&Vec<Vec<String>>>,
     entity_attr_filter: Option<&Vec<String>>,
 ) -> bool {
-    if let Some(types) = types {
+    if let Some(sel) = type_sel {
+        // 4.17: one alternative whose every type the Entity has
         let etypes = doc["type"].as_array().cloned().unwrap_or_default();
-        if !etypes
-            .iter()
-            .any(|t| types.iter().any(|w| Some(w.as_str()) == t.as_str()))
-        {
+        if !sel.iter().any(|and_group| {
+            and_group
+                .iter()
+                .all(|w| etypes.iter().any(|t| t.as_str() == Some(w.as_str())))
+        }) {
             return false;
         }
     }
@@ -336,7 +387,7 @@ pub(crate) async fn query_temporal_inner(
     headers: &HeaderMap,
     filter: &crate::policy::Filter,
 ) -> ApiResult<Response> {
-    query_temporal_collected(st, params, headers, filter, None).await
+    query_temporal_collected(st, params, headers, filter, None, None).await
 }
 
 /// The same query, with the merged documents of each page handed to `merged`
@@ -344,18 +395,24 @@ pub(crate) async fn query_temporal_inner(
 /// query and has to STORE what it matched: for an Evolution held by a
 /// registered Context Source there is nothing else in this broker to store —
 /// the fan-out's answer is the only copy, and the response body is a
-/// presentation of it that compaction does not undo.
+/// presentation of it that compaction does not undo. `ctx`, when given,
+/// stands for the Link header's: a Snapshot's own @context, which may be
+/// inline and so has no Link form.
 pub(crate) async fn query_temporal_collected(
     st: &AppState,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
     filter: &crate::policy::Filter,
     merged: Option<&mut Vec<Value>>,
+    ctx: Option<std::sync::Arc<Context>>,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, QUERY_PARAMS)?;
     let accept = parse_accept(headers)?;
-    let ctx = request_context(&st.loader, headers).await?;
+    let ctx = match ctx {
+        Some(ctx) => ctx,
+        None => request_context(&st.loader, headers).await?,
+    };
     // 5.7.4.4 a-e: id/idPattern alone are NOT sufficient, and the attrs
     // list / q must include at least one non-system Attribute to qualify.
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
@@ -541,6 +598,10 @@ struct Parsed<'p> {
     trepr: TRepr,
     ids: Option<Vec<&'p str>>,
     id_pattern: Option<IdMatcher>,
+    /// the 4.17 type selection: alternatives of types an Entity must all
+    /// have; `None` for no selector or `*`
+    type_sel: Option<Vec<Vec<String>>>,
+    /// every type the selection names, the store's (OR) prefilter
     types: Option<Vec<String>>,
     /// what the window keeps per Entity
     attrs_filter: Option<Vec<String>>,
@@ -583,10 +644,12 @@ impl<'p> Parsed<'p> {
             antares_model::EntityId::new(id)?;
         }
         let id_pattern = id_matcher(params.get("idPattern"))?;
-        let types: Option<Vec<String>> = params.get("type").map(|s| {
-            s.split([',', '|'])
-                .map(|t| ctx.expand_key(t.trim()))
-                .collect()
+        let type_sel = crate::entities::type_selection(params, ctx);
+        let types: Option<Vec<String>> = type_sel.as_ref().map(|sel| {
+            let mut all: Vec<String> = sel.iter().flatten().cloned().collect();
+            all.sort();
+            all.dedup();
+            all
         });
         let attrs_filter = selection(&trepr);
         let (entity_attr_filter, shown_attrs) = if ruled {
@@ -608,6 +671,7 @@ impl<'p> Parsed<'p> {
             trepr,
             ids,
             id_pattern,
+            type_sel,
             types,
             attrs_filter,
             entity_attr_filter,
@@ -727,6 +791,12 @@ impl Pushdown {
         let page = (exact || (no_geo && qry.scope_q.is_none() && q_page_exact))
             && ruled.is_some()
             && qry.id_pattern.is_none()
+            // a 4.17 AND group is judged after the store's OR prefilter
+            && qry
+                .type_sel
+                .iter()
+                .flatten()
+                .all(|and_group| and_group.len() == 1)
             && params.get("orderBy").is_none()
             && params.get("datasetId").is_none()
             && params.get("pick").is_none()
@@ -909,7 +979,7 @@ fn qualifies(
         (None, Some(matches)) if !matches(id) => return None,
         _ => {}
     }
-    if !type_and_attrs_match(&doc, qry.types.as_ref(), qry.entity_attr_filter.as_ref()) {
+    if !type_and_attrs_match(&doc, qry.type_sel.as_ref(), qry.entity_attr_filter.as_ref()) {
         return None;
     }
     if !conditions_hold(&mut doc, tq, qry.q_ast.as_ref(), geos, ctx) {
@@ -1154,7 +1224,9 @@ pub async fn batch_temporal_query(
             geo: named.geo.as_ref(),
         )
         .await?;
-        query_temporal_inner(&st, &vp, &headers, &filter).await
+        // 5.5.7: the terms of an application/ld+json body resolve against
+        // the body's own @context, not the Link header's
+        query_temporal_collected(&st, &vp, &headers, &filter, None, Some(parsed.ctx.clone())).await
     };
     go.await.unwrap_or_else(|e| e.into_response())
 }
@@ -1212,9 +1284,10 @@ pub(crate) async fn build_temporal_map(
         eff.remove(k);
     }
     eff.insert("limit".into(), st.max_limit.to_string());
+    show_ids(&mut eff);
     // Box::pin: build_temporal_map is reachable from query_temporal_inner
     // (entityMap=true), so this recursive edge needs indirection.
-    let resp = Box::pin(query_temporal_inner(st, &eff, headers, filter)).await?;
+    let resp = Box::pin(query_temporal_inner(st, &eff, &ids_shown(headers), filter)).await?;
     let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
         .await
         .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;

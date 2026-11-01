@@ -38,6 +38,15 @@ pub fn registry_subject(tenant: &TenantId) -> String {
     format!("registry.{tenant}")
 }
 
+/// One registration's deltas: `registry.{tenant}.{id_hash}`. Each
+/// registration owns its subject, so the stream's last message on it is that
+/// registration's newest delta, the revision a compare-and-set publish
+/// checks; a per-tenant subject would make every write in the tenant a
+/// conflict for every other.
+pub fn registration_subject(tenant: &TenantId, id: &str) -> String {
+    format!("registry.{tenant}.{:016x}", fnv1a64(id.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +91,13 @@ mod tests {
         assert_eq!(s.split('.').count(), 4, "tenant must stay one token: {s}");
         assert!(!s.contains('>') && !s.contains('*'), "no wildcards: {s}");
         assert_eq!(registry_subject(&tenant("a-b_1")), "registry.a-b_1");
+        let r = registration_subject(&tenant("a-b_1"), "urn:x:1.>.*");
+        assert!(r.starts_with("registry.a-b_1."), "{r}");
+        assert_eq!(
+            r.split('.').count(),
+            3,
+            "the id stays one hashed token: {r}"
+        );
     }
 
     /// Hostile types and ids never reach the wire: both are hashed, so

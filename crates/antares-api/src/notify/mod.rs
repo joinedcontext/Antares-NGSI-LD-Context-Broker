@@ -62,6 +62,11 @@ use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH};
 use crate::bounds::{DELIVERY_LANE, DELIVERY_WIDTH_PER_TENANT};
 static CHANGES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Entities whose newest change version the matcher keeps (two generations
+/// of this many): a hook overtakes another only among the writes in flight
+/// at once.
+const CHANGE_ORDER_KEYS: usize = 16_384;
+
 /// Hand a batch to the matcher queue: counted as pending on acceptance,
 /// counted as dropped when the queue is full. Not the durable outbox
 /// (`antares_sql::store::pg::outbox::enqueue`), which is a row inside the
@@ -231,16 +236,32 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     // work is handed to the async task below. One choke point for every write.
     let st_rec = state.clone();
     let hook_pending = state.pending_changes.clone();
+    // Two writers of one Entity may run their hooks in either order on the
+    // Postgres arm (S3-18): the matcher drops a change older than one of the
+    // same Entity it has taken, so no subscriber is handed the older image
+    // last. Recording keeps every change, late or not: each carries the
+    // instances only it wrote, and history is ordered by their instants.
+    let newest = Arc::new(antares_store::NewestSeen::new(CHANGE_ORDER_KEYS));
     state.store.set_change_hook(Arc::new(
         move |tenant: &TenantId,
               before: Option<Value>,
-              after: Option<Value>|
+              after: Option<Value>,
+              version: antares_store::ChangeVersion|
               -> antares_store::HookFuture<'_> {
             let st_rec = st_rec.clone();
             let tx = tx.clone();
             let hook_pending = hook_pending.clone();
+            let newest = newest.clone();
             Box::pin(async move {
                 record_temporal_change(&st_rec, tenant, before.as_ref(), after.as_ref()).await;
+                let id = after
+                    .as_ref()
+                    .or(before.as_ref())
+                    .and_then(|d| d.get("id"))
+                    .and_then(Value::as_str);
+                if id.is_some_and(|id| !newest.admit(tenant.as_str(), id, &version)) {
+                    return;
+                }
                 // inside a request the change rides the request's buffer and
                 // reaches the matcher with the rest of that request's changes
                 let Some(change) =

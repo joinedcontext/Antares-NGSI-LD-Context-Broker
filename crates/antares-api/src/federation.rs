@@ -991,6 +991,8 @@ pub struct BuiltForward<'a> {
     tenant: &'a TenantId,
     reg: &'a FedReg,
     subject: HeaderMap,
+    /// The registered @context the forward was switched to (4.3.6.6).
+    answered_in: Option<std::sync::Arc<Context>>,
 }
 
 impl BuiltForward<'_> {
@@ -1117,14 +1119,36 @@ pub async fn forward(
     ctx_url: &str,
     body: Option<Value>,
 ) -> ForwardAnswer {
+    forward_in(st, method, url, query, headers, tenant, reg, ctx_url, body)
+        .await
+        .0
+}
+
+/// [`forward`], and the @context its answer is in when that is not the
+/// request's own: a forward 4.3.6.6 switched to the registered
+/// `jsonldContext` is answered in that context's terms, so a read expands
+/// the answer with it (`None`: with the request's).
+#[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
+pub(crate) async fn forward_in(
+    st: &AppState,
+    method: reqwest::Method,
+    url: String,
+    query: &[(String, String)],
+    headers: &HeaderMap,
+    tenant: &TenantId,
+    reg: &FedReg,
+    ctx_url: &str,
+    body: Option<Value>,
+) -> (ForwardAnswer, Option<std::sync::Arc<Context>>) {
     // Process-wide slot first (bounds::MAX_FED_INFLIGHT): the buffers and
     // connections below exist only while a slot is held.
     let _slot = crate::bounds::FED_INFLIGHT.acquire().await;
     let built = build_forward(st, method, url, query, headers, tenant, reg, ctx_url, body).await;
+    let answered_in = built.answered_in.clone();
     if let Some(answer) = ask_transport(st, &built).await {
-        return answer;
+        return (answer, answered_in);
     }
-    send_http(st, built).await
+    (send_http(st, built).await, answered_in)
 }
 
 /// The forward through the registered transport, or `None` when there is
@@ -1178,10 +1202,12 @@ async fn build_forward<'a>(
     // "jsonldContext": recompact payload and term-bearing query parameters
     // with the registered context, forward THAT context, Content-Type
     // application/json, no @context member in the payload. Entity-shaped
-    // bodies only — a POST-query body has no entity terms to recompact; if
-    // either context fails to load the forward degrades to the original
-    // context rather than sending terms compacted against the wrong one.
+    // bodies only — a POST-query body is not translated and so keeps the
+    // original context; if either context fails to load the forward
+    // degrades to the original context rather than sending terms compacted
+    // against the wrong one.
     let mut link_ctx: String = ctx_url.to_owned();
+    let mut answered_in = None;
     let mut query: Vec<(String, String)> = query.to_vec();
     // 4.3.6.4: "a binding-specific mechanism to request operations only on
     // the registered endpoint itself" — a localOnly registration (5.2.9)
@@ -1270,8 +1296,12 @@ async fn build_forward<'a>(
                     None => can_switch = false,
                 },
                 Some(v) => match v.as_object() {
-                    // a 5.2.23 Query body carries no entity terms to recompact
-                    Some(o) if o.get("type").and_then(Value::as_str) == Some("Query") => {}
+                    // A 5.2.23 Query body names terms too (entities[].type,
+                    // attrs, geoQ.geoproperty, q) and has no translation
+                    // here, so it travels in the @context its terms are in.
+                    Some(o) if o.get("type").and_then(Value::as_str) == Some("Query") => {
+                        can_switch = false;
+                    }
                     Some(o) => {
                         let opts = antares_jsonld::ExpandOpts {
                             fragment: o.get("id").is_none(),
@@ -1321,6 +1351,7 @@ async fn build_forward<'a>(
                     }
                 }
                 link_ctx = reg_ctx_url.to_owned();
+                answered_in = Some(target);
             } else {
                 tracing::warn!(
                     "payload could not be expressed in the registered jsonldContext \
@@ -1449,6 +1480,7 @@ async fn build_forward<'a>(
         tenant,
         reg,
         subject,
+        answered_in,
     }
 }
 
@@ -1843,7 +1875,7 @@ pub async fn fed_retrieve_temporal(
         // 4.5.5.3 recency arbitration
         let mut query = temporal_window(params);
         query.extend(scope_attrs(&reg, ctx));
-        let (status, body, peer_warns) = forward(
+        let ((status, body, peer_warns), actx) = forward_in(
             st,
             reqwest::Method::GET,
             format!(
@@ -1859,18 +1891,18 @@ pub async fn fed_retrieve_temporal(
             None,
         )
         .await;
-        (reg, status, body, peer_warns)
+        (reg, status, body, peer_warns, actx)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns) in fetched {
+    for (reg, status, body, peer_warns, actx) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
         }
         if body.get("id").and_then(Value::as_str) != Some(id) {
             continue;
         }
-        match import_temporal(&body, &reg, ctx) {
+        match import_temporal(&body, &reg, actx.as_deref().unwrap_or(ctx)) {
             Some(doc) => out.push((reg.mode == "auxiliary", doc)),
             None => warnings.push(warning(
                 111,
@@ -2042,16 +2074,16 @@ pub async fn fed_retrieve(
         .collect();
     let fetched = fan_out(regs, move |reg| async move {
         let Some(op) = reg.read_op() else {
-            return (reg, 0, Value::Null, Vec::new());
+            return (reg, 0, Value::Null, Vec::new(), None);
         };
         // sysAttrs on every forwarded read: conflicting instances resolve by
         // most recent observedAt/modifiedAt (4.5.5.3) — without the remote
         // modifiedAt the winner would be arrival order, i.e. indeterminate.
         let mut query: Vec<(String, String)> = vec![("options".into(), "sysAttrs".into())];
         query.extend(scope_attrs(&reg, ctx));
-        let (status, body, peer_warns) = match op {
+        let ((status, body, peer_warns), actx) = match op {
             "retrieveEntity" => {
-                forward(
+                forward_in(
                     st,
                     reqwest::Method::GET,
                     format!("{}/ngsi-ld/v1/entities/{}", reg.endpoint, path_segment(id)),
@@ -2072,7 +2104,7 @@ pub async fn fed_retrieve(
                     .unwrap_or_else(|| "*".into());
                 query.push(("type".into(), t));
                 query.push(("id".into(), id.to_owned()));
-                forward(
+                forward_in(
                     st,
                     reqwest::Method::GET,
                     format!("{}/ngsi-ld/v1/entities", reg.endpoint),
@@ -2092,7 +2124,7 @@ pub async fn fed_retrieve(
                     sel.insert("type".into(), Value::String(ctx.compact_iri(t)));
                 }
                 sel.insert("id".into(), Value::String(id.to_owned()));
-                forward(
+                forward_in(
                     st,
                     reqwest::Method::POST,
                     format!("{}/ngsi-ld/v1/entityOperations/query", reg.endpoint),
@@ -2106,12 +2138,12 @@ pub async fn fed_retrieve(
                 .await
             }
         };
-        (reg, status, body, peer_warns)
+        (reg, status, body, peer_warns, actx)
     })
     .await;
     let mut out = Vec::new();
     let single = fetched.len() == 1;
-    for (reg, status, body, peer_warns) in fetched {
+    for (reg, status, body, peer_warns, actx) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             if single && reg.is_proxy() {
                 *sole_failure = Some(Part {
@@ -2137,7 +2169,7 @@ pub async fn fed_retrieve(
             if c.get("id").and_then(Value::as_str) != Some(id) {
                 continue;
             }
-            match import_entity(c, &reg, ctx) {
+            match import_entity(c, &reg, actx.as_deref().unwrap_or(ctx)) {
                 Some(doc) => out.push((reg.mode == "auxiliary", doc)),
                 // received in time, but not a parseable NGSI-LD entity (111)
                 None => warnings.push(warning(
@@ -2237,6 +2269,16 @@ fn admits_import(reg: &FedReg, spec: &crate::registry::CsrSpec, id: &str) -> boo
             .is_some_and(|p| antares_ql::regex::compile(p).is_ok_and(|re| re.find(id).is_some()))
 }
 
+/// The scope gate of a fan-out answer: `c` is this source's data (4.3.6.1:
+/// a type outside the registration's EntityInfo is not, whatever the client
+/// asked for) and [`admits_import`] admits its id.
+fn in_scope(reg: &FedReg, spec: &crate::registry::CsrSpec, ctx: &Context, c: &Value) -> bool {
+    c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+        && c.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|i| admits_import(reg, spec, i))
+}
+
 /// Whether a query parameter travels on a forward. A narrowed `q` (the
 /// caller's joined with a policy's, `antares_ql::parse_narrowed_q`) can be
 /// past the caps a peer counts it with, `antares_ql::parse_q`'s; the peer's
@@ -2268,7 +2310,7 @@ pub async fn fed_query(
         .collect();
     let fetched = fan_out(regs, move |reg| async move {
         let Some(op) = reg.query_op() else {
-            return (reg, 0, Value::Null, Vec::new());
+            return (reg, 0, Value::Null, Vec::new(), None);
         };
         // The forwarded selection is decided ONCE and then rendered either as
         // query parameters (Query Entities, 5.7.2) or as a Query body
@@ -2319,7 +2361,7 @@ pub async fn fed_query(
                 .filter(|v| forwardable(k, v))
                 .map(String::to_owned)
         };
-        let (status, body, peer_warns) = if op == "queryBatch" {
+        let ((status, body, peer_warns), actx) = if op == "queryBatch" {
             let mut sel = Map::new();
             if let Some(t) = params.get("type") {
                 sel.insert("type".into(), Value::String(t.clone()));
@@ -2373,7 +2415,7 @@ pub async fn fed_query(
             if !geo.is_empty() {
                 q_body.insert("geoQ".into(), Value::Object(geo));
             }
-            forward(
+            forward_in(
                 st,
                 reqwest::Method::POST,
                 format!("{}/ngsi-ld/v1/entityOperations/query", reg.endpoint),
@@ -2417,7 +2459,7 @@ pub async fn fed_query(
                     query.push((k.into(), v));
                 }
             }
-            forward(
+            forward_in(
                 st,
                 reqwest::Method::GET,
                 format!("{}/ngsi-ld/v1/entities", reg.endpoint),
@@ -2430,25 +2472,21 @@ pub async fn fed_query(
             )
             .await
         };
-        (reg, status, body, peer_warns)
+        (reg, status, body, peer_warns, actx)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns) in fetched {
+    for (reg, status, body, peer_warns, actx) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
         }
         if let Value::Array(a) = &body {
-            // Scope gate — see admits_import.
-            for c in a.iter().filter(|c| {
-                // 4.3.6.1: a type outside the registration's EntityInfo is
-                // not this source's data, whatever the client asked for
-                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
-                    && c.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|i| admits_import(&reg, &spec, i))
-            }) {
-                match import_entity(c, &reg, ctx) {
+            // Scope gate — see in_scope.
+            for c in a
+                .iter()
+                .filter(|c| in_scope(&reg, &spec, actx.as_deref().unwrap_or(ctx), c))
+            {
+                match import_entity(c, &reg, actx.as_deref().unwrap_or(ctx)) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
                     None => warnings.push(warning(
                         111,
@@ -2606,7 +2644,7 @@ async fn narrow_map_ids(
             if let Some(t) = type_param {
                 query.push(("type".to_owned(), t.clone()));
             }
-            let (status, found, _) = forward(
+            let ((status, found, _), actx) = forward_in(
                 st,
                 reqwest::Method::GET,
                 format!("{}/ngsi-ld/v1/entities", reg.endpoint),
@@ -2626,7 +2664,7 @@ async fn narrow_map_ids(
                     continue;
                 };
                 if ids.iter().any(|i| i == id)
-                    && import_entity(e, reg, ctx)
+                    && import_entity(e, reg, actx.as_deref().unwrap_or(ctx))
                         .is_some_and(|doc| antares_ql::eval::eval_q(q, &doc, ctx, &|_| None))
                 {
                     kept.insert(id.to_owned());
@@ -2691,7 +2729,7 @@ pub async fn fed_query_temporal(
         } else if let Some(a) = params.get("attrs") {
             query.push(("attrs".into(), a.clone()));
         }
-        let (status, body, peer_warns) = forward(
+        let ((status, body, peer_warns), actx) = forward_in(
             st,
             reqwest::Method::GET,
             format!("{}/ngsi-ld/v1/temporal/entities", reg.endpoint),
@@ -2703,25 +2741,21 @@ pub async fn fed_query_temporal(
             None,
         )
         .await;
-        (reg, status, body, peer_warns)
+        (reg, status, body, peer_warns, actx)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns) in fetched {
+    for (reg, status, body, peer_warns, actx) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
         }
         if let Value::Array(a) = &body {
             // Same scope gate as the non-temporal query fan-out.
-            for c in a.iter().filter(|c| {
-                // 4.3.6.1: a type outside the registration's EntityInfo is
-                // not this source's data, whatever the client asked for
-                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
-                    && c.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|i| admits_import(&reg, &spec, i))
-            }) {
-                match import_temporal(c, &reg, ctx) {
+            for c in a
+                .iter()
+                .filter(|c| in_scope(&reg, &spec, actx.as_deref().unwrap_or(ctx), c))
+            {
+                match import_temporal(c, &reg, actx.as_deref().unwrap_or(ctx)) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
                     None => warnings.push(warning(
                         111,

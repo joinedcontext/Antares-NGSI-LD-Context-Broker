@@ -177,6 +177,7 @@ pub async fn temporal_maintenance(
                 Ok(_) => {
                     sp.commit().await?;
                     done.push(format!("partition {suffix}: ok"));
+                    police_partition(&mut tx, keyed, &suffix).await?;
                     continue;
                 }
                 Err(_) => sp.rollback().await?,
@@ -200,6 +201,7 @@ pub async fn temporal_maintenance(
                 Ok(()) => {
                     sp.commit().await?;
                     done.push(format!("partition {suffix}: adopted from default"));
+                    police_partition(&mut tx, keyed, &suffix).await?;
                 }
                 Err(e) => {
                     // warn, not debug: a PERMANENTLY failing create
@@ -252,6 +254,13 @@ pub async fn temporal_maintenance(
             Err(e) => done.push(format!("history index build deferred ({e})")),
         }
     }
+    // Before the reap that reads it: a week created ahead this pass is
+    // indexed in this pass.
+    match history_expiry_index(pool).await {
+        Ok(Some(line)) => done.push(line),
+        Ok(None) => {}
+        Err(e) => done.push(format!("history expiry index build deferred ({e})")),
+    }
     // 4.22 garbage collection, on both backends: reads already refuse expired
     // entities and instances, so these reaps only bound storage — the clause
     // itself sanctions deletion lagging expiresAt.
@@ -268,6 +277,11 @@ pub async fn temporal_maintenance(
         Ok(0) => {}
         Ok(n) => done.push(format!("reaped {n} expired attribute instances (4.22)")),
         Err(e) => done.push(format!("instance reap skipped ({e})")),
+    }
+    match expiry_scan_daily(pool).await {
+        Ok(None) | Ok(Some(0)) => {}
+        Ok(Some(n)) => done.push(format!("daily scan reaped {n} expired history rows (4.22)")),
+        Err(e) => done.push(format!("daily expiry scan failed ({e})")),
     }
     // Claim-check rows the drain kept because the bus could not carry their
     // bodies. The consumer resolves them off the message, so the window has to
@@ -976,6 +990,7 @@ async fn drop_partitions(
     let mut any = false;
     for (name, hi) in &found {
         let mut tx = pool.begin().await?;
+        crate::store::pg::set_service(&mut tx).await?;
         let ok = droppable(&mut tx, name, hi, tenants, cuts).await?;
         tx.commit().await?;
         if ok {
@@ -1026,8 +1041,9 @@ async fn drop_partitions(
 }
 
 /// Whether [`DROPPABLE`] admits the partition `name` with upper bound `hi`.
-/// The partition is read directly: it carries no policy of its own, so the
-/// read sees every Tenant's rows whatever the role.
+/// The partition is read directly, under its own policies (migration
+/// 0029): the caller's transaction holds the service escape, so the read
+/// sees every Tenant's rows.
 async fn droppable(
     tx: &mut sqlx::PgConnection,
     name: &str,
@@ -1071,6 +1087,37 @@ fn create_partition_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> String
             "CREATE TABLE IF NOT EXISTS attr_instances_{suffix} PARTITION OF attr_instances \
              FOR VALUES FROM ('{lo}') TO ('{hi}')"
         )
+    }
+}
+
+/// The week `suffix` given its parent's row security
+/// (`history_partition_rls`, migration 0029): a statement naming the
+/// partition is judged by the partition's own policies, never the parent's.
+/// After the week is attached, so the adoption's move into the standalone
+/// table is not refused by its WITH CHECK. In a savepoint of its own: a
+/// week that cannot be policed (a role that does not own it) stays as it
+/// was and is reported, it does not undo the week.
+async fn police_partition(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    keyed: bool,
+    suffix: &str,
+) -> Result<(), sqlx::Error> {
+    let mut sp = tx.begin().await?;
+    match sqlx::query(
+        "SELECT history_partition_rls(format('public.%I',
+           CASE WHEN $1 THEN 'attr_rows_' ELSE 'attr_instances_' END || $2)::regclass)",
+    )
+    .bind(keyed)
+    .bind(suffix)
+    .execute(&mut *sp)
+    .await
+    {
+        Ok(_) => sp.commit().await,
+        Err(e) => {
+            sp.rollback().await?;
+            tracing::warn!("weekly history partition {suffix} has no row security: {e}");
+            Ok(())
+        }
     }
 }
 
@@ -1119,28 +1166,224 @@ fn adopt_default_rows_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> [Str
 /// wait for the next tick, earliest expiry first.
 const PRUNE_BATCH: i64 = 1000;
 
+/// History rows one reap transaction deletes at most, in one table.
+const REAP_BATCH: i64 = 1000;
+
+/// Batches one history table gets a pass; the rest wait for the next.
+const REAP_BATCHES: usize = 100;
+
+/// The tables that hold history rows, smallest first: every partition or
+/// timescale chunk under `attr_instances` and `attr_rows` (`attr_rows_long`'s
+/// weeks and `attr_rows_short` included), and `attr_versions`. Each comes
+/// quoted and schema-qualified, with its `expires_at` index (migration 0030)
+/// named bare and qualified, and that index's validity, NULL without one.
+/// A hypertable or partitioned parent is no table here: its rows live in its
+/// children. Catalog only, as under forced RLS no count would see a row.
+const HISTORY_TABLES: &str = "WITH RECURSIVE tree(oid) AS (
+       SELECT i.inhrelid FROM pg_inherits i
+        WHERE i.inhparent IN ('public.attr_instances'::regclass, 'public.attr_rows'::regclass)
+       UNION ALL
+       SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON i.inhparent = t.oid)
+     SELECT format('%I.%I', n.nspname, c.relname),
+            quote_ident(left(c.relname, 54) || '_expires'),
+            format('%I.%I', n.nspname, left(c.relname, 54) || '_expires'),
+            x.indisvalid
+       FROM (SELECT oid FROM tree UNION SELECT 'public.attr_versions'::regclass::oid) l
+       JOIN pg_class c ON c.oid = l.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_class ic ON ic.relname = left(c.relname, 54) || '_expires'
+                            AND ic.relnamespace = c.relnamespace
+       LEFT JOIN pg_index x ON x.indexrelid = ic.oid AND x.indrelid = c.oid
+      WHERE c.relkind = 'r'
+      ORDER BY pg_relation_size(c.oid), 1";
+
+/// One row of [`HISTORY_TABLES`].
+type HistoryTable = (String, String, String, Option<bool>);
+
 /// The 4.22 expired-instance reap: the current state's expired instances
 /// (pruned from `entities.entity`), then the history rows. Isolated so a
 /// deadlock with concurrent ingest never poisons the main maintenance
 /// transaction. Service role: the reap is cross-tenant work (RLS would hide
 /// other tenants' rows).
+///
+/// The prune is bounded (`PRUNE_BATCH`, by the `attrs_expire_at` index) and
+/// commits first. The history rows go table by table through each table's
+/// `expires_at` index ([`history_expiry_index`]), `REAP_BATCH` rows a
+/// transaction ([`expired_history_sql`]); a table without a valid index yet,
+/// and every row the column misses, wait for [`expiry_scan_daily`].
 async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
-    // The current state first, then the history rows, in one transaction.
     let mut n = super::entity::prune_expired_current(&mut tx, PRUNE_BATCH).await?;
+    tx.commit().await?;
+    let tables: Vec<HistoryTable> = sqlx::query_as(HISTORY_TABLES).fetch_all(pool).await?;
+    for (table, _, _, valid) in tables {
+        if valid != Some(true) {
+            continue;
+        }
+        let sql = expired_history_sql(&table);
+        for _ in 0..REAP_BATCHES {
+            let mut tx = pool.begin().await?;
+            crate::store::pg::set_service(&mut tx).await?;
+            let gone = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            n = n.saturating_add(gone);
+            if gone < REAP_BATCH as u64 {
+                break;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// One batch of the 4.22 history reap on `table`, a quoted name from
+/// `HISTORY_TABLES`: at most `REAP_BATCH` rows its `expires_at` index finds
+/// past, deleted by ctid. `ONLY` the table, as a ctid names a row of one
+/// table. The row's `data` decides: a correction by an older release leaves
+/// the column stale (0030's rollback note), and a row whose `expiresAt` has
+/// not passed is kept. try_timestamptz runs on the batch's rows alone.
+pub fn expired_history_sql(table: &str) -> String {
+    format!(
+        "DELETE FROM ONLY {table} WHERE ctid = ANY(ARRAY(
+           SELECT ctid FROM ONLY {table} WHERE expires_at < now() LIMIT {REAP_BATCH}))
+         AND expires_at < now() AND try_timestamptz(data->>'expiresAt') < now()"
+    )
+}
+
+/// The history rows `expires_at` misses, by a scan of `data`: rows written
+/// before migration 0030 or by an older release after a rollback, the tables
+/// [`history_expiry_index`] has not reached, and a timescale chunk's
+/// compressed rows, which no index of the chunk holds. Every row of both
+/// parents and the versions is read, so the scan runs once a day, claimed on
+/// its own `maintenance_jobs` row and held there until done; a statement
+/// that fails (statement_timeout on a large history) costs only itself, and
+/// the day is spent either way, as a retry every tick would be the cost this
+/// replaces. `data ? 'expiresAt'` keeps the plpgsql cast and its
+/// subtransaction to the rows that carry one. `None` when not due.
+async fn expiry_scan_daily(pool: &PgPool) -> Result<Option<u64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let due = sqlx::query(
+        "SELECT name FROM maintenance_jobs WHERE name = 'history_expiry_scan'
+            AND (last_run IS NULL OR last_run < now() - interval '1 day')
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if due.is_none() {
+        return Ok(None);
+    }
+    crate::store::pg::set_service(&mut tx).await?;
+    let (mut n, mut failed) = (0u64, None);
     // try_timestamptz (0001_init.sql), not a bare cast: `expiresAt` is
     // jsonb TEXT and a stamp PostgreSQL cannot parse would abort this
-    // DELETE for the whole deployment, every tick, forever.
+    // DELETE for the whole deployment, every day, forever.
     for sql in [
-        "DELETE FROM attr_instances WHERE try_timestamptz(data->>'expiresAt') < now()",
-        "DELETE FROM attr_rows WHERE try_timestamptz(data->>'expiresAt') < now()",
-        "DELETE FROM attr_versions WHERE try_timestamptz(data->>'expiresAt') < now()",
+        "DELETE FROM attr_instances WHERE data ? 'expiresAt' AND try_timestamptz(data->>'expiresAt') < now()",
+        "DELETE FROM attr_rows WHERE data ? 'expiresAt' AND try_timestamptz(data->>'expiresAt') < now()",
+        "DELETE FROM attr_versions WHERE data ? 'expiresAt' AND try_timestamptz(data->>'expiresAt') < now()",
     ] {
-        n = n.saturating_add(sqlx::query(sql).execute(&mut *tx).await?.rows_affected());
+        let mut sp = tx.begin().await?;
+        match sqlx::query(sql).execute(&mut *sp).await {
+            Ok(r) => {
+                sp.commit().await?;
+                n = n.saturating_add(r.rows_affected());
+            }
+            Err(e) => {
+                sp.rollback().await?;
+                failed = Some(e);
+            }
+        }
     }
+    sqlx::query("UPDATE maintenance_jobs SET last_run = now() WHERE name = 'history_expiry_scan'")
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
-    Ok(n)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(Some(n)),
+    }
+}
+
+/// How long a pass of [`history_expiry_index`] starts new builds for.
+const EXPIRY_INDEX_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The partial index on `expires_at` (migration 0030) that
+/// `reap_expired_instances` reads, built on each history table of
+/// `HISTORY_TABLES` by name with `CREATE INDEX CONCURRENTLY` (writes go
+/// on), smallest first, as [`history_one_index`] builds 0017's: never by a
+/// migration, never on a parent. A pass starts builds while it has spent
+/// less than `EXPIRY_INDEX_BUDGET`, so the empty weeks created ahead are
+/// indexed in the pass that creates them, and each large table of a history
+/// written before the migration takes a pass of its own. A timescale chunk
+/// is a table as well: an index on the hypertable would build every chunk
+/// at once under a lock that blocks writes. `None` when every table has
+/// one, or while another pod builds.
+pub async fn history_expiry_index(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    let missing: Vec<HistoryTable> = sqlx::query_as::<_, HistoryTable>(HISTORY_TABLES)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .filter(|t| t.3 != Some(true))
+        .collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    // a concurrent build runs outside a transaction, on a session of its own
+    // the pool never sees again (as in `history_one_index`)
+    let mut conn = pool.acquire().await?.detach();
+    let held: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('antares.history_expiry_index'))")
+            .fetch_one(&mut conn)
+            .await?;
+    if !held {
+        return Ok(None);
+    }
+    let built = expiry_index_steps(&mut conn, &missing).await;
+    use sqlx::Connection;
+    // Closing the session releases the advisory lock with it.
+    conn.close().await?;
+    let built = built?;
+    Ok(Some(format!(
+        "history expiry index built on {built} of {} tables (4.22)",
+        missing.len()
+    )))
+}
+
+async fn expiry_index_steps(
+    conn: &mut sqlx::PgConnection,
+    missing: &[HistoryTable],
+) -> Result<usize, sqlx::Error> {
+    use sqlx::Executor;
+    // A concurrent build waits for older transactions to end: those waits
+    // count against lock_timeout, and one that runs out leaves an invalid
+    // index the next pass drops and builds again. Short, unlike the 0017
+    // build's: the reaps of this tick run after it, and a long transaction
+    // open somewhere would hold them for the whole wait.
+    conn.execute("SET statement_timeout = 0; SET lock_timeout = '5s'")
+        .await?;
+    let started = std::time::Instant::now();
+    let mut built: usize = 0;
+    for (table, bare, index, valid) in missing {
+        if started.elapsed() >= EXPIRY_INDEX_BUDGET {
+            break;
+        }
+        if valid.is_some() {
+            conn.execute(sqlx::AssertSqlSafe(format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {index}"
+            )))
+            .await?;
+        }
+        conn.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS {bare} ON {table} (expires_at) \
+             WHERE expires_at IS NOT NULL"
+        )))
+        .await?;
+        built = built.saturating_add(1);
+    }
+    Ok(built)
 }
 
 /// The columns of the one history btree (migration 0017).

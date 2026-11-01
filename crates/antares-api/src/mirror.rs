@@ -257,6 +257,12 @@ struct TenantIndex {
     /// The [`tick`] each subscription first entered the mirror at; a later
     /// write keeps it, so a PATCH does not make a subscription new again.
     born: std::collections::HashMap<String, u64>,
+    /// Periodic subscriptions whose last firing had nothing to send (5.8.6:
+    /// "If there are no matching Entities, no Notification is sent"): epoch
+    /// millis before which the sweep does not read them again. Such a firing
+    /// leaves `lastNotification` alone, so without this the subscription
+    /// stays due and re-runs its whole query on every tick. A write clears it.
+    quiet_until: std::collections::HashMap<String, i64>,
 }
 
 /// One clock for both sides of a match: a change takes a tick when it is
@@ -324,6 +330,7 @@ impl SubMirror {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let t = map.entry(tenant.to_owned()).or_default();
         let born = t.born.remove(id);
+        t.quiet_until.remove(id);
         if let Some(old) = t.docs.remove(id) {
             match index_keys(&old) {
                 Keys::Types(ts) => {
@@ -466,6 +473,41 @@ impl SubMirror {
             .unwrap_or_default()
     }
 
+    /// The instant an empty periodic firing parked this subscription until
+    /// (see `TenantIndex::quiet_until`), if one did and no write came since.
+    pub(crate) fn quiet_until(&self, tenant: &str, id: &str) -> Option<i64> {
+        self.map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .and_then(|t| t.quiet_until.get(id).copied())
+    }
+
+    /// Park a periodic subscription whose firing had nothing to send until
+    /// `until`, its next interval. Only while the mirror still holds the
+    /// document that firing evaluated: a write during the firing replaced
+    /// it and cleared the park, and parking the new document on the old
+    /// one's empty result would hold it back for a whole interval.
+    pub(crate) fn park_quiet(
+        &self,
+        tenant: &str,
+        id: &str,
+        evaluated: &std::sync::Arc<Value>,
+        until: i64,
+    ) {
+        let mut map = self
+            .map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(t) = map.get_mut(tenant).filter(|t| {
+            t.docs
+                .get(id)
+                .is_some_and(|d| std::sync::Arc::ptr_eq(d, evaluated))
+        }) {
+            t.quiet_until.insert(id.to_owned(), until);
+        }
+    }
+
     #[cfg(any(test, feature = "test-kit"))]
     pub fn tenants(&self) -> Vec<String> {
         self.map
@@ -525,6 +567,20 @@ impl DocMirror {
                 }
             }
         }
+    }
+
+    /// Take `fresh`'s contents in one step, dropping everything held before:
+    /// a re-hydrate seeds a new mirror from the store and swaps it in, so a
+    /// registration deleted while no delta could arrive leaves this one too.
+    pub fn replace_with(&self, fresh: DocMirror) {
+        let fresh = fresh
+            .map
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self
+            .map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
     }
 
     /// The registrations of one tenant that can match these ids and types,
@@ -615,5 +671,25 @@ mod born {
         assert_eq!(ids(&m, later), ["s:new"]);
         // the unstamped path sees every subscription
         assert_eq!(m.candidates("t", &["Car"], &[]).len(), 2);
+    }
+
+    /// An empty periodic firing parks the document it evaluated, never one
+    /// a write put in its place while it ran (the write cleared the park).
+    #[test]
+    fn an_empty_firing_does_not_park_a_document_written_during_it() {
+        let m = SubMirror::default();
+        let sub = |q: &str| json!({"id": "s:p", "timeInterval": 1, "q": q});
+        m.apply("t", "s:p", Some(sub("a==1")));
+        let evaluated = m.periodic_docs("t").pop().expect("doc");
+        m.apply("t", "s:p", Some(sub("a==2")));
+        m.park_quiet("t", "s:p", &evaluated, i64::MAX);
+        assert_eq!(
+            m.quiet_until("t", "s:p"),
+            None,
+            "the new document was parked"
+        );
+        let current = m.periodic_docs("t").pop().expect("doc");
+        m.park_quiet("t", "s:p", &current, 7);
+        assert_eq!(m.quiet_until("t", "s:p"), Some(7));
     }
 }

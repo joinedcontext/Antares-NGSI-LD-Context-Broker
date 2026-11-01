@@ -88,7 +88,8 @@ async fn batch_query_inner(
     crate::repr::narrow_repr(&mut repr, &filter);
     let join = crate::entities::parse_join(&vp)?;
     crate::entities::check_linked_projection(&repr, &join)?;
-    let mut payload = shaped_page(&page, &repr, &parsed.ctx);
+    let (rendered_from, mut payload): (Vec<&Value>, Vec<Value>) =
+        shaped_page(&page, &repr, &parsed.ctx).into_iter().unzip();
     if let Some((mode, level)) = &join {
         // 4.5.23.1 bounds the WIDTH of the retrieval per REQUEST, so one
         // allowance is spent across the whole page, exactly as the GET twin
@@ -106,7 +107,7 @@ async fn batch_query_inner(
         match mode.as_str() {
             "inline" => {
                 let remote = crate::federation::active(&page_params).then_some(headers);
-                scope.inline(&mut payload, remote).await;
+                scope.inline(&mut payload, &rendered_from, remote).await;
             }
             "flat" => payload.extend(scope.flat(&page).await),
             _ => {}
@@ -125,20 +126,20 @@ async fn batch_query_inner(
     Ok(resp)
 }
 
-/// Each page Entity in the requested representation; one a `pick` leaves
-/// empty is dropped.
-fn shaped_page(
-    page: &[Value],
+/// Each page Entity in the requested representation, beside the Entity it
+/// was rendered from; one a `pick` leaves empty is dropped.
+fn shaped_page<'p>(
+    page: &'p [Value],
     repr: &crate::repr::Repr,
     ctx: &antares_jsonld::Context,
-) -> Vec<Value> {
+) -> Vec<(&'p Value, Value)> {
     page.iter()
         .filter_map(|doc| {
             let shaped = apply(doc, repr);
             if repr.pick.is_some() && shaped.as_object().is_some_and(|o| o.is_empty()) {
                 return None;
             }
-            Some(crate::repr::compact_for(repr, &shaped, ctx))
+            Some((doc, crate::repr::compact_for(repr, &shaped, ctx)))
         })
         .collect()
 }
@@ -217,17 +218,19 @@ struct JoinScope<'a> {
 }
 
 impl JoinScope<'_> {
-    /// 4.5.23 inline join: the linked Entities inside each payload Entity;
-    /// `remote` carries the request headers when the query is federated.
-    async fn inline(&self, payload: &mut [Value], remote: Option<&HeaderMap>) {
+    /// 4.5.23 inline join: the linked Entities inside each payload Entity,
+    /// each beside the Entity it was rendered from; `remote` carries the
+    /// request headers when the query is federated.
+    async fn inline(&self, payload: &mut [Value], stored: &[&Value], remote: Option<&HeaderMap>) {
         let mut budget = crate::repr::MAX_JOIN_LOOKUPS;
-        for p in payload {
+        for (p, stored) in payload.iter_mut().zip(stored) {
             crate::repr::inline_join_beyond(
                 self.st,
                 self.tenant,
                 self.ctx,
                 self.repr,
                 p,
+                stored,
                 self.level,
                 &self.held,
                 &mut budget,

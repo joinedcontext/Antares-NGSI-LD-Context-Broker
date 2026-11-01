@@ -2455,6 +2455,152 @@ mod clause_5_8_6_periodic_sweep {
             parked - now
         );
     }
+
+    /// The paged sweep holds no more pages than it can send: a page is read
+    /// only once a delivery slot can take it. Against an endpoint that holds
+    /// every request open, the tick stops reading at the tenant's share, so
+    /// the Vehicles deleted meanwhile are never read and never notified.
+    /// Reading ahead of the sends instead holds the whole match set in memory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn periodic_sweep_reads_no_page_ahead_of_a_delivery_slot() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        crate::allow_private();
+        let arrived: Arc<AtomicUsize> = Arc::default();
+        let notified: Arc<AtomicUsize> = Arc::default();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (a, n, g) = (arrived.clone(), notified.clone(), gate.clone());
+        let app = axum::Router::new().route(
+            "/notify",
+            axum::routing::post(move |body: String| {
+                let (a, n, g) = (a.clone(), n.clone(), g.clone());
+                async move {
+                    a.fetch_add(1, SeqCst);
+                    let _open = g.acquire().await;
+                    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    n.fetch_add(v["data"].as_array().map_or(0, Vec::len), SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let (mut st, _mirror, _) = state_with_mirror("antares-periodic-backpressure");
+        // its own tenant: the share is per tenant and process-wide
+        let tenant = TenantId::new("periodicbackpressure").expect("tenant");
+        st.max_limit = 1;
+        let share = *DELIVERY_WIDTH_PER_TENANT;
+        let n = share * 3;
+        let ids: Vec<String> = (0..n)
+            .map(|i| format!("urn:ngsi-ld:Vehicle:bp{i:03}"))
+            .collect();
+        for id in &ids {
+            st.store
+                .create(&tenant, Kind::Entity, id, entity(id, "Vehicle"))
+                .await
+                .expect("entity row");
+        }
+        install(
+            &st,
+            &tenant,
+            &periodic(
+                "urn:ngsi-ld:Subscription:backpressure",
+                &format!("http://{addr}/notify"),
+                json!([{"type": format!("{DC}/Vehicle")}]),
+                10,
+            ),
+        )
+        .await;
+        let sweep = {
+            let st = st.clone();
+            tokio::spawn(async move { interval_tick(&st).await })
+        };
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(10 * crate::state::slow_factor());
+        while arrived.load(SeqCst) < share {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the share never filled: {}",
+                arrived.load(SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // give a read-ahead sweep the time to read every page
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        for id in &ids {
+            st.store
+                .delete(&tenant, Kind::Entity, id)
+                .await
+                .expect("delete");
+        }
+        gate.add_permits(n * 4);
+        sweep.await.expect("sweep");
+        let sent = notified.load(SeqCst);
+        assert!(
+            sent < n,
+            "{sent} of {n} Vehicles were notified: every page was read before a slot could send it"
+        );
+    }
+
+    /// 5.8.6 sends the periodic Notification "when the time interval (in
+    /// seconds) specified in such value field is reached", and none when
+    /// nothing matches. A firing with nothing to send is therefore over until
+    /// the next interval: re-arming the sweep clock for the next tick re-reads
+    /// the subscription's whole match set twice a second.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_periodic_firing_parks_the_sweep_clock_for_its_interval() {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::allow_private();
+        let (uri, seen) = recording_endpoint().await;
+        let (st, mirror, tenant) = state_with_mirror("antares-periodic-empty-clock");
+        let mut sub = periodic(
+            "urn:ngsi-ld:Subscription:empty",
+            &uri,
+            json!([{"type": format!("{DC}/Vehicle")}]),
+            7200,
+        );
+        sub["timeInterval"] = json!(3600);
+        install(&st, &tenant, &sub).await;
+
+        interval_tick(&st).await;
+        let next = mirror.next_sub_sweep_ms.load(Relaxed);
+        assert!(
+            next > chrono::Utc::now().timestamp_millis() + 60_000,
+            "a firing with nothing to send must not re-arm the sweep for the next tick: {next}"
+        );
+
+        // a Vehicle that appears inside the interval waits for the next one
+        st.store
+            .create(
+                &tenant,
+                Kind::Entity,
+                "urn:ngsi-ld:Vehicle:late",
+                entity("urn:ngsi-ld:Vehicle:late", "Vehicle"),
+            )
+            .await
+            .expect("entity row");
+        mirror.next_sub_sweep_ms.store(0, Relaxed);
+        interval_tick(&st).await;
+        assert!(
+            seen.lock().expect("recorded bodies").is_empty(),
+            "the interval after an empty firing has not been reached"
+        );
+
+        // a write to the subscription makes it new again
+        install_again(&mirror, &tenant, &sub);
+        interval_tick(&st).await;
+        assert_eq!(seen.lock().expect("recorded bodies").len(), 1);
+    }
+
+    fn install_again(mirror: &SubMirror, tenant: &TenantId, sub: &Value) {
+        mirror.apply(
+            tenant.as_str(),
+            sub["id"].as_str().expect("sub id"),
+            Some(sub.clone()),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2635,8 +2781,7 @@ mod interval_claim {
     /// The multi-pod claim stamps that member to win the firing, so a due
     /// subscription that then matches nothing must have the stamp put back:
     /// otherwise a client reads a notification instant for a notification
-    /// that never happened, and the subscription — still owing its firing —
-    /// waits out a whole interval that the single-process path does not.
+    /// that never happened.
     #[tokio::test]
     async fn a_claimed_firing_that_matches_nothing_leaves_no_notification_instant() {
         let tenant = TenantId::new("default").expect("tenant");
@@ -2982,6 +3127,111 @@ mod delivery_share {
             in_flight <= *DELIVERY_WIDTH_PER_TENANT,
             "one tenant held {in_flight} of the {} delivery slots",
             *DELIVERY_WIDTH
+        );
+    }
+
+    /// The share bounds a Tenant, and the sweep must not turn it back into a
+    /// broker-wide wait: a Tenant whose endpoint never answers waits for its
+    /// own share, and a Tenant swept after it still receives its periodic
+    /// Notification on time (5.8.6) instead of after the first Tenant's
+    /// endpoint timeout.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tenant_waiting_for_its_share_does_not_hold_back_another_tenants_sweep() {
+        use std::sync::atomic::Ordering::SeqCst;
+        crate::allow_private();
+        let hang = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hang_addr = hang.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = hang.accept().await {
+                held.push(s);
+            }
+        });
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&answered);
+        let ok = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let ok_addr = ok.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/notify",
+            axum::routing::post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(ok, app).await.expect("serve") });
+        let st = AppState::new("antares-sweep-per-tenant".into());
+        // the tenant list is swept in name order: the hanging one first
+        let hog = TenantId::new("aaasweephog").expect("tenant");
+        let other = TenantId::new("zzzsweepother").expect("tenant");
+        let periodic = |id: &str, uri: String| {
+            json!({
+                "id": id,
+                "type": "Subscription",
+                "status": "active",
+                "timeInterval": 1,
+                "createdAt": "2020-01-01T00:00:00Z",
+                "entities": [{
+                    "type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"
+                }],
+                "notification": {"endpoint": {"uri": uri, "timeout": 30_000}},
+            })
+        };
+        for t in [&hog, &other] {
+            st.store
+                .create(
+                    t,
+                    Kind::Entity,
+                    "urn:ngsi-ld:Vehicle:sweep",
+                    json!({
+                        "id": "urn:ngsi-ld:Vehicle:sweep",
+                        "type": ["https://uri.etsi.org/ngsi-ld/default-context/Vehicle"],
+                    }),
+                )
+                .await
+                .expect("seed entity");
+        }
+        // one more than the share: the last waits for a slot the hanging
+        // endpoint holds for its whole timeout
+        for i in 0..=*DELIVERY_WIDTH_PER_TENANT {
+            let id = format!("urn:ngsi-ld:Subscription:sweep-hog-{i}");
+            st.store
+                .create(
+                    &hog,
+                    Kind::Subscription,
+                    &id,
+                    periodic(&id, format!("http://{hang_addr}/notify")),
+                )
+                .await
+                .expect("seed subscription");
+        }
+        let id = "urn:ngsi-ld:Subscription:sweep-other";
+        st.store
+            .create(
+                &other,
+                Kind::Subscription,
+                id,
+                periodic(id, format!("http://{ok_addr}/notify")),
+            )
+            .await
+            .expect("seed subscription");
+        let sweep = tokio::spawn(async move { interval_tick(&st).await });
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(5 * crate::state::slow_factor());
+        while answered.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        sweep.abort();
+        assert_eq!(
+            answered.load(SeqCst),
+            1,
+            "the second Tenant waited for the first Tenant's endpoint timeout"
         );
     }
 

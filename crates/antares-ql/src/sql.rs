@@ -196,7 +196,13 @@ pub fn value_or_filter(
     let steps = VALUE_KEYS
         .iter()
         .filter(|k| objects || !matches!(**k, "object" | "objectList"))
-        .map(|k| format!(".\"{k}\""))
+        // 4.9: a LanguageProperty's target value is a value of ANY of its
+        // languageMap pairs (`eval::terminal`), so a compare reads the map's
+        // values; existence keeps the member itself, as an empty map exists
+        .map(|k| match (*k, filter) {
+            ("languageMap", Some(_)) => ".\"languageMap\".*".to_owned(),
+            _ => format!(".\"{k}\""),
+        })
         // C.6: a value written as a JSON-LD typed value carries it under
         // `@value`, and `eval::untyped` compares that member — one more
         // step for the members that can hold one.
@@ -514,6 +520,28 @@ mod tests {
     fn quoting_escapes_what_would_break_the_jsonpath() {
         assert_eq!(jsonpath_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         assert_eq!(jsonpath_string("l\n"), "\"l\\n\"");
+    }
+
+    /// 4.9: a bare LanguageProperty name compares the values of its
+    /// languageMap (as `eval::terminal` does), not the map object, which no
+    /// scalar ever equals; existence still reads the member itself.
+    #[test]
+    fn a_language_map_compares_its_values() {
+        let lm = |q: &str| {
+            c(q).expect("compiles")
+                .binds
+                .into_iter()
+                .find(|b| b.contains("languageMap"))
+                .expect("languageMap arm")
+        };
+        assert_eq!(
+            lm(r#"color=="red""#),
+            "$.\"https://uri.etsi.org/ngsi-ld/default-context/color\"[*].\"languageMap\".* ? (@ == \"red\")"
+        );
+        assert_eq!(
+            lm("color"),
+            "$.\"https://uri.etsi.org/ngsi-ld/default-context/color\"[*].\"languageMap\""
+        );
     }
 
     #[test]

@@ -58,6 +58,19 @@ pub fn slow_factor() -> u64 {
     }
 }
 
+/// `ANTARES_CONTEXT_RESOLVE_TIMEOUT_MS`: a positive integer of
+/// milliseconds, else 30 000. Each fetch already has its own 10 s bound,
+/// but one resolution may make `MAX_CONTEXT_URLS` of them one after the
+/// other, each after waiting for a permit, so without a bound of its own a
+/// client-chosen @context tree holds its request for minutes.
+fn resolve_deadline_from(env: Option<&str>) -> std::time::Duration {
+    let ms = env
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30_000);
+    std::time::Duration::from_millis(ms.saturating_mul(slow_factor()))
+}
+
 /// Egress policy hook for @context fetches: scheme allowlist is
 /// enforced in `fetch`; this adds the private-range deny (loopback,
 /// RFC 1918, link-local incl. the 169.254.169.254 metadata range, ULA).
@@ -490,7 +503,14 @@ pub fn client_builder(policy: EgressPolicy) -> reqwest::ClientBuilder {
         attempt.follow()
     });
     install_crypto_provider();
+    // No proxy from the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
+    // `ALL_PROXY`): a proxy resolves the TARGET name itself, so the
+    // resolver above would only ever judge the proxy's name, and the DNS
+    // pin, the private-range deny and the metadata deny would all be off
+    // the path. A caller that adds `.proxy(..)` on top owns that choice,
+    // and the proxy then has to enforce the same deny.
     let mut b = reqwest::Client::builder()
+        .no_proxy()
         .redirect(redirect)
         .dns_resolver(std::sync::Arc::new(PolicyResolver(policy)));
     if let Ok(path) = std::env::var("ANTARES_EXTRA_CA_FILE") {
@@ -583,6 +603,24 @@ pub async fn io_deadline<T>(fut: impl std::future::Future<Output = T>, ms: u32) 
         Either::Left((v, _)) => Some(v),
         Either::Right(_) => None,
     }
+}
+
+/// `fut` bounded by `d` on whichever timer the target has; `None` = the
+/// deadline passed first, and `fut` was dropped.
+#[cfg(not(target_arch = "wasm32"))]
+async fn within<T>(fut: impl std::future::Future<Output = T>, d: std::time::Duration) -> Option<T> {
+    tokio::time::timeout(d, fut).await.ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn within<T>(fut: impl std::future::Future<Output = T>, d: std::time::Duration) -> Option<T> {
+    // the gloo timer is !Send; wrapped like an HTTP interaction so the
+    // handlers that resolve a @context stay Send
+    http_interaction(io_deadline(
+        fut,
+        u32::try_from(d.as_millis()).unwrap_or(u32::MAX),
+    ))
+    .await
 }
 
 /// Ceiling on a header-supplied cache lifetime: one year. The values are
@@ -762,6 +800,10 @@ pub struct Loader {
     /// fetch, not per resolution) — a burst of exotic-context requests can't
     /// blow the JSON working-set budget.
     resolve_permits: tokio::sync::Semaphore,
+    /// One whole resolution's wall-clock bound: every fetch it makes, the
+    /// waits for their permits and the store hooks they call
+    /// (`ANTARES_CONTEXT_RESOLVE_TIMEOUT_MS`).
+    resolve_deadline: std::sync::RwLock<std::time::Duration>,
     /// Write-through: freshly fetched remote contexts are handed to this
     /// hook (the broker persists them as kind='Cached' rows) so the cache
     /// survives a restart. Set once at wiring; None in tests.
@@ -860,10 +902,24 @@ impl Loader {
             usage: RwLock::new(HashMap::new()),
             merged_urls: BoundedCache::new(MAX_MERGED_ENTRIES),
             resolve_permits: tokio::sync::Semaphore::new(32),
+            resolve_deadline: std::sync::RwLock::new(resolve_deadline_from(
+                std::env::var("ANTARES_CONTEXT_RESOLVE_TIMEOUT_MS")
+                    .ok()
+                    .as_deref(),
+            )),
             cache_writer: std::sync::RwLock::new(None),
             usage_bump: std::sync::RwLock::new(None),
             local_lookup: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Replace the bound on one whole resolution (see
+    /// `ANTARES_CONTEXT_RESOLVE_TIMEOUT_MS`).
+    pub fn set_resolve_deadline(&self, d: std::time::Duration) {
+        *self
+            .resolve_deadline
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = d;
     }
 
     /// Install the hook that persists a fetched @context (url, document).
@@ -1077,7 +1133,28 @@ impl Loader {
         self.resolve_counted(Some(tenant), user, false).await
     }
 
+    /// [`Self::resolve_uncapped`] under the one deadline a resolution has.
+    /// 5.5.6: an @context that cannot be retrieved in time is not available.
     async fn resolve_counted(
+        &self,
+        tenant: Option<&TenantId>,
+        user: &Value,
+        count: bool,
+    ) -> Result<Arc<Context>, NgsiError> {
+        let deadline = *self
+            .resolve_deadline
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match within(self.resolve_uncapped(tenant, user, count), deadline).await {
+            Some(r) => r,
+            None => Err(NgsiError::LdContextNotAvailable(format!(
+                "@context resolution exceeded its {} ms deadline",
+                deadline.as_millis()
+            ))),
+        }
+    }
+
+    async fn resolve_uncapped(
         &self,
         tenant: Option<&TenantId>,
         user: &Value,
@@ -1344,7 +1421,7 @@ impl Loader {
         // `acquire` fails only on a closed semaphore, which nothing closes.
         // If that ever changed, proceeding without the permit costs the
         // concurrency bound and not the fetch, so it is not worth a panic.
-        let _permit = self.resolve_permits.acquire().await.ok();
+        let permit = self.resolve_permits.acquire().await.ok();
         // The whole HTTP interaction is one Send unit (http_interaction);
         // only Send data (ttl + bytes) crosses back out.
         let send = || {
@@ -1462,6 +1539,10 @@ impl Loader {
                 owner: None,
             },
         );
+        // The fetch and its parse are done: the permit bounds those, and
+        // holding it across the write-through below would let a slow store
+        // stall every Tenant's cold @context behind it.
+        drop(permit);
         // Write-through: persist what was just fetched.
         let writer = self
             .cache_writer
@@ -2384,6 +2465,137 @@ mod tests {
         );
         let n = hits.load(Ordering::SeqCst);
         assert!(n <= 33, "crawl must stop at the cap, made {n} fetches");
+    }
+
+    /// A fetch permit bounds the network fetches in flight, not the store:
+    /// a write-through that does not return (a slow or stalled store) must
+    /// not keep the permit, or 32 of them stall every cold @context of
+    /// every Tenant behind the store instead of behind the network.
+    #[tokio::test]
+    async fn a_slow_write_through_does_not_hold_a_fetch_permit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"@context":{"a":"https://example.org/a"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let loader = Arc::new(Loader::with_policy(EgressPolicy {
+            allow_private: true,
+            private_hosts: &[],
+        }));
+        let stalled = Arc::new(AtomicUsize::new(0));
+        let s = Arc::clone(&stalled);
+        loader.set_cache_writer(Arc::new(move |_, url, _| {
+            let stall = url.contains("/slow/");
+            if stall {
+                s.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+            })
+        }));
+        for i in 0..32 {
+            let l = Arc::clone(&loader);
+            let url = Value::String(format!("http://{addr}/slow/{i}.jsonld"));
+            tokio::spawn(async move { l.resolve(&url).await });
+        }
+        let t0 = Instant::now();
+        while stalled.load(Ordering::SeqCst) < 32 {
+            assert!(
+                t0.elapsed().as_secs() < 10,
+                "the 32 fetches never reached the store"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let fast = Value::String(format!("http://{addr}/fast.jsonld"));
+        let got =
+            tokio::time::timeout(std::time::Duration::from_secs(3), loader.resolve(&fast)).await;
+        assert!(
+            matches!(got, Ok(Ok(_))),
+            "a cold fetch queued behind 32 stalled store writes: {got:?}"
+        );
+    }
+
+    /// One resolution has one deadline. Each fetch is bounded on its own,
+    /// but a client-chosen @context of `MAX_CONTEXT_URLS` references to a
+    /// server that answers each one just inside that bound held the request
+    /// (and a fetch permit, one at a time) for the sum of them all.
+    #[tokio::test]
+    async fn a_whole_resolution_is_bounded_by_one_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    // a tarpit: every answer comes, slowly
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    let body = r#"{"@context":{"a":"https://example.org/a"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let loader = Loader::with_policy(EgressPolicy {
+            allow_private: true,
+            private_hosts: &[],
+        });
+        loader.set_resolve_deadline(std::time::Duration::from_millis(1_500));
+        let tree = Value::Array(
+            (0..8)
+                .map(|i| Value::String(format!("http://{addr}/tarpit/{i}.jsonld")))
+                .collect(),
+        );
+        let t0 = Instant::now();
+        let got = loader.resolve(&tree).await;
+        let took = t0.elapsed();
+        assert!(
+            matches!(got, Err(NgsiError::LdContextNotAvailable(_))),
+            "8 slow references must end in LdContextNotAvailable: {:?}",
+            got.as_ref().err()
+        );
+        assert!(
+            took < std::time::Duration::from_millis(3_000),
+            "the resolution ran {took:?}, past its 1.5 s deadline"
+        );
+        // under the deadline the same server resolves
+        loader.set_resolve_deadline(std::time::Duration::from_secs(10));
+        let one = Value::String(format!("http://{addr}/tarpit/one.jsonld"));
+        assert!(loader.resolve(&one).await.is_ok());
+    }
+
+    #[test]
+    fn the_resolve_deadline_parses_a_positive_millisecond_count() {
+        let f = slow_factor();
+        let ms = |n: u64| std::time::Duration::from_millis(n * f);
+        assert_eq!(resolve_deadline_from(None), ms(30_000));
+        assert_eq!(resolve_deadline_from(Some("2500")), ms(2_500));
+        for bad in ["0", "-1", "abc", ""] {
+            assert_eq!(resolve_deadline_from(Some(bad)), ms(30_000), "{bad:?}");
+        }
     }
 
     /// The usage registry records client-supplied URLs — it must hold a

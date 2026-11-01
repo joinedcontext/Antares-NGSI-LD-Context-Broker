@@ -857,6 +857,70 @@ fn expand_common_members(
     Ok(())
 }
 
+/// 4.5.3: a Relationship's `object` is a URI, or a non-empty array of
+/// URIs; the NGSI-LD Null passes under `allow_null`. The one check the
+/// full-instance and the partial-update fragment paths share.
+fn check_object(name: &str, objv: &Value, opts: ExpandOpts) -> Result<(), NgsiError> {
+    let bad = NgsiError::BadRequestData;
+    match objv {
+        Value::String(s) => {
+            if !(opts.allow_null && s == "urn:ngsi-ld:null") {
+                antares_model::EntityId::new(s)
+                    .map_err(|_| bad(format!("attribute {name}: object must be a URI")))?;
+            }
+        }
+        Value::Array(items) if !items.is_empty() => {
+            for s in items {
+                let s = s
+                    .as_str()
+                    .ok_or_else(|| bad(format!("attribute {name}: object entries must be URIs")))?;
+                antares_model::EntityId::new(s)
+                    .map_err(|_| bad(format!("attribute {name}: object must be a URI")))?;
+            }
+        }
+        _ => return Err(bad(format!("attribute {name}: invalid object"))),
+    }
+    Ok(())
+}
+
+/// 4.5.22.2/4.5.22.3: objectList is an ordered array of Relationship
+/// objects — `{"object": <URI>}` objects (normalized) or bare URI strings
+/// (concise). Internal form is bare URIs; the normalized output shape is
+/// restored at compaction. The `[null]` deletion form (single NGSI-LD Null)
+/// passes through under allow_null.
+fn object_list(name: &str, l: &Value, opts: ExpandOpts) -> Result<Value, NgsiError> {
+    let bad = NgsiError::BadRequestData;
+    match l {
+        _ if opts.allow_null && is_ngsi_null_list(l) => Ok(l.clone()),
+        Value::Array(items) => {
+            let mut uris = Vec::with_capacity(items.len());
+            for it in items {
+                let uri = match it {
+                    Value::String(s) => s.as_str(),
+                    Value::Object(o)
+                        if o.len() == 1 && o.get("object").is_some_and(Value::is_string) =>
+                    {
+                        o["object"].as_str().unwrap_or_default()
+                    }
+                    _ => {
+                        return Err(bad(format!(
+                            "attribute {name}: objectList entries must be URIs \
+                             or {{\"object\": <URI>}} objects"
+                        )))
+                    }
+                };
+                antares_model::EntityId::new(uri)
+                    .map_err(|_| bad(format!("attribute {name}: objectList entry is not a URI")))?;
+                uris.push(Value::String(uri.to_owned()));
+            }
+            Ok(Value::Array(uris))
+        }
+        _ => Err(bad(format!(
+            "attribute {name}: objectList must be an array"
+        ))),
+    }
+}
+
 /// Expand a single instance (normalized or concise) to normalized form.
 ///
 /// This is where the 4.2.2 Meta Model's own SHALLs are enforced: "An NGSI-LD
@@ -1038,24 +1102,7 @@ fn expand_instance(
             let objv = obj
                 .get("object")
                 .ok_or_else(|| bad(format!("attribute {name}: Relationship needs object")))?;
-            match objv {
-                Value::String(s) => {
-                    if !(opts.allow_null && s == "urn:ngsi-ld:null") {
-                        antares_model::EntityId::new(s)
-                            .map_err(|_| bad(format!("attribute {name}: object must be a URI")))?;
-                    }
-                }
-                Value::Array(items) if !items.is_empty() => {
-                    for s in items {
-                        let s = s.as_str().ok_or_else(|| {
-                            bad(format!("attribute {name}: object entries must be URIs"))
-                        })?;
-                        antares_model::EntityId::new(s)
-                            .map_err(|_| bad(format!("attribute {name}: object must be a URI")))?;
-                    }
-                }
-                _ => return Err(bad(format!("attribute {name}: invalid object"))),
-            }
+            check_object(name, objv, opts)?;
             out.insert("object".into(), objv.clone());
         }
         "LanguageProperty" => {
@@ -1113,52 +1160,20 @@ fn expand_instance(
             if !l.is_array() && !(opts.allow_null && is_ngsi_null(l)) {
                 return Err(bad(format!("attribute {name}: valueList must be an array")));
             }
+            // 5.5.7: no user @context below the top level, inside a list's
+            // values as inside a Property value
+            if embeds_context(l) {
+                return Err(bad(format!(
+                    "attribute {name}: embedded @context is not allowed (4.5.1/5.5.7)"
+                )));
+            }
             out.insert("valueList".into(), l.clone());
         }
         "ListRelationship" => {
-            // 4.5.22.2/4.5.22.3: objectList is an ordered array of
-            // Relationship objects — {"object": <URI>} objects (normalized)
-            // or bare URI strings (concise). Internal form is bare URIs; the
-            // normalized output shape is restored at compaction. The [null]
-            // deletion form (single NGSI-LD Null) passes through under
-            // allow_null.
             let l = obj
                 .get("objectList")
                 .ok_or_else(|| bad(format!("attribute {name}: needs objectList")))?;
-            let normalized = match l {
-                _ if opts.allow_null && is_ngsi_null_list(l) => l.clone(),
-                Value::Array(items) => {
-                    let mut uris = Vec::with_capacity(items.len());
-                    for it in items {
-                        let uri = match it {
-                            Value::String(s) => s.as_str(),
-                            Value::Object(o)
-                                if o.len() == 1
-                                    && o.get("object").is_some_and(Value::is_string) =>
-                            {
-                                o["object"].as_str().unwrap_or_default()
-                            }
-                            _ => {
-                                return Err(bad(format!(
-                                    "attribute {name}: objectList entries must be URIs \
-                                     or {{\"object\": <URI>}} objects"
-                                )))
-                            }
-                        };
-                        antares_model::EntityId::new(uri).map_err(|_| {
-                            bad(format!("attribute {name}: objectList entry is not a URI"))
-                        })?;
-                        uris.push(Value::String(uri.to_owned()));
-                    }
-                    Value::Array(uris)
-                }
-                _ => {
-                    return Err(bad(format!(
-                        "attribute {name}: objectList must be an array"
-                    )))
-                }
-            };
-            out.insert("objectList".into(), normalized);
+            out.insert("objectList".into(), object_list(name, l, opts)?);
         }
         // 4.5.2 closes the set of Attribute types, and `attr_type` is
         // either a member of ATTR_TYPES or one of the inferred literals
@@ -1373,7 +1388,14 @@ fn is_language_tag(tag: &str) -> bool {
 /// inference happens (a fragment `{providedBy: …}` patches the sub-attribute,
 /// it is not a concise Property value).
 pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<Value, NgsiError> {
+    /// the attribute name the member checks report: a fragment has none
+    const FRAGMENT: &str = "fragment";
     let bad = NgsiError::BadRequestData;
+    let opts = ExpandOpts {
+        fragment: true,
+        allow_null: true,
+        ..Default::default()
+    };
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
@@ -1418,6 +1440,15 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                          allowed in merge fragments (5.5.4)"
                         .into()));
                 }
+                // the value rules a full Property instance obeys
+                if let Some(vo) = v.as_object().filter(|o| o.contains_key("@value")) {
+                    check_value_object(FRAGMENT, vo, ctx)?;
+                }
+                if embeds_context(v) {
+                    return Err(bad(
+                        "embedded @context is not allowed in a fragment (4.5.1/5.5.7)".into(),
+                    ));
+                }
                 out.insert("value".into(), v.clone());
             }
             // 4.5.5.1/5.5.8: the fragment's datasetId selects the instance to
@@ -1434,22 +1465,52 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
             {
                 return Err(bad("invalid languageMap in fragment (4.5.18.2)".into()));
             }
+            // 10.2.5.4/5.5.12: a null (either form) removes the member from
+            // the patched instance (`removes_member`), whatever the member
+            _ if RESERVED_MEMBERS.contains(&k.as_str()) && (v.is_null() || is_ngsi_null(v)) => {
+                out.insert(k.clone(), v.clone());
+            }
+            // 5.5.7: the rest of the reserved members are held to the rules,
+            // and expanded the way, a full instance's are — or one PATCH
+            // stores a Relationship target that is no URI, an objectList
+            // outside the bare-URI internal form, or a short-term vocab that
+            // a create would have stored as an IRI
+            "object" => {
+                check_object(FRAGMENT, v, opts)?;
+                out.insert(k.clone(), v.clone());
+            }
+            "objectList" => {
+                out.insert(k.clone(), object_list(FRAGMENT, v, opts)?);
+            }
+            "vocab" => {
+                out.insert(k.clone(), expand_terms(FRAGMENT, k, v, ctx)?);
+            }
+            "valueList" if !(v.is_array() || is_ngsi_null_list(v)) => {
+                return Err(bad("valueList in fragment must be an array".into()));
+            }
+            // 5.5.7, as for a fragment's value
+            "valueList" if embeds_context(v) => {
+                return Err(bad(
+                    "embedded @context is not allowed in a fragment (4.5.1/5.5.7)".into(),
+                ));
+            }
+            "unitCode" | "lang" | "valueType" | "objectType" => {
+                // the fragment may carry no type; Table 5.2.32-1's literal
+                // langString then still reads as the LanguageProperty's
+                let attr_type = match obj.get("type").and_then(Value::as_str) {
+                    Some(t) => t,
+                    None if v.as_str() == Some("langString") => "LanguageProperty",
+                    None => "",
+                };
+                let one = Map::from_iter([(k.clone(), v.clone())]);
+                expand_common_members(FRAGMENT, &one, attr_type, ctx, opts, &mut out)?;
+            }
             _ if RESERVED_MEMBERS.contains(&k.as_str()) => {
                 out.insert(k.clone(), v.clone());
             }
             _ => {
                 let iri = expand_attr_name(k, ctx)?;
-                let instances = expand_attribute(
-                    k,
-                    v,
-                    &ctx.within(&iri),
-                    ExpandOpts {
-                        fragment: true,
-                        allow_null: true,
-                        ..Default::default()
-                    },
-                    1,
-                )?;
+                let instances = expand_attribute(k, v, &ctx.within(&iri), opts, 1)?;
                 // 4.5.5.1: one Attribute name = one member of the fragment.
                 if out.insert(iri.clone(), Value::Array(instances)).is_some() {
                     return Err(bad(format!(
@@ -3707,6 +3768,30 @@ mod clause_5_2_36 {
         let attr = &ok["https://uri.etsi.org/ngsi-ld/default-context/readings"][0];
         assert_eq!(attr["type"], "ListProperty");
     }
+
+    /// 5.5.7: a user @context lives at the top level only; a ListProperty's
+    /// values may not carry one, in a full attribute or in a fragment, any
+    /// more than a Property value may.
+    #[test]
+    fn a_list_value_may_not_embed_a_context() {
+        let embedded = json!([{"@context": {"a": "http://evil/a"}, "a": 1}]);
+        assert!(
+            expand(with_list(
+                json!({"type": "ListProperty", "valueList": embedded.clone()})
+            ))
+            .is_err(),
+            "a full ListProperty"
+        );
+        let fragment = json!({"type": "ListProperty", "valueList": embedded});
+        assert!(
+            expand_attr_fragment(
+                fragment.as_object().expect("obj"),
+                &std::sync::Arc::new(crate::core_context()),
+            )
+            .is_err(),
+            "a fragment"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4641,6 +4726,52 @@ mod edges {
                             "https://uri.etsi.org/ngsi-ld/default-context/s":
                                 {"type": "Property", "value": 2}}))
         .is_err());
+    }
+
+    /// 5.5.7 + 4.5.3/4.5.22: a partial-update fragment's reserved members
+    /// obey the rules a full instance's do — a Relationship target is a
+    /// URI, an objectList holds the bare-URI internal form, vocab and
+    /// objectType are expanded — or one PATCH stores what a create refuses.
+    #[test]
+    fn a_fragment_holds_reserved_members_to_the_instance_rules() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let frag = |v: Value| expand_attr_fragment(v.as_object().expect("obj"), &ctx);
+        for bad in [
+            json!({"object": "not a uri"}),
+            json!({"object": 5}),
+            json!({"unitCode": 7}),
+            json!({"lang": ["fr"]}),
+            json!({"objectList": [5]}),
+            json!({"objectList": "urn:a"}),
+            json!({"valueList": 5}),
+            json!({"vocab": 5}),
+            json!({"value": {"@value": 1, "x": 2}}),
+            json!({"value": {"a": {"@context": "https://e/c"}}}),
+        ] {
+            assert!(frag(bad.clone()).is_err(), "{bad}");
+        }
+        let out = frag(json!({"vocab": "non-commercial"})).expect("vocab");
+        assert_eq!(
+            out["vocab"],
+            "https://uri.etsi.org/ngsi-ld/default-context/non-commercial"
+        );
+        let out = frag(json!({"objectList": [{"object": "urn:a"}, "urn:b"]})).expect("list");
+        assert_eq!(out["objectList"], json!(["urn:a", "urn:b"]));
+        let out = frag(json!({"objectType": "Parking", "object": "urn:a"})).expect("rel");
+        assert_eq!(
+            out["objectType"],
+            "https://uri.etsi.org/ngsi-ld/default-context/Parking"
+        );
+        // the deletion forms still remove the member (10.2.5.4)
+        for null in [json!("urn:ngsi-ld:null"), Value::Null] {
+            for k in ["object", "unitCode", "lang", "vocab", "objectType", "json"] {
+                let one = Value::Object(Map::from_iter([(k.to_owned(), null.clone())]));
+                let out = frag(one).unwrap_or_else(|e| panic!("{k}: {e:?}"));
+                assert_eq!(out[k], null, "{k}");
+            }
+        }
+        let out = frag(json!({"objectList": ["urn:ngsi-ld:null"]})).expect("list deletion");
+        assert_eq!(out["objectList"], json!(["urn:ngsi-ld:null"]));
     }
 
     #[test]

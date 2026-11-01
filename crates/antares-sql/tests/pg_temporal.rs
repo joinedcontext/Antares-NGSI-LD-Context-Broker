@@ -631,6 +631,56 @@ async fn append_refreshes_types_after_first_touch() {
         .expect("cleanup");
 }
 
+/// 4.5.6: a scope change is recorded as a scope instance in the
+/// evolution's `meta`. The next append's shell carries the CURRENT scope (a
+/// string array), and refreshing `meta` from it erased every recorded scope
+/// instance: the history kept only the scope as it now is.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_append_keeps_the_recorded_scope_history() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgscopehist").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:Vehicle:scopehist";
+    let _ = s.delete(&t, id).await;
+    ensure_entity(&pool, &t, id).await;
+    let attr = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    let shell = json!({"id": id, "type": "Vehicle", "scope": ["/a"],
+        "createdAt": "2026-08-15T09:00:00Z", "modifiedAt": "2026-08-15T09:00:00Z"});
+    let adds = |n: u32| {
+        json!({attr: [{"type": "Property", "value": n,
+        "observedAt": format!("2026-08-15T09:0{n}:00Z"),
+        "instanceId": format!("urn:ngsi-ld:Instance:sh{n}")}]})
+    };
+    s.append(&t, id, &shell, &adds(1)).await.expect("append 1");
+    // what push_scope records for a 4.5.6 scope change
+    let scope = json!({"type": "Property", "value": ["/a"],
+        "observedAt": "2026-08-15T09:00:30Z", "instanceId": "urn:ngsi-ld:Instance:sc1"});
+    s.mutate(&t, id, |doc| {
+        doc["scope"] = json!([scope.clone()]);
+        Ok::<(), ()>(())
+    })
+    .await
+    .expect("mutate")
+    .expect("present")
+    .expect("scope recorded");
+    s.append(&t, id, &shell, &adds(2)).await.expect("append 2");
+    let got = s.get(&t, id).await.expect("get").expect("present");
+    let _ = s.delete(&t, id).await;
+    sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+    assert_eq!(
+        got["scope"],
+        json!([scope]),
+        "the scope history was overwritten"
+    );
+    assert_eq!(got[attr].as_array().map(Vec::len), Some(2), "{got}");
+}
+
 /// 5.6.6 Delete Entity removes the entity, and with it the temporal evolution
 /// recorded for it (5.6.11 auto-recording). Those are two transactions, so an
 /// auto-recording append that started before the delete can commit after it —
@@ -1405,4 +1455,356 @@ async fn an_unchanged_append_records_no_new_instance() {
             .await
             .expect("cleanup");
     }
+}
+
+/// S3-06: one append (a drained request) that sets a value, another, then
+/// the first again records all three, and an append whose first row
+/// repeats the stored newest skips that row only: the rest of the batch
+/// follows its own predecessor, not the row stored before the batch. In the
+/// text shape and in the keyed one (a cut-over before the writes).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_that_returns_within_one_append_is_recorded() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = TenantId::new("pgtempreturn").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let name = "https://uri.etsi.org/ngsi-ld/default-context/name";
+    let base = chrono::Utc::now() - chrono::Duration::minutes(30);
+    let cut = base - chrono::Duration::days(1);
+    for (shape, s) in [
+        ("text", PgTemporalStore::with_cutover(pool.clone(), None)),
+        (
+            "keyed",
+            PgTemporalStore::with_cutover(pool.clone(), Some(cut)),
+        ),
+    ] {
+        let id = format!("urn:ngsi-ld:Vehicle:return-{shape}");
+        let _ = s.delete(&t, &id).await;
+        ensure_entity(&pool, &t, &id).await;
+        let at = |m: i64| {
+            (base + chrono::Duration::minutes(m)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let shell = json!({"id": id, "type": "Vehicle", "createdAt": at(0), "modifiedAt": at(0)});
+        let batch = |vals: &[(&str, i64)]| {
+            json!({name: vals.iter().map(|(v, m)| json!({"type": "Property", "value": v,
+                "instanceId": format!("urn:ngsi-ld:Instance:{shape}-{m}"),
+                "createdAt": at(0), "modifiedAt": at(*m)})).collect::<Vec<_>>()})
+        };
+        let values = || async {
+            let doc = s.get(&t, &id).await.expect("get").expect("present");
+            let mut inst: Vec<serde_json::Value> =
+                doc[name].as_array().cloned().unwrap_or_default();
+            inst.sort_by_key(|i| i["modifiedAt"].as_str().unwrap_or_default().to_owned());
+            inst.into_iter()
+                .map(|i| i["value"].clone())
+                .collect::<Vec<_>>()
+        };
+        s.append(&t, &id, &shell, &batch(&[("a", 1), ("b", 2), ("a", 3)]))
+            .await
+            .expect("append");
+        assert_eq!(
+            values().await,
+            [json!("a"), json!("b"), json!("a")],
+            "{shape}"
+        );
+        s.append(&t, &id, &shell, &batch(&[("a", 4), ("b", 5), ("a", 6)]))
+            .await
+            .expect("append");
+        assert_eq!(
+            values().await,
+            [json!("a"), json!("b"), json!("a"), json!("b"), json!("a")],
+            "{shape}: the first row repeats the stored newest, the rest are new"
+        );
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND entity_no = iri_no($1, $2)",
+        )
+        .bind(t.as_str())
+        .bind(&id)
+        .fetch_one(&pool)
+        .await
+        .expect("keyed rows");
+        assert_eq!(stored, if shape == "keyed" { 5 } else { 0 }, "{shape}");
+        let _ = s.delete(&t, &id).await;
+    }
+}
+
+/// S3-11: the 4.22 current-state prune commits on its own. The history reap
+/// after it may not finish (here a row of `attr_versions` held past the
+/// session's 5 s lock_timeout, as a scan past statement_timeout ends the same
+/// way); one that did not used to roll the prune back with it, so on a
+/// history large enough to time out every tick expired current-state
+/// instances were never pruned.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_current_state_prune_survives_a_failed_history_reap() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = TenantId::new("pgprunealone").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = pg::entity::PgEntityStore::new(pool.clone());
+    let id = "urn:ngsi-ld:T:prunealone";
+    let _ = store.delete(&t, id).await;
+    let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    let doc = json!({"id": id, "type": ["T"],
+        "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+        speed: [{"type": "Property", "value": 1, "datasetId": "urn:d:gone",
+                 "expiresAt": "2020-01-01T00:00:00Z"},
+                {"type": "Property", "value": 2}]});
+    assert!(store.create(&t, id, &doc).await.expect("create"));
+    // an expired superseded version the history reap must delete, held
+    let held = "urn:ngsi-ld:Instance:prunealone-held";
+    sqlx::query(
+        "INSERT INTO attr_versions (tenant_id, entity_id, attr_id, instance_id,
+                                    observed_at, version, data, expires_at)
+         VALUES ($1, $2, 'urn:a', $3, now(), 1, '{\"expiresAt\": \"2020-01-01T00:00:00Z\"}',
+                 '2020-01-01T00:00:00Z')
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(t.as_str())
+    .bind(id)
+    .bind(held)
+    .execute(&pool)
+    .await
+    .expect("version row");
+    let mut blocker = pool.begin().await.expect("blocker");
+    sqlx::query("SELECT 1 FROM attr_versions WHERE tenant_id = $1 AND instance_id = $2 FOR UPDATE")
+        .bind(t.as_str())
+        .bind(held)
+        .execute(&mut *blocker)
+        .await
+        .expect("hold the row");
+    let due = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT attrs_expire_at IS NOT NULL AND attrs_expire_at < now()
+               FROM entities WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("entity row")
+    };
+    assert!(due().await, "the Entity holds an expired instance");
+    let msg = maintenance_winning(&pool, None).await.expect("maintenance");
+    blocker.rollback().await.expect("release");
+    assert!(
+        msg.contains("instance reap skipped"),
+        "the history reap failed: {msg}"
+    );
+    assert!(
+        !due().await,
+        "the prune went down with the history reap: {msg}"
+    );
+    sqlx::query("DELETE FROM attr_versions WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+    let _ = store.delete(&t, id).await;
+}
+
+/// The tables of the rows of `tenants` all carry a valid `expires_at` index
+/// (migration 0030): the maintenance job builds them, and a sibling test's
+/// pass may hold the build while this one asks.
+async fn expiry_indexes_built(pool: &sqlx::PgPool, tenants: &[&str]) {
+    let tenants: Vec<String> = tenants.iter().map(|t| (*t).to_owned()).collect();
+    for _ in 0..100 {
+        antares_sql::store::pg::maintenance::history_expiry_index(pool)
+            .await
+            .expect("expiry index build");
+        let unindexed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM (SELECT DISTINCT tableoid FROM attr_instances WHERE tenant_id = ANY($1)
+                                   UNION SELECT DISTINCT tableoid FROM attr_rows WHERE tenant_id = ANY($1)
+                                   UNION SELECT 'attr_versions'::regclass::oid) t
+              WHERE NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_class ic ON ic.oid = x.indexrelid
+                                 WHERE x.indrelid = t.tableoid AND x.indisvalid
+                                   AND ic.relname LIKE '%\\_expires')",
+        )
+        .bind(&tenants)
+        .fetch_one(pool)
+        .await
+        .expect("indexes");
+        if unindexed == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the expires_at indexes were never built");
+}
+
+/// S3-11: the 4.22 history reap reads `expires_at` (migration 0030), which
+/// both history shapes and the kept versions fill at write time, instead of
+/// casting every row's `data->>'expiresAt'` each tick. Rows written before
+/// the column (`expires_at` NULL, an expired `expiresAt` in `data`) are kept
+/// by the tick's reap and reaped by the daily scan; a row expiring later and
+/// one without expiry are kept by both, in every Tenant.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_history_reap_finds_expired_rows_by_their_column() {
+    let url = require_db!();
+    let _ddl = PARTITION_DDL.lock().await;
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let (ta, tb) = ("pgreapcol-a", "pgreapcol-b");
+    let clean = || async {
+        for table in [
+            "attr_instances",
+            "attr_rows",
+            "attr_versions",
+            "temporal_entities",
+            "entities",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE tenant_id = ANY($1)"
+            )))
+            .bind(vec![ta, tb])
+            .execute(&pool)
+            .await
+            .expect("clean");
+        }
+    };
+    clean().await;
+    let attr = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    // observed this hour: the week's partition or chunk exists and a
+    // timescale chunk this young is not compressed
+    let now = chrono::Utc::now();
+    let at = |m: i64| (now - chrono::Duration::minutes(m)).to_rfc3339();
+    let inst = |id: &str, value: i64, m: i64, expires: Option<&str>| {
+        let mut i = json!({"type": "Property", "value": value, "observedAt": at(m),
+                           "instanceId": format!("urn:ngsi-ld:Instance:{id}")});
+        if let Some(e) = expires {
+            i["expiresAt"] = json!(e);
+        }
+        i
+    };
+    let id = "urn:ngsi-ld:T:reapcol";
+    let shell = json!({"id": id, "type": ["T"], "createdAt": at(10), "modifiedAt": at(10)});
+    let mut doc = shell.clone();
+    doc[attr] = json!([
+        inst("gone", 1, 9, Some("2020-01-01T00:00:00Z")),
+        inst("later", 2, 8, Some("2099-01-01T00:00:00Z")),
+        inst("durable", 3, 7, None)
+    ]);
+    // tenant a in the text shape, b in the keyed one (attr_rows)
+    let text = PgTemporalStore::new(pool.clone());
+    let keyed = PgTemporalStore::with_cutover(pool.clone(), Some(chrono::DateTime::UNIX_EPOCH));
+    for (t, s) in [(ta, &text), (tb, &keyed)] {
+        let t = TenantId::new(t).expect("tenant");
+        pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+        ensure_entity(&pool, &t, id).await;
+        assert!(s.create(&t, id, &doc).await.expect("create"));
+        // a correction of the expired instance: its old version goes to
+        // attr_versions with the column
+        let fix = json!({attr: [inst("gone", 10, 9, Some("2020-01-01T00:00:00Z"))]});
+        s.append(&t, id, &shell, &fix).await.expect("correct");
+    }
+    let stamped = |table: &'static str, t: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM {table} WHERE tenant_id = $1 AND expires_at IS NOT NULL"
+            )))
+            .bind(t)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    assert_eq!(stamped("attr_instances", ta).await, 2, "text rows stamped");
+    assert_eq!(stamped("attr_rows", tb).await, 2, "keyed rows stamped");
+    assert_eq!(
+        stamped("attr_versions", ta).await,
+        1,
+        "text version stamped"
+    );
+    assert_eq!(
+        stamped("attr_versions", tb).await,
+        1,
+        "keyed version stamped"
+    );
+    // Spent before the rows the daily scan reaps are written: the UPDATE
+    // waits for a sibling's scan that holds the claim, and none starts after.
+    sqlx::query("UPDATE maintenance_jobs SET last_run = now() WHERE name = 'history_expiry_scan'")
+        .execute(&pool)
+        .await
+        .expect("the daily scan is not due");
+    // rows as a release before 0030 wrote them
+    for (table, iid) in [
+        ("attr_instances", "urn:ngsi-ld:Instance:legacy"),
+        ("attr_versions", "urn:ngsi-ld:Instance:legacyv"),
+    ] {
+        let cols = if table == "attr_instances" {
+            "(tenant_id, entity_id, attr_id, instance_id, observed_at, created_at, modified_at, data)
+             VALUES ($1, $2, $3, $4, now(), now(), now(), '{\"expiresAt\": \"2020-01-01T00:00:00Z\"}')"
+        } else {
+            "(tenant_id, entity_id, attr_id, instance_id, observed_at, version, data)
+             VALUES ($1, $2, $3, $4, now(), 1, '{\"expiresAt\": \"2020-01-01T00:00:00Z\"}')"
+        };
+        for t in [ta, tb] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("INSERT INTO {table} {cols}")))
+                .bind(t)
+                .bind(id)
+                .bind(attr)
+                .bind(iid)
+                .execute(&pool)
+                .await
+                .expect("legacy row");
+        }
+    }
+    let left = |t: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut ids: Vec<String> = sqlx::query_scalar(
+                "SELECT 'h:' || COALESCE(data->>'instanceId', instance_id) FROM (
+                   SELECT instance_id, data FROM attr_instances WHERE tenant_id = $1
+                   UNION ALL SELECT r.instance_no::text, r.data FROM attr_rows r WHERE tenant_id = $1) h
+                 UNION ALL SELECT 'v:' || instance_id FROM attr_versions WHERE tenant_id = $1",
+            )
+            .bind(t)
+            .fetch_all(&pool)
+            .await
+            .expect("rows");
+            ids.sort();
+            ids
+        }
+    };
+    let kept = |legacy: bool| {
+        let mut v = vec![
+            "h:urn:ngsi-ld:Instance:durable",
+            "h:urn:ngsi-ld:Instance:later",
+        ];
+        if legacy {
+            v.extend([
+                "h:urn:ngsi-ld:Instance:legacy",
+                "v:urn:ngsi-ld:Instance:legacyv",
+            ]);
+        }
+        let mut v: Vec<String> = v.into_iter().map(str::to_owned).collect();
+        v.sort();
+        v
+    };
+    for t in [ta, tb] {
+        assert_eq!(left(t).await.len(), 6, "{t}: {:?}", left(t).await);
+    }
+    expiry_indexes_built(&pool, &[ta, tb]).await;
+    let msg = maintenance_winning(&pool, None).await.expect("maintenance");
+    assert!(!msg.contains("daily scan"), "{msg}");
+    for t in [ta, tb] {
+        assert_eq!(
+            left(t).await,
+            kept(true),
+            "{t}: the rows the column marks expired reaped, the rest kept: {msg}"
+        );
+    }
+    sqlx::query("UPDATE maintenance_jobs SET last_run = NULL WHERE name = 'history_expiry_scan'")
+        .execute(&pool)
+        .await
+        .expect("the daily scan is due");
+    // a sibling's pass may be the one that runs it: the rows tell
+    let msg = maintenance_winning(&pool, None).await.expect("maintenance");
+    for t in [ta, tb] {
+        assert_eq!(
+            left(t).await,
+            kept(false),
+            "{t}: the daily scan reaped the rows written before the column: {msg}"
+        );
+    }
+    clean().await;
 }

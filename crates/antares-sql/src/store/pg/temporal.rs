@@ -220,6 +220,13 @@ use super::entity::types_scopes_stamps as extract;
 /// verbatim either way, exactly as the bridge kept it unpruned.
 const DOC_META: &[&str] = antares_model::ENTITY_META_KEYS;
 
+/// The meta an append leaves on a `temporal_entities` row that exists: the
+/// shell's (`EXCLUDED.meta`), but a stored `scope` that holds instances —
+/// its recorded history, which `push_scope` keeps in `meta` — stays.
+const KEPT_META: &str = "CASE WHEN jsonb_typeof(temporal_entities.meta->'scope'->0) = 'object'
+           THEN EXCLUDED.meta || jsonb_build_object('scope', temporal_entities.meta->'scope')
+           ELSE EXCLUDED.meta END";
+
 /// The meta-only document stored in `temporal_entities.meta`.
 fn meta_of(doc: &Value) -> Value {
     let mut m = serde_json::Map::new();
@@ -283,6 +290,12 @@ fn decompose(doc: &Value) -> Vec<Value> {
                     "created_at": ts("createdAt").unwrap_or_else(|| observed.clone()),
                     "modified_at": ts("modifiedAt").unwrap_or(observed),
                     "deleted_at": ts("deletedAt"),
+                    // 4.22: the reap's index key (migration 0030); a stamp
+                    // chrono cannot read stays NULL there, and the daily
+                    // scan of `data` reaps it
+                    "expires_at": ts("expiresAt")
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                        .map(|t| t.to_rfc3339()),
                     "data": data,
                     "provenance": provenance,
                 }));
@@ -468,31 +481,46 @@ fn observed_range(rows: &[Value]) -> (String, String) {
     }
 }
 
-/// The rows of one append that are new observations: of rows equal
-/// but for their stamps, the first, and of rows with an `observedAt`, one per
-/// (attribute, datasetId, observedAt). What the table already holds is
-/// `insert_rows`'s to compare.
+/// The rows of one append that are new observations: of rows with an
+/// `observedAt`, one per (attribute, datasetId, observedAt), and of rows
+/// without, each one that differs but for its stamps from the row kept
+/// before it in its (attribute, datasetId) — the rule NEWEST_REPEATS applies
+/// against the table, so a value that comes back after another is recorded.
+/// A row kept after another of its series is marked `follows`: its
+/// predecessor is that row, never the table's newest, and `insert_rows`
+/// holds only a series' first row against what the table already holds.
 fn unseen(rows: Vec<Value>) -> Vec<Value> {
-    let mut seen = std::collections::HashSet::new();
+    let mut observed = std::collections::HashSet::new();
+    let mut last: std::collections::HashMap<(String, String), Value> =
+        std::collections::HashMap::new();
     rows.into_iter()
-        .filter(|r| {
-            let data = &r["data"];
-            let what = if data.get("observedAt").is_some() {
-                r["observed_at"].clone()
-            } else {
-                let mut d = data.clone();
-                if let Some(o) = d.as_object_mut() {
-                    for k in ["instanceId", "createdAt", "modifiedAt"] {
-                        o.remove(k);
-                    }
+        .filter_map(|mut r| {
+            let field = |k: &str| r.get(k).cloned().unwrap_or(Value::Null);
+            let series = (
+                field("attr_id").to_string(),
+                field("dataset_id").to_string(),
+            );
+            let at = field("observed_at").to_string();
+            let mut d = field("data");
+            let has_observed_at = d.get("observedAt").is_some();
+            if let Some(o) = d.as_object_mut() {
+                for k in ["instanceId", "createdAt", "modifiedAt"] {
+                    o.remove(k);
                 }
-                d
-            };
-            seen.insert((
-                r["attr_id"].to_string(),
-                r["dataset_id"].to_string(),
-                what.to_string(),
-            ))
+            }
+            if has_observed_at {
+                if !observed.insert((series.0.clone(), series.1.clone(), at)) {
+                    return None;
+                }
+            } else if last.get(&series) == Some(&d) {
+                return None;
+            }
+            if last.insert(series, d).is_some() {
+                if let Some(o) = r.as_object_mut() {
+                    o.insert("follows".into(), Value::Bool(true));
+                }
+            }
+            Some(r)
         })
         .collect()
 }
@@ -672,9 +700,10 @@ async fn insert_text(
     // `dedup` the same (attribute, datasetId, observedAt).
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_versions
-           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance)
+           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance,
+            expires_at)
          SELECT x.tenant_id, x.entity_id, x.attr_id, x.instance_id, x.dataset_id, x.observed_at,
-                x.version, {x_data}, x.provenance
+                x.version, {x_data}, x.provenance, x.expires_at
          FROM jsonb_array_elements($3::jsonb) AS e
          JOIN attr_instances x ON x.tenant_id = $1 AND x.entity_id = $2
            AND x.attr_id = e->>'attr_id' AND x.observed_at = (e->>'observed_at')::timestamptz
@@ -701,7 +730,8 @@ async fn insert_text(
              SET data = (e->'data') - 'instanceId',
                  version = x.version + 1, provenance = {CORRECTED},
                  modified_at = (e->>'modified_at')::timestamptz,
-                 deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
+                 deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE},
+                 expires_at = (e->>'expires_at')::timestamptz
              FROM jsonb_array_elements($3::jsonb) AS e
              WHERE x.tenant_id = $1 AND x.entity_id = $2 AND e->'data' ? 'observedAt' AND {same}
                AND x.observed_at = (e->>'observed_at')::timestamptz
@@ -718,18 +748,21 @@ async fn insert_text(
     }
     // `$4` off: today's row per write. On: a row with an observedAt already
     // stored, or without one equal to the newest stored instance, is no new
-    // observation. Both probes ride (tenant_id, entity_id, attr_id, observed_at, …)
+    // observation; a row that `follows` another of the batch was compared
+    // with that one by `unseen`. Both probes ride
+    // (tenant_id, entity_id, attr_id, observed_at, …)
     // and read one row: the second is NEWEST_REPEATS, never a scan of the
     // attribute's whole history (that scan cost ~90 ms a station at a
     // month of history, and a minute's batch of 2,063 stations recorded nothing).
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_instances
            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
-            created_at, modified_at, deleted_at, data, geo_value, provenance)
+            created_at, modified_at, deleted_at, data, geo_value, provenance, expires_at)
          SELECT $1, $2, e->>'attr_id', e->>'instance_id', e->>'dataset_id',
                 (e->>'observed_at')::timestamptz, (e->>'created_at')::timestamptz,
                 (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
-                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb)
+                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb),
+                (e->>'expires_at')::timestamptz
          FROM jsonb_array_elements($3::jsonb) AS e
          WHERE NOT $4 OR NOT CASE
            WHEN e->'data' ? 'observedAt' THEN EXISTS (
@@ -737,13 +770,14 @@ async fn insert_text(
              WHERE x.tenant_id = $1 AND x.entity_id = $2 AND {same}
                AND x.observed_at = (e->>'observed_at')::timestamptz
                AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz)
-           ELSE {NEWEST_REPEATS}
+           ELSE NOT (e ? 'follows') AND {NEWEST_REPEATS}
          END
          ON CONFLICT (tenant_id, entity_id, attr_id, instance_id, observed_at)
            DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
                          dataset_id = EXCLUDED.dataset_id,
                          deleted_at = EXCLUDED.deleted_at,
                          geo_value = EXCLUDED.geo_value,
+                         expires_at = EXCLUDED.expires_at,
                          version = attr_instances.version + 1,
                          provenance = jsonb_set(COALESCE(EXCLUDED.provenance, '{{}}'::jsonb),
                                                 '{{operation}}', '\"correct\"')
@@ -790,9 +824,10 @@ async fn insert_keyed(
     // attr_versions keeps whole documents in the text shape
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_versions
-           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance)
+           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance,
+            expires_at)
          SELECT x.tenant_id, x.entity_id, x.attr_id, x.instance_id, x.dataset_id, x.observed_at,
-                x.version, {x_data}, x.provenance
+                x.version, {x_data}, x.provenance, x.expires_at
          FROM jsonb_array_elements($3::jsonb) AS e
          CROSS JOIN LATERAL attr_rows_at($1, $2, e->>'attr_id') x
          WHERE x.observed_at = (e->>'observed_at')::timestamptz
@@ -823,7 +858,8 @@ async fn insert_keyed(
                                 ELSE '{{}}'::jsonb END,
                  version = x.version + 1, provenance = {CORRECTED},
                  modified_at = (e->>'modified_at')::timestamptz,
-                 deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
+                 deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE},
+                 expires_at = (e->>'expires_at')::timestamptz
              FROM jsonb_array_elements($3::jsonb) AS e
              WHERE x.tenant_id = $1 AND x.entity_no = iri_no($1, $2)
                AND e->'data' ? 'observedAt' AND {same}
@@ -842,12 +878,13 @@ async fn insert_keyed(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_rows
            (tenant_id, entity_no, attr_no, instance_no, dataset_id, observed_at,
-            created_at, modified_at, deleted_at, data, geo_value, provenance, short)
+            created_at, modified_at, deleted_at, data, geo_value, provenance, short, expires_at)
          SELECT $1, iri_no($1, $2), iri_no($1, e->>'attr_id'), (e->>'instance_no')::uuid,
                 e->>'dataset_id',
                 (e->>'observed_at')::timestamptz, (e->>'created_at')::timestamptz,
                 (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
-                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb), $7
+                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb), $7,
+                (e->>'expires_at')::timestamptz
          FROM jsonb_array_elements($3::jsonb) AS e
          WHERE NOT $4 OR NOT CASE
            WHEN e->'data' ? 'observedAt' THEN EXISTS (
@@ -855,13 +892,14 @@ async fn insert_keyed(
              WHERE x.tenant_id = $1 AND x.entity_no = iri_no($1, $2) AND {same}
                AND x.observed_at = (e->>'observed_at')::timestamptz
                AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz)
-           ELSE {NEWEST_REPEATS}
+           ELSE NOT (e ? 'follows') AND {NEWEST_REPEATS}
          END
          ON CONFLICT (tenant_id, entity_no, attr_no, observed_at, instance_no, short)
            DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
                          dataset_id = EXCLUDED.dataset_id,
                          deleted_at = EXCLUDED.deleted_at,
                          geo_value = EXCLUDED.geo_value,
+                         expires_at = EXCLUDED.expires_at,
                          version = attr_rows.version + 1,
                          provenance = jsonb_set(COALESCE(EXCLUDED.provenance, '{{}}'::jsonb),
                                                 '{{operation}}', '\"correct\"')
@@ -978,7 +1016,9 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
 /// `OFFSET 0` keeps the instance read a parameterised index
 /// range per Attribute, which a hash join over the whole Entity would
 /// otherwise replace. The N-th newest takes the newest N of each parent,
-/// each arm limited itself so both read their btree backwards.
+/// each arm limited itself so both read their btree backwards, over the rows
+/// that carry observedAt only: the rank puts a row without it after every
+/// one with it (`NULLS LAST`), whatever its `observed_at` column says.
 const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
             SELECT min(x.attr_id) FROM attr_instances x \
             WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id{xwindow} \
@@ -1004,10 +1044,11 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
                 ELSE k.nth - interval '28 hours' END FROM (SELECT COALESCE((SELECT t.observed_at FROM (\
                 (SELECT t.observed_at FROM attr_instances t \
                   WHERE t.tenant_id = m.tenant_id AND t.entity_id = m.id AND t.attr_id = a.attr{window} \
+                    AND t.data ->> 'observedAt' IS NOT NULL \
                   ORDER BY t.observed_at DESC LIMIT greatest(${n}::bigint, 1)) \
                 UNION ALL \
                 (SELECT t.observed_at FROM attr_rows_at(m.tenant_id, m.id, a.attr) t \
-                  WHERE true{window} \
+                  WHERE t.data ->> 'observedAt' IS NOT NULL{window} \
                   ORDER BY t.observed_at DESC LIMIT greatest(${n}::bigint, 1))) t \
                 ORDER BY t.observed_at DESC OFFSET greatest(${n}::bigint - 1, 0) LIMIT 1), \
                 '-infinity'::timestamptz) AS nth) k) END AS th) c \
@@ -1457,19 +1498,23 @@ impl PgTemporalStore {
         // temporal queries forever. The shell carries the CURRENT
         // entity, so refresh on change; the IS DISTINCT FROM guard keeps
         // the common no-change append from churning the meta row.
-        sqlx::query(
+        // The one meta member the shell cannot refresh is a `scope` that
+        // holds instances (4.5.6 scope history, its deletion instances):
+        // the shell's is the current string array, and writing it over the
+        // history erased every scope change recorded so far.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO temporal_entities
                (tenant_id, id, types, scopes, meta, created_at, modified_at)
              VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz)
              ON CONFLICT (tenant_id, id) DO UPDATE SET
                types = EXCLUDED.types,
                scopes = EXCLUDED.scopes,
-               meta = EXCLUDED.meta,
+               meta = {KEPT_META},
                modified_at = EXCLUDED.modified_at
              WHERE temporal_entities.types IS DISTINCT FROM EXCLUDED.types
                 OR temporal_entities.scopes IS DISTINCT FROM EXCLUDED.scopes
-                OR temporal_entities.meta IS DISTINCT FROM EXCLUDED.meta",
-        )
+                OR temporal_entities.meta IS DISTINCT FROM {KEPT_META}"
+        )))
         .bind(tenant.as_str())
         .bind(id)
         .bind(&types)
@@ -2035,9 +2080,9 @@ impl PgTemporalStore {
                     sqlx::query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO attr_versions
                            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
-                            version, data, provenance)
+                            version, data, provenance, expires_at)
                          SELECT t.tenant_id, t.entity_id, t.attr_id, t.instance_id, t.dataset_id,
-                                t.observed_at, t.version, {}, t.provenance
+                                t.observed_at, t.version, {}, t.provenance, t.expires_at
                          FROM {} t JOIN jsonb_array_elements($3::jsonb) AS e
                            ON t.attr_id = e->>'a' AND t.instance_id = e->>'i'
                          ON CONFLICT DO NOTHING",
@@ -2505,6 +2550,25 @@ mod tests {
         };
         // half-pruning would silently skip the range: refuse instead
         assert!(attr_object_expr(&f, 1).is_none());
+    }
+
+    /// S3-06: without observedAt a row is dropped only when it repeats the
+    /// row kept before it in its (attribute, datasetId), as NEWEST_REPEATS
+    /// judges against the table: a value that comes back after another is
+    /// a new observation, and only a batch's first row of a series is held
+    /// against the table.
+    #[test]
+    fn unseen_keeps_a_value_that_returns_after_another() {
+        let row = |v: i64, i: &str| {
+            serde_json::json!({"attr_id": "a", "dataset_id": null,
+            "instance_id": i, "observed_at": "2026-01-01T00:00:00Z",
+            "data": {"type": "Property", "value": v}})
+        };
+        let kept = unseen(vec![row(1, "i1"), row(2, "i2"), row(1, "i3")]);
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        let kept = unseen(vec![row(1, "i1"), row(1, "i2"), row(2, "i3")]);
+        let ids: Vec<_> = kept.iter().map(|r| r["instance_id"].clone()).collect();
+        assert_eq!(ids, ["i1", "i3"], "a repeat in a row is still one");
     }
 
     #[test]

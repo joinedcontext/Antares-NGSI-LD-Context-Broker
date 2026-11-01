@@ -217,6 +217,49 @@ async fn a_batch_applies_the_condition_per_member() {
     }
 }
 
+/// A conditioned batch delete commits member by member: a store error
+/// after one delete landed is a 207 naming the committed id in S and the
+/// failed one in E (5.6.10.4), not a 5xx that hides the delete; a batch whose
+/// first delete fails committed nothing and answers the store error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_error_after_a_conditioned_delete_is_a_207_naming_both() {
+    const ALSO_A: &str = "urn:ngsi-ld:Vehicle:also-a";
+    let mut st = state(Arc::new(Conditioned(zone_a()))).await;
+    st.policy = None;
+    let (status, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(vehicle(ALSO_A, "A")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    st.policy = Some(Arc::new(Conditioned(zone_a())));
+    st.store = Arc::new(Double::refusing_create(
+        st.store.clone(),
+        antares_store::Kind::Entity,
+        ALSO_A,
+    ));
+    let (status, out) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/delete",
+        Some(json!([IN_A, ALSO_A])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{out}");
+    assert_eq!(out["success"], json!([IN_A]), "{out}");
+    assert_eq!(out["errors"][0]["entityId"], ALSO_A, "{out}");
+    let (status, out) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/delete",
+        Some(json!([ALSO_A])),
+    )
+    .await;
+    assert!(status.is_server_error(), "{status}: {out}");
+}
+
 /// Batch Upsert: a conditioned member updates the Entity its
 /// condition selects and never creates. The one it does not select and an
 /// absent one answer the same 404 in E, and neither is written.

@@ -1332,3 +1332,123 @@ async fn history_count_within_gives_up_at_its_bound() {
     );
     assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
 }
+
+/// S3-18: two writers to one Entity on the Postgres arm, the memory arm's
+/// `change_hook_fires_in_commit_order_per_entity` run against it. Writer 1
+/// commits and sits in its change hook; writer 2 commits after it and its
+/// hook runs at once, so the hooks run v2 then v1. Each change carries the
+/// version its write left under the row lock (option B of the verdict), and
+/// a consumer that keeps the newest image per Entity through
+/// `NewestSeen` drops the late v1: it ends with v2, which committed last.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_change_hook_fires_in_commit_order_per_entity() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let s = Arc::new(antares_sql::store::any::AnyStore::Pg(
+        antares_sql::store::any::PgBackend::new(pool.clone()),
+    ));
+    // (image, its version) in the order the hooks ran, and the image the
+    // consumer kept
+    let seen: Arc<std::sync::Mutex<Vec<(i64, antares_store::ChangeVersion)>>> = Arc::default();
+    let kept: Arc<std::sync::Mutex<i64>> = Arc::default();
+    let newest = Arc::new(antares_store::NewestSeen::new(16));
+    let entered = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    {
+        let (seen, kept, entered, released) = (
+            seen.clone(),
+            kept.clone(),
+            entered.clone(),
+            released.clone(),
+        );
+        s.set_change_hook(Arc::new(
+            move |t: &TenantId,
+                  _b: Option<serde_json::Value>,
+                  after: Option<serde_json::Value>,
+                  version: antares_store::ChangeVersion|
+                  -> antares_store::HookFuture<'_> {
+                let (seen, kept, entered, released) = (
+                    seen.clone(),
+                    kept.clone(),
+                    entered.clone(),
+                    released.clone(),
+                );
+                let newest = newest.clone();
+                Box::pin(async move {
+                    let v = after
+                        .as_ref()
+                        .and_then(|a| a.get("v"))
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(-1);
+                    if v == 1 {
+                        entered.store(true, Ordering::SeqCst);
+                        while !released.load(Ordering::SeqCst) {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                    if newest.admit(t.as_str(), "urn:ngsi-ld:T:emitorder", &version) {
+                        *kept
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = v;
+                    }
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((v, version));
+                })
+            },
+        ));
+    }
+    let t = TenantId::new("pgemitorder").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:T:emitorder";
+    let doc = move |v: i64| {
+        serde_json::json!({"id": id, "type": ["T"], "v": v,
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z"})
+    };
+    let _ = s.delete(&t, antares_sql::store::Kind::Entity, id).await;
+    s.upsert(&t, antares_sql::store::Kind::Entity, id, doc(0))
+        .await
+        .expect("seed");
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    let (s1, t1) = (s.clone(), t.clone());
+    let w1 = tokio::spawn(async move {
+        s1.upsert(&t1, antares_sql::store::Kind::Entity, id, doc(1))
+            .await
+            .expect("writer 1");
+    });
+    while !entered.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let (s2, t2) = (s.clone(), t.clone());
+    let w2 = tokio::spawn(async move {
+        s2.upsert(&t2, antares_sql::store::Kind::Entity, id, doc(2))
+            .await
+            .expect("writer 2");
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    released.store(true, Ordering::SeqCst);
+    w1.await.expect("writer 1");
+    w2.await.expect("writer 2");
+    let order = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let kept = *kept
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = s.delete(&t, antares_sql::store::Kind::Entity, id).await;
+    let images: Vec<i64> = order.iter().map(|(v, _)| *v).collect();
+    assert_eq!(images, vec![2, 1], "the hooks ran out of commit order");
+    assert!(
+        order[1].1 < order[0].1,
+        "the late change carries the older version: {order:?}"
+    );
+    assert_eq!(
+        kept, 2,
+        "the consumer must end with the image committed last: {order:?}"
+    );
+}

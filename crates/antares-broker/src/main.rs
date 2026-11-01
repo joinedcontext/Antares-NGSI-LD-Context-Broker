@@ -60,12 +60,18 @@ const KNOWN_KEYS: &[&str] = &[
     // Host names that may still resolve to a private address while the wall
     // is armed: the in-cluster peers; never loopback or metadata.
     "ANTARES_EGRESS_PRIVATE_HOSTS",
+    // Bound on one whole @context resolution (every fetch it makes and
+    // their permit waits); default 30 000 ms, past it LdContextNotAvailable.
+    "ANTARES_CONTEXT_RESOLVE_TIMEOUT_MS",
     // Refuse to start when the DB role bypasses RLS (production gate;
     // default off so the dev/ETSI superuser stack still boots).
     "ANTARES_REQUIRE_RLS",
     // Temporal retention horizon in days; absent = keep forever (a
     // maintenance job must never default to dropping data).
     "ANTARES_TEMPORAL_RETENTION_DAYS",
+    // Most instances one Attribute's history keeps in the memory/file store
+    // (default 10 000, 0 = no cap): its whole history is one document.
+    "ANTARES_MEM_MAX_INSTANCES",
     // a value older than the current one goes to history only
     // (`on`); off keeps NGSI-LD's last-write-wins.
     "ANTARES_HISTORY_BACKFILL",
@@ -229,6 +235,56 @@ fn parse_sweep_secs(raw: Option<&str>) -> Result<u64, String> {
         )),
         Ok(n) => Ok(n),
     }
+}
+
+/// ANTARES_MEM_MAX_INSTANCES: the most instances one Attribute's history
+/// keeps in the memory/file store. Absent = 10 000, `0` = no cap; anything
+/// that is not a non-negative integer is fatal, like every other bound.
+fn parse_mem_max_instances(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(10_000),
+        Some(v) => v.trim().parse::<usize>().map_err(|_| {
+            format!("ANTARES_MEM_MAX_INSTANCES must be a non-negative integer, got {v:?}")
+        }),
+    }
+}
+
+/// The one boot warning a memory/file history gets: no retention job
+/// prunes it (ANTARES_TEMPORAL_RETENTION_DAYS runs on Postgres history), so
+/// it grows until the per-Attribute cap stops it — or, uncapped, until every
+/// append rewrites a document the size of the whole history. `None` for any
+/// other history backend.
+fn mem_history_warning(history: Option<&str>, cap: usize) -> Option<String> {
+    let mem = history
+        .and_then(|h| h.parse::<antares_sql::StoreMode>().ok())
+        .is_some_and(|m| {
+            matches!(
+                m,
+                antares_sql::StoreMode::Memory | antares_sql::StoreMode::File
+            )
+        });
+    if !mem {
+        return None;
+    }
+    let retention = if std::env::var_os("ANTARES_TEMPORAL_RETENTION_DAYS").is_some() {
+        "ANTARES_TEMPORAL_RETENTION_DAYS does not prune it (it applies to Postgres history)"
+    } else {
+        "nothing prunes it (ANTARES_TEMPORAL_RETENTION_DAYS is unset, and applies to Postgres \
+         history only)"
+    };
+    Some(if cap == 0 {
+        format!(
+            "temporal history lives in the memory/file store and {retention}; with \
+             ANTARES_MEM_MAX_INSTANCES=0 it is uncapped, and every append rewrites the Entity's \
+             whole history under the store's single write lock"
+        )
+    } else {
+        format!(
+            "temporal history lives in the memory/file store and {retention}: an Attribute that \
+             reaches {cap} instances (ANTARES_MEM_MAX_INSTANCES) records no more, temporal API \
+             writes past it are refused and Entity writes stop extending its history"
+        )
+    })
 }
 
 /// An explicitly-off switch value, whatever the operator's spelling. Used by
@@ -460,6 +516,18 @@ fn parse_pg_batch_async_commit(raw: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// ANTARES_SECRET_KEY: the key that seals the notification credentials, in
+/// the Pg store and in the bus KV mirror. Unset or blank is none; a value
+/// that is no key is fatal, and the error never echoes it.
+fn secret_key() -> Result<Option<antares_sql::store::pg::seal::SecretKey>, String> {
+    match std::env::var("ANTARES_SECRET_KEY") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            antares_sql::store::pg::seal::SecretKey::from_base64(&raw).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// ANTARES_PG_POOL → pool size: absent defaults to 20; anything that is not
 /// a positive integer is fatal (a misread size must never silently run with
 /// a default, matching the unknown-key policy).
@@ -680,6 +748,10 @@ async fn build_drivers(store_name: &str) -> Result<Drivers, Box<dyn std::error::
             (second.temporal, Some(name))
         }
     };
+    let cap = parse_mem_max_instances(std::env::var("ANTARES_MEM_MAX_INSTANCES").ok().as_deref())?;
+    if let Some(w) = mem_history_warning(temporal_name.as_deref(), cap) {
+        tracing::warn!("{w}");
+    }
     Ok(Drivers {
         store: built.store,
         temporal,
@@ -772,8 +844,9 @@ async fn build_builtin(
     use antares_sql::store::pg::maintenance::TemporalBackend;
     use antares_sql::store::Store;
     use antares_sql::StoreMode;
+    let cap = parse_mem_max_instances(std::env::var("ANTARES_MEM_MAX_INSTANCES").ok().as_deref())?;
     match mode {
-        StoreMode::Memory => Ok((AnyStore::Mem(Store::default()), None)),
+        StoreMode::Memory => Ok((AnyStore::Mem(Store::default()).max_instances(cap), None)),
         StoreMode::File => {
             let dir = std::env::var("ANTARES_DATA_DIR").map_err(|_| {
                 "ANTARES_STORE=file requires ANTARES_DATA_DIR (a mounted volume — data \
@@ -781,7 +854,10 @@ async fn build_builtin(
             })?;
             let dir = std::path::PathBuf::from(dir);
             warn_if_not_mount_point(&dir);
-            Ok((AnyStore::Mem(Store::open_file(&dir)?), None))
+            Ok((
+                AnyStore::Mem(Store::open_file(&dir)?).max_instances(cap),
+                None,
+            ))
         }
         StoreMode::Postgres | StoreMode::Timescale => {
             // The URL carries the database password: held as a Secret so no
@@ -806,12 +882,7 @@ async fn build_builtin(
             )?;
             // read before the pool opens, so a bad key fails the boot
             // before any connection exists; never echoed.
-            let mut secret_key = match std::env::var("ANTARES_SECRET_KEY") {
-                Ok(raw) if !raw.trim().is_empty() => {
-                    Some(antares_sql::store::pg::seal::SecretKey::from_base64(&raw)?)
-                }
-                _ => None,
-            };
+            let mut secret_key = secret_key()?;
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
@@ -1115,7 +1186,8 @@ async fn run(
         // consumers per role, topology asserted before traffic.
         let url = std::env::var("ANTARES_NATS_URL")
             .map_err(|_| "ANTARES_BUS=nats requires ANTARES_NATS_URL")?;
-        let bus = wiring::wire_nats(&mut state, &url, roles).await?;
+        // the subscription KV mirror seals under the key the store seals with
+        let bus = wiring::wire_nats(&mut state, &url, roles, secret_key()?).await?;
         drop(bus);
     } else {
         antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
@@ -1678,6 +1750,45 @@ mod sweep_secs_tests {
             let err =
                 parse_sweep_secs(Some(bad)).expect_err(&format!("SWEEP_SECS={bad:?} is fatal"));
             assert!(err.contains("ANTARES_SWEEP_SECS"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod mem_max_instances_tests {
+    use super::{mem_history_warning, parse_mem_max_instances};
+
+    /// The memory/file history cap: 10 000 by default, `0` switches it off,
+    /// and a value that is no count is fatal rather than silently the default.
+    #[test]
+    fn mem_max_instances_defaults_and_rejects() {
+        assert_eq!(parse_mem_max_instances(None).expect("default"), 10_000);
+        assert_eq!(parse_mem_max_instances(Some("0")).expect("off"), 0);
+        assert_eq!(parse_mem_max_instances(Some("500")).expect("explicit"), 500);
+        for bad in ["-1", "", "10k", "1.5", "99999999999999999999999"] {
+            let err = parse_mem_max_instances(Some(bad))
+                .expect_err(&format!("ANTARES_MEM_MAX_INSTANCES={bad:?} is fatal"));
+            assert!(err.contains("ANTARES_MEM_MAX_INSTANCES"), "{err}");
+        }
+    }
+
+    /// One boot warning for a memory/file history, naming the cap that
+    /// bounds it; none for Postgres history or with history off.
+    #[test]
+    fn a_memory_or_file_history_warns_at_boot() {
+        for mem in ["memory", "file"] {
+            let w = mem_history_warning(Some(mem), 10_000).expect("warned");
+            assert!(
+                w.contains("10000") && w.contains("ANTARES_MEM_MAX_INSTANCES"),
+                "{w}"
+            );
+            assert!(w.contains("ANTARES_TEMPORAL_RETENTION_DAYS"), "{w}");
+            assert!(mem_history_warning(Some(mem), 0)
+                .expect("warned")
+                .contains("uncapped"));
+        }
+        for other in [Some("postgres"), Some("timescale"), None] {
+            assert!(mem_history_warning(other, 10_000).is_none(), "{other:?}");
         }
     }
 }

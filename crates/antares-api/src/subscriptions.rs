@@ -740,12 +740,12 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
 }
 
 /// What a read answers in place of each `endpoint.receiverInfo` value.
-const MASKED: &str = "***";
+pub(crate) const MASKED: &str = "***";
 
 /// `receiverInfo` carries the credentials a notification is sent with (6.3.8: each pair is a
 /// header, the Authorization header the example). No read answers them: the keys stay, the
 /// values are [`MASKED`].
-fn mask_receiver_info(notification: &mut Map<String, Value>) {
+pub(crate) fn mask_receiver_info(notification: &mut Map<String, Value>) {
     // 7.2 userinfo in the endpoint URI is a credential too.
     if let Some(uri) = notification
         .get_mut("endpoint")
@@ -782,7 +782,7 @@ fn masked_uri(uri: &str) -> Option<String> {
 /// key instead of overwriting it; a key the stored endpoint lacks keeps the literal value.
 /// The stored credential stays with the stored URI: a masked value under a stored key beside
 /// another URI is refused, or an update-right holder could redirect the credential.
-fn keep_masked_receiver_info(
+pub(crate) fn keep_masked_receiver_info(
     fragment: &mut Map<String, Value>,
     stored: &Map<String, Value>,
 ) -> Result<(), NgsiError> {
@@ -799,8 +799,20 @@ fn keep_masked_receiver_info(
             .and_then(|n| n.get_mut("endpoint"))
             .and_then(|e| e.get_mut("uri")),
     ) {
-        if masked_uri(stored_uri).as_deref() == uri.as_str() {
-            *uri = Value::String(stored_uri.to_owned());
+        match (masked_uri(stored_uri), uri.as_str()) {
+            (Some(masked), Some(sent)) if masked == sent => {
+                *uri = Value::String(stored_uri.to_owned());
+            }
+            // The masked userinfo it was answered, beside another URI: the
+            // stored credential cannot follow it there (as a masked
+            // receiverInfo value below cannot), and stored as it came it
+            // was sent as a user literally named `***`.
+            (Some(_), Some(sent)) if masked_uri(sent).is_some_and(|m| m == sent) => {
+                return Err(NgsiError::BadRequestData(
+                    "endpoint.uri: a masked userinfo cannot move to another uri: send the credential again".into(),
+                ));
+            }
+            _ => {}
         }
     }
     let held = stored
@@ -1581,6 +1593,36 @@ mod tests {
             .unwrap_or_default();
         mask_receiver_info(&mut plain);
         assert_eq!(plain["endpoint"]["uri"], "http://h/n");
+    }
+
+    /// The masked userinfo of a read, written back beside another host or
+    /// path, cannot carry the stored credential there: refused, as a masked
+    /// receiverInfo value beside another uri is. It used to be stored as it
+    /// came, and notifications went out as a user named `***`. A URI the
+    /// client spells with its own userinfo, and a stored URI without any,
+    /// are left alone.
+    #[test]
+    fn a_masked_uri_userinfo_does_not_follow_a_new_uri() {
+        let at = |uri: &str| {
+            json!({"notification": {"endpoint": {"uri": uri}}})
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+        };
+        let stored = at("http://u:secret@h1/n");
+        for moved in ["http://***@h2/n", "http://***@h1/other"] {
+            let refused = keep_masked_receiver_info(&mut at(moved), &stored);
+            let detail = refused.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(detail.starts_with("endpoint.uri:"), "{moved}: {detail}");
+            assert!(!detail.contains("secret"), "{detail}");
+        }
+        let mut own = at("http://v:new@h2/n");
+        assert!(keep_masked_receiver_info(&mut own, &stored).is_ok());
+        assert_eq!(own, at("http://v:new@h2/n"));
+        let mut kept = at("http://***@h1/n");
+        assert!(keep_masked_receiver_info(&mut kept, &stored).is_ok());
+        assert_eq!(kept, stored);
+        assert!(keep_masked_receiver_info(&mut at("http://***@h2/n"), &at("http://h1/n")).is_ok());
     }
 
     /// Table 5.2.33-1 `type`: "To indicate a request for all Entities (with

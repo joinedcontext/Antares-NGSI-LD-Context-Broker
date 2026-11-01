@@ -120,3 +120,11 @@ note = "a new index on entities (tenant_id, id COLLATE \"C\"); an older release 
 [0028]
 rollback = "compatible"
 note = "offset_until is not kept by an older release: after a roll-forward, lastN of an attribute given a non-UTC observedAt during the rollback may read its newest rows only, ranked by instant"
+
+[0029]
+rollback = "compatible"
+note = "every history partition gains 0005's policies and the history_partition_rls function; an older release names neither and reaches history through the parents as before, its maintenance creates new weeks without the partition belt, and its emptied-week check reads a policed week without the service escape, so it finds no rows and takes the drop lock to check again under the escape, every tick"
+
+[0030]
+rollback = "compatible"
+note = "attr_instances, attr_rows and attr_versions gain the nullable expires_at, attr_rows_of and attr_rows_at return it, and maintenance_jobs a history_expiry_scan row; an older release names neither in its INSERTs and still reaps by data every tick, its rows keep expires_at NULL and the daily scan of data reaps them after the roll-forward, and a correction it writes leaves the column stale, which the reap's recheck of data keeps from deleting the row"

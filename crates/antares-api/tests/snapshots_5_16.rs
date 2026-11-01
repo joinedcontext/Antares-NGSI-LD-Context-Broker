@@ -1443,3 +1443,297 @@ async fn clause_5_16_1_the_temporal_copy_outlives_the_auto_recorded_stub() {
         "the snapshot holds the copied history, not the instant of the copy: {evo}"
     );
 }
+
+/// 5.16.6 sends the SnapshotNotification with each `receiverInfo` pair as a
+/// header (6.3.8) — an Authorization header the usual one. A read of the
+/// Snapshot answers those values masked, as a Subscription read does, and so
+/// does the 200 body of an update.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_receiver_info_is_masked_on_read() {
+    let st = state().await;
+    let snap = json!({"type": "Snapshot", "endpoint": "http://user:pw@127.0.0.1:9/n",
+        "receiverInfo": [{"key": "Authorization", "value": "Bearer s3cret"}],
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, headers, _) = send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let loc = headers
+        .get("Location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = send(&st, "GET", &loc, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.to_string().contains("s3cret"),
+        "credential served: {body}"
+    );
+    assert!(
+        !body.to_string().contains("pw@"),
+        "endpoint userinfo served: {body}"
+    );
+    assert_eq!(body["receiverInfo"][0]["key"], "Authorization", "{body}");
+    // the read written back keeps the stored credential
+    let back = json!({"receiverInfo": body["receiverInfo"], "endpoint": body["endpoint"],
+        "snapshotPriority": 7})
+    .to_string();
+    let (status, body) = send(&st, "PATCH", &loc, Some(back)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.to_string().contains("s3cret"),
+        "credential served: {body}"
+    );
+    let id = loc.rsplit('/').next().unwrap();
+    let stored = st
+        .store
+        .get(
+            &antares_model::TenantId::default(),
+            antares_store::Kind::Snapshot,
+            id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored["receiverInfo"][0]["value"], "Bearer s3cret",
+        "{stored}"
+    );
+    assert_eq!(
+        stored["endpoint"], "http://user:pw@127.0.0.1:9/n",
+        "{stored}"
+    );
+}
+
+/// The credential stays with its endpoint: an update that names another
+/// endpoint and no `receiverInfo` must not leave the stored credential to be
+/// sent there with the next 5.16.6 notification, and a masked value cannot
+/// travel to the new endpoint either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_endpoint_moved_by_update_does_not_take_the_credential() {
+    let st = state().await;
+    let snap = json!({"type": "Snapshot", "endpoint": "http://127.0.0.1:9/n",
+        "receiverInfo": [{"key": "Authorization", "value": "Bearer s3cret"}],
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, headers, _) = send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let loc = headers
+        .get("Location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let (status, body) = send(
+        &st,
+        "PATCH",
+        &loc,
+        Some(
+            json!({"endpoint": "http://127.0.0.1:8/x",
+            "receiverInfo": [{"key": "Authorization", "value": "***"}]})
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a masked value moved: {body}"
+    );
+    let (status, body) = send(
+        &st,
+        "PATCH",
+        &loc,
+        Some(json!({"endpoint": "http://127.0.0.1:8/x"}).to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = loc.rsplit('/').next().unwrap();
+    let stored = st
+        .store
+        .get(
+            &antares_model::TenantId::default(),
+            antares_store::Kind::Snapshot,
+            id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !stored.to_string().contains("s3cret"),
+        "the stored credential follows the new endpoint: {stored}"
+    );
+}
+
+/// 6.3.5: a POST in application/ld+json takes its @context from the body, and
+/// the Snapshot's queries are written in that body's terms. The fill runs
+/// after the request is answered, so it has to read them in that @context:
+/// read in the core one, `Car` names default-context/Car, matches nothing and
+/// the snapshot ends "empty".
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_queries_expand_with_the_body_context() {
+    let st = state().await;
+    let ctx = json!({"Car": "https://example.org/ns/Car"});
+    let post = |path: &str, body: Value| {
+        let b = body.to_string();
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Content-Type", "application/ld+json")
+            .header("Content-Length", b.len())
+            .body(Body::from(b))
+            .unwrap()
+    };
+    let e = json!({"@context": ctx, "id": "urn:ngsi-ld:Car:1", "type": "Car",
+        "speed": {"type": "Property", "value": 1}});
+    let r = antares_api::router(st.clone())
+        .oneshot(post("/ngsi-ld/v1/entities", e))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let s = json!({"@context": ctx, "type": "Snapshot",
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Car"}]}]});
+    let r = antares_api::router(st.clone())
+        .oneshot(post("/ngsi-ld/v1/snapshots", s))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let loc = r.headers()["Location"].to_str().unwrap().to_owned();
+    let ready = wait_ready(&st, &loc).await;
+    assert_eq!(ready["snapshotStatus"], "success", "{ready}");
+    assert!(
+        !ready.to_string().contains("__context"),
+        "the recorded @context is the broker's own: {ready}"
+    );
+}
+
+/// 5.16.7.4: a purge q may not name `receiverInfo` or `endpoint`. Both hold
+/// the credentials the 5.16.6 notification is sent with, which every read
+/// answers masked; a purge that matched on them answered 204 either way and
+/// told the caller, by which snapshots disappeared, whether a regex guess of
+/// a stored token was right.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_16_7_purge_q_cannot_probe_the_credentials() {
+    let st = state().await;
+    let snap = json!({"type": "Snapshot",
+        "endpoint": "http://probe:guess@localhost:1/snapnotify",
+        "receiverInfo": [{"key": "Authorization", "value": "Bearer s3cr3t"}],
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, h, body) = send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let loc = h.get("Location").unwrap().to_str().unwrap().to_owned();
+    wait_ready(&st, &loc).await;
+    for q in [
+        "receiverInfo~=%22%5EBearer%20s%22",
+        "receiverInfo%5Bvalue%5D~=%22%5EBearer%20s%22",
+        "receiverInfo%5Bkey%5D==%22Authorization%22",
+        "receiverInfo",
+        "endpoint~=%22probe:g%22",
+        "id==%22urn:x:y%22%7CreceiverInfo~=%22.%22",
+    ] {
+        let (status, body) =
+            send(&st, "DELETE", &format!("/ngsi-ld/v1/snapshots?q={q}"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "q={q}: {body}");
+        assert_eq!(
+            body["type"], "https://uri.etsi.org/ngsi-ld/errors/BadRequestData",
+            "{body}"
+        );
+        assert!(!body.to_string().contains("s3cr3t"), "{body}");
+        let (status, _) = send(&st, "GET", &loc, None).await;
+        assert_eq!(status, StatusCode::OK, "q={q} purged the snapshot");
+    }
+}
+
+/// S2-05: the temporal half of the same. A Snapshot posted with an inline
+/// body @context, which has no Link form, fills its temporal queries in that
+/// @context: read in the core one, `Car` and `rpm` name default-context terms,
+/// the query matches nothing and the snapshot ends "empty".
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_temporal_queries_expand_with_the_inline_body_context() {
+    let st = state().await;
+    let ctx = json!({"Car": "https://example.org/ns/Car", "rpm": "https://example.org/ns/rpm"});
+    let e = json!({"@context": ctx, "id": "urn:ngsi-ld:Car:t1", "type": "Car",
+        "rpm": {"type": "Property", "value": 3000}})
+    .to_string();
+    let post_ld = |path: &'static str, b: String| {
+        let st = st.clone();
+        async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/ld+json")
+                .header("Content-Length", b.len())
+                .body(Body::from(b))
+                .unwrap();
+            antares_api::router(st).oneshot(req).await.unwrap()
+        }
+    };
+    let r = post_ld("/ngsi-ld/v1/entities", e).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let snap = json!({"@context": ctx, "type": "Snapshot",
+        "snapshotTemporalQueries": [{"type": "Query", "entities": [{"type": "Car"}],
+            "attrs": ["rpm"],
+            "temporalQ": {"timerel": "after", "timeAt": "2000-01-01T00:00:00Z",
+                          "timeproperty": "createdAt"}}]})
+    .to_string();
+    let r = post_ld("/ngsi-ld/v1/snapshots", snap).await;
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let loc = r.headers()["Location"].to_str().unwrap().to_owned();
+    let ready = wait_ready(&st, &loc).await;
+    assert_eq!(ready["snapshotStatus"], "success", "{ready}");
+    let sid = ready["id"].as_str().expect("id");
+    let (status, _, list) = send_h(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities?type=https://example.org/ns/Car&timerel=after&timeAt=2000-01-01T00:00:00Z&timeproperty=createdAt",
+        None,
+        &[("NGSILD-Snapshot", sid)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let car = list
+        .as_array()
+        .and_then(|a| a.iter().find(|d| d["id"] == "urn:ngsi-ld:Car:t1"))
+        .unwrap_or_else(|| panic!("the Car's evolution is in the snapshot: {list}"));
+    assert!(
+        car["https://example.org/ns/rpm"]
+            .to_string()
+            .contains("3000"),
+        "the term's data was copied: {car}"
+    );
+}
+
+/// A Snapshot registry that cannot be listed is an error, never an empty
+/// one: the create that would check the per-tenant cap against it is
+/// refused and leaves no snapshot behind, and a purge answers the error
+/// instead of a 204 for a purge that never ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_listing_that_fails_is_not_read_as_empty() {
+    use std::sync::Arc;
+
+    let mut st = state().await;
+    let base = st.store.clone();
+    st.store = Arc::new(common::Double::flaky_list(base.clone(), 1));
+    let snap = json!({"type": "Snapshot",
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, _, body) = send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert!(!status.is_success(), "{status}: {body}");
+    let left = base
+        .list(&Default::default(), antares_store::Kind::Snapshot)
+        .await
+        .expect("list");
+    assert!(left.is_empty(), "the refused snapshot stayed: {left:?}");
+
+    st.store = Arc::new(common::Double::flaky_list(base, 1));
+    let (status, _, body) = send_h(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/snapshots?q=snapshotPriority==5",
+        None,
+        &[],
+    )
+    .await;
+    assert!(!status.is_success(), "{status}: {body}");
+}

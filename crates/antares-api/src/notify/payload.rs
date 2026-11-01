@@ -333,7 +333,8 @@ pub(super) async fn build_data(
     let mut data = Vec::new();
     match &shape.join {
         Some((mode, level)) if mode == "inline" => {
-            crate::repr::inline_join(st, tenant, ctx, &shape.repr, &mut main, *level).await;
+            crate::repr::inline_join(st, tenant, ctx, &shape.repr, &mut main, &internal, *level)
+                .await;
             data.push(main);
         }
         Some((mode, level)) if mode == "flat" => {

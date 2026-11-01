@@ -211,6 +211,11 @@ fn describe() {
         "HTTP request service time"
     );
     describe_counter!(
+        "antares_change_final_delivery_total",
+        Unit::Count,
+        "change messages handed to the matcher on their last allowed delivery; one that then fails is dropped by the server"
+    );
+    describe_counter!(
         "antares_policy_failures_total",
         Unit::Count,
         "policy decisions the seam had to make itself because the engine did not, by reason"

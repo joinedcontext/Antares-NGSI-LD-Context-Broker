@@ -262,17 +262,14 @@ async fn deleted_broadcast_consumer_ends_its_stream_and_a_fresh_one_resumes() {
         .await
         .expect("delete consumer");
 
-    // Contract: the stream terminates. A hang here is the freeze bug.
-    let ended = tokio::time::timeout(
-        Duration::from_secs(15),
-        antares_bus::nats::next_delta(&mut msgs),
-    )
+    // Contract: the stream terminates. A hang here is the freeze bug. The
+    // stream is shared with every test publishing registry deltas, so what
+    // was already delivered before the delete may still come first.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while antares_bus::nats::next_delta(&mut msgs).await.is_some() {}
+    })
     .await
     .expect("stream must end within 15s after its consumer is deleted, not hang");
-    assert!(
-        ended.is_none(),
-        "a deleted consumer must end the stream so the watcher reopens"
-    );
 
     // Recovery: a new consumer sees traffic published after the gap.
     let fresh = bus
@@ -392,4 +389,235 @@ async fn core_request_reaches_the_replier_and_is_none_without_one() {
     task.abort();
     let _aborted = task.await;
     assert_eq!(asker.request(subject, b"late".to_vec(), within).await, None);
+}
+
+/// `ANTARES_CHANGES` keeps a message only while a consumer is interested in
+/// it (Interest retention). The matcher durable is the interest, so it has to
+/// exist before the first change is published, on every role: an api pod
+/// that connects and publishes before any matcher pod has run must not
+/// publish into a stream that discards what it is given.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_published_before_the_matcher_ever_ran_reaches_it() {
+    let url = require_nats!();
+    // a deployment whose matcher has never run: no "matcher" durable
+    let js = async_nats::jetstream::new(async_nats::connect(&url).await.expect("raw connect"));
+    if let Ok(s) = js.get_stream(antares_bus::nats::CHANGES_STREAM).await {
+        let _ = s.delete_consumer("matcher").await;
+    }
+    // the api pod: connect, publish
+    let api = NatsBus::connect(&url).await.expect("connect api");
+    let n = nonce();
+    let tenant = TenantId::new(&format!("early{n}")).expect("tenant");
+    let id = format!("urn:early:{n}");
+    api.publish(&event(&tenant, &id, 1)).await.expect("publish");
+    // the matcher pod starts afterwards
+    let matcher = NatsBus::connect(&url).await.expect("connect matcher");
+    let c = matcher
+        .consume_balanced("matcher")
+        .await
+        .expect("matcher durable");
+    let mut s = c.messages().await.expect("stream");
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(m)) = s.next().await {
+            m.ack().await.expect("ack");
+            if antares_bus::nats::decode(&m).is_some_and(|ev| ev.entity_id.as_str() == id) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        got,
+        "the change published before the matcher durable existed was discarded"
+    );
+}
+
+/// A registration delta is a compare-and-set on the registration's own
+/// subject: a publish whose revision a newer delta has passed is refused, so
+/// a late writer re-reads instead of landing after the newer one in every
+/// mirror. A delta for another registration of the same tenant is no
+/// conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_delta_that_lost_the_race_is_refused() {
+    let url = require_nats!();
+    let bus = NatsBus::connect(&url).await.expect("connect");
+    let tenant = format!("regcas{}", nonce());
+    let delta = |v: i64| serde_json::json!({"tenant": tenant, "id": "urn:reg:a", "v": v});
+    assert_eq!(
+        bus.registration_revision(&tenant, "urn:reg:a")
+            .await
+            .expect("revision"),
+        0,
+        "nothing held yet"
+    );
+    bus.publish_registration(&tenant, "urn:reg:a", &delta(1), 0)
+        .await
+        .expect("first delta");
+    let rev = bus
+        .registration_revision(&tenant, "urn:reg:a")
+        .await
+        .expect("revision");
+    assert!(rev > 0);
+    // another registration of the tenant does not move this one's revision
+    bus.publish_registration(&tenant, "urn:reg:b", &delta(9), 0)
+        .await
+        .expect("a sibling registration is no conflict");
+    assert!(
+        bus.publish_registration(&tenant, "urn:reg:a", &delta(0), 0)
+            .await
+            .is_err(),
+        "a delta read before the first one landed must be refused"
+    );
+    bus.publish_registration(&tenant, "urn:reg:a", &delta(2), rev)
+        .await
+        .expect("the current revision publishes");
+    assert!(
+        bus.publish_registration(&tenant, "urn:reg:a", &delta(1), rev)
+            .await
+            .is_err(),
+        "a stale revision must be refused"
+    );
+}
+
+/// At-least-once without self-inflicted duplicates: a message is acked only
+/// after its work (ADR-0002), and while that work outlasts the consumer's
+/// `ack_wait` (one slow notification endpoint), neither it nor the messages
+/// of the same pull already queued behind it may be redelivered. They were:
+/// the server re-sent every one of them, to this pod or another, and each
+/// was matched (and notified) twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
+    use async_nats::jetstream::{self, stream};
+    let url = require_nats!();
+    let js = jetstream::new(async_nats::connect(&url).await.expect("connect"));
+    let n = nonce();
+    let name = format!("ANTARES_TEST_SLOW_{n}");
+    let subject = format!("slowwork{n}");
+    let s = js
+        .create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{subject}.>")],
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    let mut cfg = antares_bus::nats::balanced_config("worker");
+    cfg.ack_wait = Duration::from_secs(1);
+    let consumer: antares_bus::nats::PullConsumer = s.create_consumer(cfg).await.expect("consumer");
+    for i in 0..3 {
+        js.publish(format!("{subject}.m"), i.to_string().into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let runner = tokio::spawn(async move {
+        let _ = antares_bus::nats::run_balanced(&consumer, |msg| {
+            let body = String::from_utf8_lossy(&msg.payload).into_owned();
+            log.lock().expect("lock").push(body.clone());
+            async move {
+                if body == "0" {
+                    // 3.5 ack_waits on the first message
+                    tokio::time::sleep(Duration::from_millis(3_500)).await;
+                }
+            }
+        })
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(6_000)).await;
+    runner.abort();
+    let info = s.consumer_info("worker").await.expect("info");
+    let seen = seen.lock().expect("lock").clone();
+    let _ = js.delete_stream(&name).await;
+    assert_eq!(seen, ["0", "1", "2"], "worked on more than once");
+    assert_eq!(info.num_redelivered, 0, "the server redelivered");
+    assert_eq!(info.num_ack_pending, 0, "a message was left unacked");
+}
+
+/// The heartbeat runs across the whole pull, not per message: a batch of
+/// messages each shorter than a third of `ack_wait`, together longer than
+/// it, kept the messages still queued behind them unacknowledged for their
+/// whole wait, and the server redelivered them (each matched and notified
+/// twice). The clock restarted with every message and never ticked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_of_short_messages_longer_than_ack_wait_is_not_redelivered() {
+    use async_nats::jetstream::{self, stream};
+    let url = require_nats!();
+    let js = jetstream::new(async_nats::connect(&url).await.expect("connect"));
+    let n = nonce();
+    let name = format!("ANTARES_TEST_BATCHBEAT_{n}");
+    let subject = format!("batchbeat{n}");
+    let s = js
+        .create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{subject}.>")],
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    let mut cfg = antares_bus::nats::balanced_config("worker");
+    // a beat every 300 ms; each message takes 220 ms, six take 1.3 s
+    cfg.ack_wait = Duration::from_millis(900);
+    let consumer: antares_bus::nats::PullConsumer = s.create_consumer(cfg).await.expect("consumer");
+    for i in 0..6 {
+        js.publish(format!("{subject}.m"), i.to_string().into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let runner = tokio::spawn(async move {
+        let _ = antares_bus::nats::run_balanced(&consumer, |msg| {
+            log.lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&msg.payload).into_owned());
+            tokio::time::sleep(Duration::from_millis(220))
+        })
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    runner.abort();
+    let info = s.consumer_info("worker").await.expect("info");
+    let seen = seen.lock().expect("lock").clone();
+    let _ = js.delete_stream(&name).await;
+    assert_eq!(
+        seen,
+        ["0", "1", "2", "3", "4", "5"],
+        "worked on more than once"
+    );
+    assert_eq!(info.num_redelivered, 0, "the server redelivered");
+    assert_eq!(info.num_ack_pending, 0, "a message was left unacked");
+}
+
+/// A balanced durable is created with the explicit ack_wait and
+/// max_deliver the heartbeat is paced from. A throwaway durable on the
+/// shared change stream (Interest retention: deleted at the end so it holds
+/// nothing back).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_balanced_durable_has_an_explicit_ack_wait_and_max_deliver() {
+    let url = require_nats!();
+    let bus = NatsBus::connect(&url).await.expect("connect");
+    let durable = format!("cfgprobe{}", nonce());
+    let mut c = bus.consume_balanced(&durable).await.expect("durable");
+    let info = c.info().await.expect("info").clone();
+    let js = async_nats::jetstream::new(async_nats::connect(&url).await.expect("connect"));
+    let _ = js
+        .get_stream(antares_bus::nats::CHANGES_STREAM)
+        .await
+        .expect("stream")
+        .delete_consumer(&durable)
+        .await;
+    assert_eq!(info.config.durable_name.as_deref(), Some(durable.as_str()));
+    assert_eq!(info.config.ack_wait, antares_bus::nats::ACK_WAIT);
+    assert_eq!(info.config.max_deliver, antares_bus::nats::MAX_DELIVER);
+    assert_eq!(
+        info.config.max_ack_pending,
+        antares_bus::nats::MAX_ACK_PENDING
+    );
 }

@@ -339,8 +339,9 @@ fn paginate_impl(
 /// (4.23.2). Mixed datatypes rank Numbers < Strings < Object < Array <
 /// Boolean < Time < Date < DateTime < Null < absent (4.23.2). Paths may be
 /// dotted (EXAMPLE 5) or carry one trailing [member.path] bracket
-/// (EXAMPLE 4). String comparison is codepoint order by default; the
-/// `collation` parameter selects an ICU collation (4.23.3 EXAMPLES 6/7).
+/// (EXAMPLE 4). String comparison is the ICU root collation by default
+/// (4.23.1: "und-x-icu"); the `collation` parameter selects another ICU
+/// collation (4.23.3 EXAMPLES 6/7).
 ///
 /// 4.23.3 EXAMPLES 6/7: the ICU collator for an RFC 6067 collation tag
 /// (e.g. und-u-ks-identic, de-u-co-phonebk). The co/kf/kn keywords travel
@@ -456,11 +457,9 @@ pub fn order_entities(
             dir,
         });
     }
-    // 4.23.3 EXAMPLES 6/7: collation names an ICU ordering for strings
-    let collator = params
-        .get("collation")
-        .map(|t| build_collator(t))
-        .transpose()?;
+    // 4.23.3 EXAMPLES 6/7: collation names an ICU ordering for strings;
+    // without one, 4.23.1 and 5.2.43 make it the ICU root collation
+    let collator = build_collator(params.get("collation").map_or("und", String::as_str))?;
     // dist-* keys need the orderFrom reference geometry (4.23.3 EXAMPLE 8-10)
     let refg = if keys
         .iter()
@@ -568,7 +567,7 @@ pub fn order_entities(
     fn cmp_vals(
         a: &Option<Value>,
         b: &Option<Value>,
-        coll: Option<&icu_collator::CollatorBorrowed<'static>>,
+        coll: &icu_collator::CollatorBorrowed<'static>,
     ) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (a, b) {
@@ -591,12 +590,10 @@ pub fn order_entities(
                             // DateTime: canonical key so equal instants in
                             // different 4.6.3 fraction spellings tie (4.11)
                             antares_model::dt_key(sx).cmp(&antares_model::dt_key(sy))
-                        } else if let Some(c) = coll {
-                            // 4.23.3 EXAMPLES 6/7: the named ICU collation
-                            c.compare(sx, sy)
                         } else {
-                            // 4.23.1 default: codepoint order
-                            sx.cmp(sy)
+                            // 4.23.1 root by default, 4.23.3 EXAMPLES 6/7
+                            // the named ICU collation
+                            coll.compare(sx, sy)
                         }
                     }
                     _ => x.to_string().cmp(&y.to_string()),
@@ -636,7 +633,7 @@ pub fn order_entities(
         for (k, ((va, da), (vb, db))) in keys.iter().zip(a.iter().zip(b)) {
             let o = match k.dir {
                 Dir::Asc | Dir::Desc => {
-                    let mut o = cmp_vals(va, vb, collator.as_ref());
+                    let mut o = cmp_vals(va, vb, &collator);
                     if k.dir == Dir::Desc {
                         o = o.reverse();
                     }
@@ -654,7 +651,7 @@ pub fn order_entities(
                     // rank before non-GeoProperties (by value)
                     (Some(_), None) => Ordering::Less,
                     (None, Some(_)) => Ordering::Greater,
-                    (None, None) => cmp_vals(va, vb, collator.as_ref()),
+                    (None, None) => cmp_vals(va, vb, &collator),
                 },
             };
             if o != Ordering::Equal {

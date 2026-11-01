@@ -52,9 +52,10 @@ pub const MAX_REGEX_PROGRAM_BYTES: usize = 256 * 1024;
 /// most a low hundreds of distinct patterns, which the cache holds whole:
 /// one request never evicts its own working set.
 pub const MAX_REGEX_CACHE: usize = 1024;
-/// Retained program bytes. Each entry is charged the tier it compiled
-/// within, not its true size, so the number is an upper bound on what the
-/// map holds.
+/// Retained bytes. Each entry is charged the tier it compiled within, not
+/// its true size, plus its key and, for a refusal, its message — both
+/// client-sized, a syntax error reprinting the pattern — so the number is an
+/// upper bound on what the map holds.
 pub const MAX_REGEX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// A program that fits this is charged this much against
@@ -156,21 +157,49 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
             Err(e) => (Err(e.to_string().into()), 0),
         },
     };
-    if let Ok(mut c) = CACHE.write() {
-        // Halving is repeated rather than assumed sufficient: one charge can
-        // be the whole byte budget's worth of the tier above, so the loop —
-        // which halves what is left each pass — is what makes the bound hold.
-        let mut bytes = BYTES.load(Ordering::Relaxed);
-        while !c.is_empty()
-            && (c.len() >= MAX_REGEX_CACHE || bytes.saturating_add(charge) > MAX_REGEX_CACHE_BYTES)
-        {
-            evict_lru_half(&mut c);
-            bytes = c.values().map(|e| e.0 .1).sum();
-        }
-        BYTES.store(bytes.saturating_add(charge), Ordering::Relaxed);
-        c.insert(pattern.into(), stamp((outcome.clone(), charge)));
+    // The key and a refusal's message are as long as the client made them:
+    // charged, or a few oversized patterns pin memory the budget never sees.
+    let charge = charge
+        .saturating_add(pattern.len())
+        .saturating_add(outcome.as_ref().err().map_or(0, |m| m.len()));
+    // An entry past the whole budget is not retained at all: the bound holds.
+    if let Some(mut c) = CACHE
+        .write()
+        .ok()
+        .filter(|_| charge <= MAX_REGEX_CACHE_BYTES)
+    {
+        retain(&mut c, pattern, outcome.clone(), charge);
     }
     outcome.map_err(String::from)
+}
+
+/// Retain one compile outcome charged `charge` bytes, evicting first so both
+/// bounds hold, and keep [`BYTES`] the sum of what the map holds.
+fn retain(
+    c: &mut HashMap<Box<str>, Entry<(Outcome, usize)>>,
+    pattern: &str,
+    outcome: Outcome,
+    charge: usize,
+) {
+    // Halving is repeated rather than assumed sufficient: one charge can
+    // be the whole byte budget's worth of the tier above, so the loop —
+    // which halves what is left each pass — is what makes the bound hold.
+    let mut bytes = BYTES.load(Ordering::Relaxed);
+    while !c.is_empty()
+        && (c.len() >= MAX_REGEX_CACHE || bytes.saturating_add(charge) > MAX_REGEX_CACHE_BYTES)
+    {
+        evict_lru_half(c);
+        bytes = c.values().map(|e| e.0 .1).sum();
+    }
+    // Two callers that missed the same pattern at once both compile and both
+    // retain it: the second entry replaces the first, and so does its charge.
+    let replaced = c
+        .insert(pattern.into(), stamp((outcome, charge)))
+        .map_or(0, |e| e.0 .1);
+    BYTES.store(
+        bytes.saturating_add(charge).saturating_sub(replaced),
+        Ordering::Relaxed,
+    );
 }
 
 /// The retained program for `pattern`, without compiling anything. A
@@ -243,6 +272,12 @@ pub fn geo_query(
         return Some(hit);
     }
     let gq = Arc::new(build()?);
+    // ponytail: a key above MAX_GEO_KEY_BYTES is built per call and never
+    // retained, so the cache holds at most MAX_REGEX_CACHE keys of at most
+    // that size (64 MiB, the regex cache's byte budget)
+    if key.len() > MAX_GEO_KEY_BYTES {
+        return Some(gq);
+    }
     if let Ok(mut c) = GEO_CACHE.write() {
         if c.len() >= MAX_REGEX_CACHE {
             evict_lru_half(&mut c);
@@ -251,6 +286,12 @@ pub fn geo_query(
     }
     Some(gq)
 }
+
+/// The largest `geoQ` serialization [`geo_query`] retains. The key, and the
+/// geometry parsed from it, follow the client's vertex count: without a
+/// per-entry ceiling the entry bound alone let 1024 of the largest
+/// geometries the parser admits pin memory no budget counted.
+const MAX_GEO_KEY_BYTES: usize = MAX_REGEX_CACHE_BYTES / MAX_REGEX_CACHE;
 
 /// Test-only serialization: a test that flushes the shared cache must not
 /// race the tests asserting what is retained.
@@ -264,6 +305,16 @@ pub(crate) fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
+
+    fn near_point() -> Option<crate::geo::GeoQuery> {
+        crate::geo::GeoQuery::from_params(&HashMap::from([
+            ("georel".to_owned(), "near;maxDistance==10".to_owned()),
+            ("geometry".to_owned(), "Point".to_owned()),
+            ("coordinates".to_owned(), "[1,2]".to_owned()),
+        ]))
+        .ok()
+        .flatten()
+    }
 
     /// The same pattern text is compiled once: the second call gets the very
     /// program the first one built (4.9 patternOp / 5.2.33 idPattern are
@@ -454,13 +505,7 @@ mod tests {
         let builds = std::cell::Cell::new(0);
         let build = || {
             builds.set(builds.get() + 1);
-            crate::geo::GeoQuery::from_params(&HashMap::from([
-                ("georel".to_owned(), "near;maxDistance==10".to_owned()),
-                ("geometry".to_owned(), "Point".to_owned()),
-                ("coordinates".to_owned(), "[1,2]".to_owned()),
-            ]))
-            .ok()
-            .flatten()
+            near_point()
         };
         geo_query("keep-geo-a", build).expect("geo");
         geo_query("keep-geo-b", build).expect("geo");
@@ -478,6 +523,35 @@ mod tests {
         assert!(retained_bytes() >= 300 * 32 * 1024);
     }
 
+    /// Two callers that missed one pattern together both retain it; the
+    /// charge follows the entry that stays, so the byte count is still the
+    /// sum of what the map holds.
+    #[test]
+    fn retaining_one_pattern_twice_charges_it_once() {
+        let _serial = serial_lock();
+        let mut c = CACHE.write().expect("cache");
+        let re = || Ok(Arc::new(regex::Regex::new("^twice$").expect("regex")));
+        retain(&mut c, "^twice$", re(), 100);
+        retain(&mut c, "^twice$", re(), 100);
+        let held: usize = c.values().map(|e| e.0 .1).sum();
+        assert_eq!(retained_bytes(), held, "the replaced entry stayed charged");
+    }
+
+    /// A geoQ larger than the per-entry ceiling is built per call and never
+    /// retained: the cache's bytes stay bounded by entries times ceiling.
+    #[test]
+    fn an_oversized_geo_key_is_not_retained() {
+        let _serial = serial_lock();
+        let key = format!("big-geo-{}", "x".repeat(MAX_GEO_KEY_BYTES));
+        geo_query(&key, near_point).expect("geo");
+        assert!(
+            GEO_CACHE
+                .read()
+                .is_ok_and(|c| !c.contains_key(key.as_str())),
+            "an oversized geoQ key was retained"
+        );
+    }
+
     /// The byte budget evicts on its own, before the entry count does:
     /// programs past the 32 KiB tier are charged 256 KiB each, so ~260 of
     /// them overrun MAX_REGEX_CACHE_BYTES long before MAX_REGEX_CACHE.
@@ -493,6 +567,21 @@ mod tests {
             );
         }
         assert!(len() < MAX_REGEX_CACHE);
+    }
+
+    /// A refusal's key and message are client-sized (a syntax error
+    /// reprints the pattern), so the byte budget is charged for them: a
+    /// retained refusal is never free.
+    #[test]
+    fn a_retained_refusal_is_charged_its_key_and_message() {
+        let _serial = serial_lock();
+        let before = retained_bytes();
+        let p = format!("({}", "a".repeat(1 << 20));
+        assert!(compile(&p).is_err());
+        assert!(
+            retained_bytes() >= before + p.len(),
+            "a 1 MiB refusal was retained free of charge"
+        );
     }
 
     /// The same q text parses once and every caller shares the tree; an

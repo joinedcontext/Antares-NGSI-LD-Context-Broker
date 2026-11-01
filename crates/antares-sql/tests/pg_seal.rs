@@ -26,6 +26,11 @@ macro_rules! require_db {
     };
 }
 
+/// The boot pass walks every tenant: one test's pass seals another's
+/// pre-key rows and its count comes out short. The tests that write such
+/// rows and count the pass run one at a time.
+static BOOT_PASS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn sub(id: &str) -> Value {
     json!({"id": id, "type": "Subscription", "notification": {"endpoint": {
         "uri": "http://h/n",
@@ -44,7 +49,7 @@ async fn tenant(pool: &sqlx::PgPool, name: &str) -> TenantId {
 /// test, and a broker started there without this key fails each read of
 /// such a row (antares-broker upsert_transactions never went idle).
 async fn forget(pool: &sqlx::PgPool, name: &str) {
-    for table in ["subscriptions", "dead_letters"] {
+    for table in ["subscriptions", "dead_letters", "snapshots"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE tenant_id = '{name}'"
         )))
@@ -173,6 +178,7 @@ async fn every_write_seals_and_every_read_opens_the_credential() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rows_written_before_the_key_are_read_and_sealed_at_boot() {
     let url = require_db!();
+    let _pass = BOOT_PASS.lock().await;
     let pool = pg::connect(&url, 5).await.expect("pool");
     let t = tenant(&pool, "pgsealboot").await;
     let id = "urn:ngsi-ld:Subscription:legacy";
@@ -279,4 +285,116 @@ async fn a_value_copied_from_another_row_is_never_decrypted() {
     tx.commit().await.expect("commit");
     assert!(s.get(&t, DocKind::Subscription, thief).await.is_err());
     forget(&pool, "pgsealcopy").await;
+}
+
+/// A Snapshot's `receiverInfo` (Table 5.2.41-1) is the header set of its
+/// 5.16.6 notification: sealed on every write, opened on every read, and a
+/// row from before the key is sealed by the boot pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_snapshot_receiver_info_is_sealed_like_a_subscription() {
+    let url = require_db!();
+    let _pass = BOOT_PASS.lock().await;
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = tenant(&pool, "pgsealsnap").await;
+    let snap = |id: &str| {
+        json!({"id": id, "type": "Snapshot", "endpoint": "http://h/n",
+               "receiverInfo": [{"key": "Authorization", "value": TOKEN}]})
+    };
+    let s = PgDocStore::new(pool.clone())
+        .with_secret_key(SecretKey::from_base64(TEST_KEY).expect("key"));
+    let id = "urn:ngsi-ld:Snapshot:sealed";
+    assert!(s
+        .create(&t, DocKind::Snapshot, id, &snap(id))
+        .await
+        .expect("create"));
+    let text = raw(&pool, &t, "snapshots", "doc", id).await;
+    assert!(
+        !text.contains("the-webhook-token") && text.contains("enc:v1:"),
+        "{text}"
+    );
+    assert_eq!(
+        s.get(&t, DocKind::Snapshot, id).await.expect("get"),
+        Some(snap(id))
+    );
+    assert_eq!(
+        s.list(&t, DocKind::Snapshot).await.expect("list"),
+        vec![snap(id)]
+    );
+
+    let legacy = "urn:ngsi-ld:Snapshot:legacy";
+    PgDocStore::new(pool.clone())
+        .upsert(&t, DocKind::Snapshot, legacy, &snap(legacy))
+        .await
+        .expect("legacy");
+    assert!(s.seal_plaintext().await.expect("seal") >= 1);
+    let text = raw(&pool, &t, "snapshots", "doc", legacy).await;
+    assert!(
+        !text.contains("the-webhook-token") && text.contains("enc:v1:"),
+        "{text}"
+    );
+    assert_eq!(
+        s.get(&t, DocKind::Snapshot, legacy).await.expect("get"),
+        Some(snap(legacy))
+    );
+    forget(&pool, "pgsealsnap").await;
+}
+
+/// 7.2: `user:password@` in an endpoint URI is a credential. Such a URI is
+/// sealed in the row, read back whole, and a row from before the key is
+/// sealed by the boot pass; a URI without userinfo is left readable.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_uri_with_userinfo_is_sealed_at_rest_and_at_boot() {
+    let url = require_db!();
+    let _pass = BOOT_PASS.lock().await;
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = tenant(&pool, "pgsealuri").await;
+    let secret = "https://hook:pa55word@h.example/n";
+    let doc = |id: &str, uri: &str| json!({"id": id, "type": "Subscription", "notification": {"endpoint": {"uri": uri}}});
+    let (legacy, bare) = (
+        "urn:ngsi-ld:Subscription:legacyuri",
+        "urn:ngsi-ld:Subscription:bareuri",
+    );
+    let before = PgDocStore::new(pool.clone());
+    before
+        .upsert(&t, DocKind::Subscription, legacy, &doc(legacy, secret))
+        .await
+        .expect("legacy");
+    let snap = "urn:ngsi-ld:Snapshot:legacyuri";
+    let snap_doc = json!({"id": snap, "type": "Snapshot", "endpoint": secret});
+    before
+        .upsert(&t, DocKind::Snapshot, snap, &snap_doc)
+        .await
+        .expect("legacy snapshot");
+    let s = PgDocStore::new(pool.clone())
+        .with_secret_key(SecretKey::from_base64(TEST_KEY).expect("key"));
+    s.upsert(
+        &t,
+        DocKind::Subscription,
+        bare,
+        &doc(bare, "https://h.example/n"),
+    )
+    .await
+    .expect("bare");
+    assert!(s.seal_plaintext().await.expect("seal") >= 2);
+    for (table, col, id) in [
+        ("subscriptions", "subscription", legacy),
+        ("snapshots", "doc", snap),
+    ] {
+        let text = raw(&pool, &t, table, col, id).await;
+        assert!(
+            !text.contains("pa55word") && text.contains("enc:v1:"),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        s.get(&t, DocKind::Subscription, legacy).await.expect("get"),
+        Some(doc(legacy, secret))
+    );
+    assert_eq!(
+        s.get(&t, DocKind::Snapshot, snap).await.expect("get"),
+        Some(snap_doc)
+    );
+    let text = raw(&pool, &t, "subscriptions", "subscription", bare).await;
+    assert!(text.contains("https://h.example/n"), "{text}");
+    forget(&pool, "pgsealuri").await;
 }

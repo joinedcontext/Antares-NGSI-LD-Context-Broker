@@ -1680,6 +1680,52 @@ async fn clause_5_6_21_purge_forwarding_gate() {
     );
 }
 
+/// 4.17 on the forward of a Purge (5.6.21.4) and a Delete Entity (5.6.6.4):
+/// the type selection matches the registration by any type it names, so
+/// `Car|Vehicle` and `(Vehicle;Car)` reach a Vehicle source, which gets the
+/// selector on the wire and judges it.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_17_a_type_selection_matches_the_registration_of_a_write() {
+    for selector in ["Car|Vehicle", "(Vehicle;Car)", "Car,Vehicle"] {
+        let m = mock_replying("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+        let st = state();
+        register_doc(
+            &st,
+            serde_json::json!({
+                "id": "urn:ngsi-ld:ContextSourceRegistration:sel",
+                "type": "ContextSourceRegistration",
+                "mode": "inclusive",
+                "operations": ["purgeEntity", "deleteEntity"],
+                "information": [{"entities": [{"type": "Vehicle", "id": ENTITY}]}],
+                "endpoint": format!("http://127.0.0.1:{}", m.port),
+            }),
+        )
+        .await;
+        for uri in [
+            format!("/ngsi-ld/v1/entities?type={selector}"),
+            format!("/ngsi-ld/v1/entities/{ENTITY}?type={selector}"),
+        ] {
+            let before = m.hits.load(Ordering::SeqCst);
+            let req = Request::builder()
+                .method("DELETE")
+                .uri(&uri)
+                .body(Body::empty())
+                .expect("request");
+            let _ = send(&st, req).await;
+            assert_eq!(
+                m.hits.load(Ordering::SeqCst),
+                before + 1,
+                "{uri}: one forward"
+            );
+            let head = m.last_head.lock().expect("lock").clone();
+            assert!(
+                head.contains("type="),
+                "{uri}: the selector travels: {head}"
+            );
+        }
+    }
+}
+
 /// 5.7.3.4: matching registrations that support retrieveTemporal are
 /// forwarded GET /temporal/entities/{id} and the remote instance data
 /// merges into the Temporal Evolution; sources without the operation are
@@ -2909,5 +2955,52 @@ async fn a_refused_loop_leaves_the_purged_entities_in_place() {
         count().await,
         3,
         "a refused purge still emptied the Entity store"
+    );
+}
+
+/// 5.6.17.4 / 5.6.18.4: the `?type` selector narrows the merge and the
+/// replace target, and the Context Sources they go to with it (5.12 matches
+/// a registration by type as well as id). A source registered for the id
+/// under another type receives neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_and_replace_forward_only_to_sources_of_the_selected_type() {
+    let st = state();
+    let (port, hits) = mock_source();
+    register_doc(
+        &st,
+        serde_json::json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:typed-car",
+            "type": "ContextSourceRegistration",
+            "mode": "inclusive",
+            "operations": ["mergeEntity", "replaceEntity"],
+            "information": [{"entities": [{"type": "Car", "id": ENTITY}]}],
+            "endpoint": format!("http://127.0.0.1:{port}"),
+        }),
+    )
+    .await;
+    let (s, b) = post_json(&st, "/ngsi-ld/v1/entities", vehicle(&["speed"])).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    for (method, body) in [
+        (
+            "PATCH",
+            serde_json::json!({"speed": {"type": "Property", "value": 2}}),
+        ),
+        ("PUT", vehicle(&["speed"])),
+    ] {
+        let body = body.to_string();
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("/ngsi-ld/v1/entities/{ENTITY}?type=Vehicle"))
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .body(Body::from(body))
+            .expect("request");
+        let res = send(&st, req).await;
+        assert!(res.status().is_success(), "{method}: {}", res.status());
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a source registered for another type received the write"
     );
 }

@@ -366,3 +366,58 @@ async fn no_migration_builds_a_partial_index_over_history() {
         "partial indexes on attr_instances: {partial:?}"
     );
 }
+
+/// S3-07: instances without observedAt rank after every instance that has
+/// one (`DESC NULLS LAST`), so they can never be the N-th newest the read
+/// cuts at. Three observedAt instances in January and five newer ones
+/// without observedAt (their `observed_at` column falls back to modifiedAt):
+/// lastN keeps what the rank keeps, the January ones included; and an
+/// Attribute none of whose instances carries observedAt keeps them all.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_n_skips_newer_rows_without_observed_at() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pglastn").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:Station:mixed-observed";
+    let _ = s.delete(&t, id).await;
+    let unobserved = |n: usize| {
+        json!({"type": "Property", "value": n, "modifiedAt": format!("2026-03-0{}T00:00:00Z", n - 9),
+               "instanceId": format!("urn:ngsi-ld:Instance:{n}")})
+    };
+    let mut speed: Vec<Value> = (1..=3)
+        .map(|n| inst(n, &format!("2026-01-0{n}T00:00:00Z"), None))
+        .collect();
+    speed.extend((10..15).map(unobserved));
+    let level: Vec<Value> = (20..25).map(|n| unobserved(n - 10)).collect();
+    let level: Vec<Value> = level
+        .into_iter()
+        .enumerate()
+        .map(|(j, mut i)| {
+            i["instanceId"] = json!(format!("urn:ngsi-ld:Instance:{}", 20 + j));
+            i
+        })
+        .collect();
+    let doc = json!({"id": id, "type": "Station", "createdAt": "2026-01-01T00:00:00Z",
+                     "modifiedAt": "2026-03-05T00:00:00Z", SPEED: speed, LEVEL: level});
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+    let expand = |t: &str| t.to_owned();
+    for n in [1, 2, 3, 4] {
+        let f = TemporalFilter {
+            ids: Some(&[id]),
+            last_n: Some(n),
+            expand: &expand,
+            ..TemporalFilter::default()
+        };
+        let out = s.query(&t, &f).await.expect("query");
+        for attr in [SPEED, LEVEL] {
+            assert_eq!(
+                ids(&out.rows[0][attr]),
+                oracle(&doc[attr].as_array().expect("instances")[..], None, n),
+                "{attr} lastN={n}"
+            );
+        }
+    }
+    assert!(s.delete(&t, id).await.expect("delete"));
+}

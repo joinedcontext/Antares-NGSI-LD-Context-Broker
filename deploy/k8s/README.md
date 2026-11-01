@@ -25,6 +25,26 @@ Every pod runs non-root with all capabilities dropped and a read-only root
 filesystem, except the plain PostGIS pod, whose entrypoint initialises
 PGDATA as root before dropping privileges.
 
+The `/q` admin routes (tenant purge, dead letters) share port 9090 with the
+NGSI-LD API, so no NetworkPolicy can fence them off: every broker
+Deployment sets `ANTARES_ADMIN_TOKEN_FILE` from the `antares-admin` Secret,
+and `/q` then answers `401` without `Authorization: Bearer <token>` (health
+and readiness stay open for the probes). The Secret is deliberately not in
+these files — a token in a public manifest is no secret. Create it before
+the brokers, or their pods wait for it:
+
+```sh
+kubectl -n antares create secret generic antares-admin \
+  --from-literal=token="$(openssl rand -hex 32)" \
+  --from-literal=secret-key="$(openssl rand -hex 32)"
+```
+
+The same Secret carries `secret-key`, the `ANTARES_SECRET_KEY` the
+Postgres-backed brokers seal notification credentials under (in the
+database and in the NATS KV mirror). Every api and worker pod reads the same
+key; keep it for as long as the database holds rows sealed under it, since a
+sealed value cannot be read without it.
+
 Connections inside the namespace are plaintext: the DSN carries no
 `sslmode` and NATS is reached over `nats://`. A cluster that does not treat
 its pod network as trusted terminates TLS at the database and the message

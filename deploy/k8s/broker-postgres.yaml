@@ -66,6 +66,8 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: admin-token
+          secret: { secretName: antares-admin }
       containers:
         - name: antares
           image: antares-local:latest
@@ -77,6 +79,7 @@ spec:
             capabilities: { drop: [ALL] }
           volumeMounts:
             - { name: tmp, mountPath: /tmp }
+            - { name: admin-token, mountPath: /run/secrets/antares-admin, readOnly: true }
           env:
             - { name: ANTARES_STORE, value: postgres }
             # The Secret must name a NON-superuser, non-BYPASSRLS role
@@ -94,6 +97,18 @@ spec:
             - { name: ANTARES_NATS_URL, value: "nats://nats.antares.svc:4222" }
             - { name: ANTARES_NATS_REPLICAS, value: "3" }
             - { name: ANTARES_ROLES, value: api }
+            # /q (tenant purge, dead letters) answers 401 without the bearer
+            # in this file; /q/health and /q/ready stay open for the probes.
+            # The antares-admin Secret is NOT shipped: create it per
+            # deployment (README), the pod waits for it until then.
+            - { name: ANTARES_ADMIN_TOKEN_FILE, value: /run/secrets/antares-admin/token }
+            # Notification credentials (receiverInfo, endpoint userinfo) are
+            # stored sealed under this key, in Postgres and in the NATS KV
+            # mirror; every api and worker pod needs the same one, and it is
+            # kept for as long as the database holds rows sealed under it.
+            - name: ANTARES_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: antares-admin, key: secret-key }
             - { name: ANTARES_DEFAULT_LIMIT, value: "100" }
             - { name: ANTARES_MAX_LIMIT, value: "1000" }
             - { name: ANTARES_TEMPORAL_DEFAULT_INSTANCES, value: "100" }
@@ -150,6 +165,8 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: admin-token
+          secret: { secretName: antares-admin }
       containers:
         - name: antares
           image: antares-local:latest
@@ -160,6 +177,7 @@ spec:
             capabilities: { drop: [ALL] }
           volumeMounts:
             - { name: tmp, mountPath: /tmp }
+            - { name: admin-token, mountPath: /run/secrets/antares-admin, readOnly: true }
           env:
             - { name: ANTARES_STORE, value: postgres }
             # Non-superuser role + ANTARES_REQUIRE_RLS=1, as in the api
@@ -172,6 +190,12 @@ spec:
             - { name: ANTARES_NATS_URL, value: "nats://nats.antares.svc:4222" }
             - { name: ANTARES_NATS_REPLICAS, value: "3" }
             - { name: ANTARES_ROLES, value: "matcher,notifier,temporal" }
+            # a worker serves the /q routes too: the same credential
+            - { name: ANTARES_ADMIN_TOKEN_FILE, value: /run/secrets/antares-admin/token }
+            # the matcher opens the sealed KV entries: the api pods' key
+            - name: ANTARES_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: antares-admin, key: secret-key }
           ports:
             - { containerPort: 9090 } # health only; no Service routes here
           readinessProbe:

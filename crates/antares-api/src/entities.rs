@@ -407,6 +407,7 @@ async fn retrieve_entity_inner(
                     &ctx,
                     &repr,
                     &mut payload,
+                    &doc,
                     *level,
                     &held,
                     &mut { MAX_JOIN_LOOKUPS },
@@ -777,16 +778,7 @@ async fn query_entities_inner(
         .map(|q| antares_ql::parse_narrowed_q(q))
         .transpose()?;
     // 5.7.2.4 validation bullets (p.201), in the spec's own order.
-    if params.get("type").map(String::as_str) == Some("*")
-        && params.get("local").map(String::as_str) == Some("false")
-    {
-        return Err(NgsiError::BadRequestData(
-            "type=* implies local and shall not be combined with local=false \
-             (Table 6.4.3.2-1)"
-                .into(),
-        )
-        .into());
-    }
+    star_type_local(params)?;
     if params.contains_key("geometryProperty") && accept != Accept::GeoJson {
         return Err(NgsiError::BadRequestData(
             "geometryProperty requires Accept: application/geo+json (5.7.2.4)".into(),
@@ -954,7 +946,9 @@ async fn query_entities_inner(
         false => links,
     };
 
-    let mut payload: Vec<Value> = page
+    // each rendered Entity beside the one it was rendered from, which the
+    // inline join reads its Relationships off
+    let (rendered_from, mut payload): (Vec<&Value>, Vec<Value>) = page
         .iter()
         .filter_map(|doc| {
             let shaped = apply(doc, &repr);
@@ -962,9 +956,9 @@ async fn query_entities_inner(
             if repr.pick.is_some() && shaped.as_object().is_some_and(|o| o.is_empty()) {
                 return None;
             }
-            Some(compact_for(&repr, &shaped, &ctx))
+            Some((doc, compact_for(&repr, &shaped, &ctx)))
         })
-        .collect();
+        .unzip();
     if let Some((mode, level)) = &join {
         let mut complete = true;
         let held = contained_by(params);
@@ -976,13 +970,14 @@ async fn query_entities_inner(
         let mut budget = MAX_JOIN_LOOKUPS;
         match mode.as_str() {
             "inline" => {
-                for p in &mut payload {
+                for (p, stored) in payload.iter_mut().zip(&rendered_from) {
                     complete &= inline_join_beyond(
                         st,
                         &tenant,
                         &ctx,
                         &repr,
                         p,
+                        stored,
                         *level,
                         &held,
                         &mut budget,
@@ -1047,6 +1042,21 @@ async fn query_entities_inner(
     Ok(resp)
 }
 
+/// Table 6.4.3.2-1: `type=*` implies local scope and shall not be combined
+/// with `local=false`.
+pub(crate) fn star_type_local(params: &HashMap<String, String>) -> Result<(), NgsiError> {
+    if params.get("type").map(String::as_str) == Some("*")
+        && params.get("local").map(String::as_str) == Some("false")
+    {
+        return Err(NgsiError::BadRequestData(
+            "type=* implies local and shall not be combined with local=false \
+             (Table 6.4.3.2-1)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// 5.7.2.4 / 5.7.4.4 / 5.14.4.4 a-e: a query qualifies (is not "too wide")
 /// only with a type selector, an attrs list or q naming at least one
 /// non-system Attribute, a geoquery, or local scope.
@@ -1093,10 +1103,14 @@ pub struct Filtered {
     pub docs: Vec<Value>,
     pub paged: bool,
     pub total: Option<usize>,
-    /// How many documents the store returned, before the evaluator below
-    /// dropped any. With a pushed page that is the size of the SQL page —
-    /// which is what a chunked walk has to step over, since `docs` undercounts
-    /// it whenever idPattern (invisible to the store filter) removed rows.
+    /// How far a chunked walk steps past this page, in the unit its offset
+    /// counts. With a pushed page that is the store rows the SQL page read,
+    /// before the evaluator below dropped any — `docs` undercounts it
+    /// whenever idPattern (invisible to the store filter) removed rows. Where
+    /// the offset counts matches instead (a window or a count the loop
+    /// decides), it is the matches of the page: stepping by the rows read
+    /// there skipped matches, and a window of rows that never match kept the
+    /// walk going forever.
     pub rows: usize,
     /// The store decided the match set and kept only the core members and
     /// [`Pushdown::order_keys`] of each document: enough to order and page
@@ -1277,7 +1291,7 @@ fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
 /// Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
 /// at all. Expanding it as a term yields an IRI nothing matches, which is
 /// how `type=*` silently returned an empty array.
-fn type_selection(
+pub(crate) fn type_selection(
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
 ) -> Option<Vec<Vec<String>>> {
@@ -1867,19 +1881,19 @@ pub async fn filter_entities_paged(
                     .saturating_add(out.len())
                     .saturating_add(usize::from(more)),
             ),
+            rows: out.len(),
             docs: out,
             paged: true,
-            rows,
             trimmed,
         });
     }
     if counting.is_some() {
         // the store paged to the end, or answered every row it holds at once
         return Ok(Filtered {
+            rows: out.len(),
             docs: out,
             paged: true,
             total: Some(matched),
-            rows,
             trimmed,
         });
     }
@@ -1920,11 +1934,11 @@ pub async fn delete_entity(
         let cond = crate::policy::Condition::of(&granted);
         // 4.17/5.6.6.4: the type selector gates the target — a registration
         // for a different type must not receive the forwarded delete.
+        // every type the 4.17 selection names: the forward carries the
+        // selector and the Context Source judges it
         let spec = crate::registry::CsrSpec {
             ids: Some(vec![id.clone()]),
-            types: params
-                .get("type")
-                .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect()),
+            types: type_selection(&params, &ctx).map(|sel| sel.into_iter().flatten().collect()),
             ..Default::default()
         };
         let regs = match crate::federation::write_plan(&st, &tenant, &spec, &ctx, &params, &headers)
@@ -2255,6 +2269,8 @@ async fn purge_inner(
         )
         .into());
     }
+    // Table 6.4.3.2-1, as on the entity query (5.7.2.4)
+    star_type_local(params)?;
     // 5.6.21.4: a syntactically invalid context source filter is
     // BadRequestData.
     if let Some(csf) = params.get("csf") {
@@ -2289,9 +2305,8 @@ async fn purge_inner(
     // loop check come first: 508 Loop Detected is an error status, so the
     // request it answers must not have deleted a page of Entities already.
     let spec = crate::registry::CsrSpec {
-        types: params
-            .get("type")
-            .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect()),
+        // every type the 4.17 selection names, as for 5.6.6
+        types: type_selection(params, &ctx).map(|sel| sel.into_iter().flatten().collect()),
         ids: params
             .get("id")
             .map(|s| s.split(',').map(str::to_owned).collect()),
@@ -2419,8 +2434,11 @@ async fn merge_entity_inner(
     apply_common_observed_at(&mut fragment, observed_at);
     let ts = now_iso();
 
+    // 5.6.17.4: the ?type selector narrows the Context Sources as it
+    // narrows the local target, as for 5.6.6
     let spec = crate::registry::CsrSpec {
         ids: Some(vec![id.to_owned()]),
+        types: type_selection(params, &parsed.ctx).map(|sel| sel.into_iter().flatten().collect()),
         ..Default::default()
     };
     let regs = match crate::federation::write_plan(st, &tenant, &spec, &parsed.ctx, params, headers)
@@ -3009,8 +3027,14 @@ pub async fn replace_entity(
             // An Entity the engine's condition does not select is
             // not found, before the body is read, as an absent target is
             .filter(|d| cond.as_ref().is_none_or(|c| c.holds(d)));
+        // the same selector narrows the Context Sources the replace goes to
+        let spec = crate::registry::CsrSpec {
+            ids: Some(vec![id.clone()]),
+            types: type_selection(&params, &ctx0).map(|sel| sel.into_iter().flatten().collect()),
+            ..Default::default()
+        };
         let regs =
-            match crate::federation::write_plan_for_id(&st, &tenant, &id, &ctx0, &params, &headers)
+            match crate::federation::write_plan(&st, &tenant, &spec, &ctx0, &params, &headers)
                 .await?
             {
                 crate::federation::WritePlan::Answered(r) => return Ok(*r),
@@ -3830,6 +3854,7 @@ mod clause_4_5_23_bounds {
             &ctx,
             &crate::repr::Repr::default(),
             &mut compacted,
+            &Value::Null,
             1,
         )
         .await;
@@ -4371,6 +4396,75 @@ mod clause_5_6_1_and_5_6_21 {
                 .await
                 .expect("clean");
         }
+    }
+
+    /// 5.6.21.4 under a scopeQ, which the store narrows but cannot decide:
+    /// the window it is walked in counts matches, so the walk steps in
+    /// matches too. Stepping by the store rows read skipped every match past
+    /// the first window and, with a full window of non-matching rows behind
+    /// it, never stopped.
+    #[tokio::test]
+    async fn purge_with_scope_q_deletes_every_match_past_the_first_window() {
+        let st = AppState::new("antares-test".into());
+        let tenant = TenantId::default();
+        for i in 0..900usize {
+            let id = format!("urn:ngsi-ld:Purge:{i:05}");
+            let mut doc = json!({"id": &id,
+                "type": ["https://uri.etsi.org/ngsi-ld/default-context/Purge"]});
+            if i < 700 {
+                doc["scope"] = json!(["/a"]);
+            }
+            st.store
+                .upsert(&tenant, Kind::Entity, &id, doc)
+                .await
+                .expect("seed");
+        }
+        let resp = purge_inner(
+            &st,
+            &purge_params(&[("type", "Purge"), ("scopeQ", "/a")]),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("purge");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let left = st.store.list(&tenant, Kind::Entity).await.expect("list");
+        let scoped = left.iter().filter(|d| d.get("scope").is_some()).count();
+        assert_eq!(scoped, 0, "{scoped} scoped matches survived the purge");
+        assert_eq!(left.len(), 200, "an Entity outside the scope was purged");
+    }
+
+    /// The same walk ends when nothing matches: a full window of rows the
+    /// scopeQ refuses is no match to step over. Run on a thread of its own,
+    /// so a walk that never yields fails the test instead of hanging it.
+    #[test]
+    fn purge_with_scope_q_matching_nothing_terminates() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let left = rt.block_on(async {
+                let st = AppState::new("antares-test".into());
+                let tenant = TenantId::default();
+                seed(&st, &tenant, PURGE_CHUNK + 1).await;
+                let params = purge_params(&[("type", "Purge"), ("scopeQ", "/none")]);
+                let resp = purge_inner(&st, &params, &HeaderMap::new())
+                    .await
+                    .expect("purge");
+                assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+                st.store
+                    .list(&tenant, Kind::Entity)
+                    .await
+                    .expect("list")
+                    .len()
+            });
+            let _ = tx.send(left);
+        });
+        let left = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the purge walk ended");
+        assert_eq!(left, PURGE_CHUNK + 1, "nothing matched, nothing is purged");
     }
 
     /// The same walk terminates: a chunk the store did not page IS the whole

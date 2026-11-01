@@ -376,3 +376,64 @@ async fn a_registered_context_cannot_rename_an_attribute_into_a_dot_segment() {
         "an untranslated request must not advertise the registered context: {head}"
     );
 }
+
+/// 4.3.6.6: a forward the broker switched to the registered @context is
+/// answered in that @context, so the answer is read in it too. The source's
+/// `velocity` is the registered context's name for the client's `speed`;
+/// expanding it with the client's own @context imports an Attribute
+/// `default-context/velocity` nobody holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_answer_is_read_in_the_context_it_was_asked_in() {
+    let st = state();
+    let ctx = format!("http://127.0.0.1:{}/ctx.jsonld", context_server());
+    let answer = format!(
+        r#"[{{"id":"{ENTITY}","type":"Vehicle","velocity":{{"type":"Property","value":7}}}}]"#
+    );
+    let port = serve(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{answer}",
+        answer.len()
+    ));
+    register(&st, port, &ctx, &["queryEntity"]).await;
+
+    let (status, body) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Vehicle", None).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        v[0]["speed"]["value"], 7,
+        "the registered velocity is the client's speed: {body}"
+    );
+}
+
+/// 4.3.6.6 for a 5.2.23 Query body (the queryBatch forward): its
+/// `entities[].type` and `attrs` are terms like any query parameter, so it
+/// either travels compacted against the registered @context or under the
+/// @context its terms are in — never untranslated under the registered one,
+/// where `speed` names `http://example.org/other#speed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_body_never_travels_under_a_context_its_terms_are_not_in() {
+    let st = state();
+    let ctx = format!("http://127.0.0.1:{}/ctx.jsonld", context_server());
+    let m = mock_source();
+    register(&st, m.port, &ctx, &["queryBatch"]).await;
+
+    let (status, body) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Vehicle&attrs=speed",
+        None,
+    )
+    .await;
+    assert!(status < 300, "query: {status} {body}");
+    let head = m.head.lock().expect("lock").clone();
+    let sent = m.body.lock().expect("lock").clone();
+    assert!(
+        target_of(&head).contains("entityOperations/query"),
+        "{head}"
+    );
+    let registered = link_of(&head).is_some_and(|l| l.contains(&ctx));
+    assert!(
+        !(registered && sent.contains("\"speed\"")),
+        "untranslated Query body under the registered @context: {head}\n{sent}"
+    );
+}

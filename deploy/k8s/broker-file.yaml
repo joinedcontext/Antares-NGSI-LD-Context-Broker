@@ -64,6 +64,8 @@ spec:
           env:
             - { name: ANTARES_STORE, value: file }
             - { name: ANTARES_DATA_DIR, value: /data }
+            # /q behind the admin bearer, as in broker-postgres.yaml
+            - { name: ANTARES_ADMIN_TOKEN_FILE, value: /run/secrets/antares-admin/token }
             - { name: ANTARES_DEFAULT_LIMIT, value: "100" }
             - { name: ANTARES_MAX_LIMIT, value: "1000" }
             - { name: ANTARES_TEMPORAL_DEFAULT_INSTANCES, value: "100" }
@@ -90,8 +92,11 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: tmp, mountPath: /tmp }
+            - { name: admin-token, mountPath: /run/secrets/antares-admin, readOnly: true }
       volumes:
         - name: data
           persistentVolumeClaim: { claimName: antares-file-data }
         - name: tmp
           emptyDir: {}
+        - name: admin-token
+          secret: { secretName: antares-admin }

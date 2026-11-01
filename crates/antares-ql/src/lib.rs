@@ -705,22 +705,32 @@ impl<'a> Parser<'a> {
             .find(|c: char| ";|(),".contains(c))
             .unwrap_or(self.rest.len());
         // the Range separator is looked for in this token only: across the
-        // whole rest, every term rescanned the terms after it
+        // whole rest, every term rescanned the terms after it. A RegExp has
+        // no Range form, and `..` is pattern text there (`n~=a..z`).
         let end = self
             .rest
             .get(..stop)
             .and_then(|token| token.find(".."))
+            .filter(|_| !regexp)
             .unwrap_or(stop);
         let (raw, rest) = self.rest.split_at(end);
         let raw = raw.trim();
         // The unquoted alternatives are `dateTime`/`date`/`time` (4.6.3), a
         // Number and a `URI` (RFC 3986). None of them admits a `\"`, so one
-        // here is an unterminated `quotedStr`, not a value.
-        if !regexp && raw.contains('"') {
+        // here is an unterminated `quotedStr`, not a value. An unquoted
+        // `RegExp` is refused one too: the term is rendered back with its
+        // pattern between quotes (render.rs), where a `\"` in the pattern
+        // ends it, so the rendered query (a policy narrowing, a forward)
+        // no longer parsed.
+        if raw.contains('"') {
             return Err(bad(raw, "unquoted value must not contain a quote (4.9)"));
         }
         self.rest = rest;
         match raw {
+            // 4.9 `patternOp RegExp`: the operand is pattern text whatever
+            // it looks like — `code~=123` is the regex 123, not the Number
+            // (which no regex is compiled from), `f~=true` no boolean
+            _ if regexp && !raw.is_empty() => Ok(QValue::Str(raw.to_owned())),
             "true" => Ok(QValue::Bool(true)),
             "false" => Ok(QValue::Bool(false)),
             // RFC 8259 section 6 lets a receiver limit the range: a Number
@@ -774,6 +784,20 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pattern operand holding a quote cannot be spelled back as a Query
+    /// Term (render.rs writes it between quotes, where the quote ends it), so
+    /// the unquoted form refuses one as the quoted form does: what parses
+    /// renders to a query that parses to it again.
+    #[test]
+    fn an_unquoted_pattern_with_a_quote_is_refused() {
+        for q in [r#"code~=a"b"#, r#"code!~=a"b"#, r#"code~=a""#] {
+            assert!(parse_q(q).is_err(), "{q}");
+        }
+        let node = parse_q(r#"code~=a\\.b"#).expect("pattern");
+        assert_eq!(parse_q(&node.to_string()).expect("round-trip"), node);
+        assert_eq!(parse_narrowed_q(&node.to_string()).expect("narrowed"), node);
+    }
 
     /// an unquoted value that starts with an operator's character is
     /// a typo of the operator, refused rather than compared as text.
@@ -1083,6 +1107,33 @@ mod tests {
                 op: CmpOp::NotPattern,
                 value: QValue::Str("^Merc".into())
             }
+        );
+    }
+
+    /// 4.9 `patternOp RegExp`: an unquoted operand is the pattern text, not a
+    /// Number, a boolean or a Range — `code~=123` must not become 123.0.
+    #[test]
+    fn an_unquoted_pattern_is_regexp_text() {
+        for (q, want) in [
+            ("code~=123", "123"),
+            ("code~=1.50", "1.50"),
+            ("f~=true", "true"),
+            ("n~=a..z", "a..z"),
+            ("n!~=0..9;m==1", "0..9"),
+        ] {
+            let n = parse_q(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
+            let pattern = match &n {
+                QNode::And(items) => items.first(),
+                other => Some(other),
+            };
+            assert!(
+                matches!(pattern, Some(QNode::Cmp { value: QValue::Str(s), .. }) if s == want),
+                "{q}: {n:?}"
+            );
+        }
+        assert!(
+            parse_q("code~=").is_err(),
+            "an empty pattern is still no value"
         );
     }
 

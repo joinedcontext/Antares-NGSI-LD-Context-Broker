@@ -237,3 +237,80 @@ async fn the_receiver_of_a_copy_is_read_from_the_inbound_index_only() {
         Some("acme")
     );
 }
+
+/// S3-18 at the consumer: on the Postgres arm a later commit's change hook
+/// may run before an earlier one's, and each change carries the version its
+/// write left. The matcher drops the change it receives after a newer one of
+/// the same Entity, so the subscriber's last notification holds the image
+/// committed last. The hook is called here as a driver would call it, the
+/// newer change first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_a_later_commit_overtook_is_not_notified_last() {
+    let inbox = Arc::new(Inbox::default());
+    antares_jsonld::allow_private_egress(true);
+    let mut st = AppState::new("in-process".into());
+    let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    antares_api::wire(&mut st).await;
+    let st = st
+        .with_forward_transport(inbox.clone())
+        .expect("one transport");
+    subscribe_and_create(&st, TAKEN, "Raced").await;
+    let wait = Duration::from_secs(5 * antares_api::state::slow_factor());
+    let delivered = |n: usize| {
+        let inbox = inbox.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + wait;
+            while inbox.seen.lock().expect("lock").len() < n {
+                assert!(tokio::time::Instant::now() < deadline, "no delivery {n}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    delivered(1).await;
+    let acme = TenantId::new("acme").expect("tenant");
+    let id = "urn:ngsi-ld:Raced:1";
+    let base = st
+        .store
+        .get(&acme, Kind::Entity, id)
+        .await
+        .expect("get")
+        .expect("stored");
+    let image = |v: i64| {
+        let mut d = base.clone();
+        let o = d.as_object_mut().expect("object");
+        let key = o.keys().find(|k| k.ends_with("/a")).cloned().expect("a");
+        o[&key][0]["value"] = json!(v);
+        d
+    };
+    let version = |n: i64| antares_store::ChangeVersion {
+        incarnation: String::new(),
+        version: n,
+    };
+    let hook = spy.change_hook().expect("the API installed its hook");
+    // beyond any version the memory arm counted for the create
+    hook(&acme, Some(base.clone()), Some(image(3)), version(1 << 40)).await;
+    // delivered before the late one runs: one matcher pass would fold the two
+    delivered(2).await;
+    hook(
+        &acme,
+        Some(base.clone()),
+        Some(image(2)),
+        version((1 << 40) - 1),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(
+        300 * antares_api::state::slow_factor(),
+    ))
+    .await;
+    let seen = inbox.seen.lock().expect("lock").clone();
+    let values: Vec<Value> = seen
+        .iter()
+        .map(|(_, _, n)| n["data"][0]["a"]["value"].clone())
+        .collect();
+    assert_eq!(
+        values,
+        vec![json!(1), json!(3)],
+        "the create, then the newer change alone: {seen:?}"
+    );
+}

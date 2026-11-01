@@ -137,7 +137,9 @@ impl ExampleStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(h) = hook {
-            h(tenant, before, after).await;
+            // no commit order to tell: the default, which every consumer
+            // admits, so each change is delivered as it comes
+            h(tenant, before, after, Default::default()).await;
         }
     }
 
