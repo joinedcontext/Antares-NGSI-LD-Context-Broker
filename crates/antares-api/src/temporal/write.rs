@@ -241,7 +241,7 @@ pub async fn delete_temporal(
         // 5.6.16.4: forward to registrations supporting the operation;
         // unsupported proxy modes are Conflict.
         let ctx = st.loader.core();
-        temporal_write_gate(&st, &tenant, &headers, &id, "5.6.16").await?;
+        temporal_write_gate(&st, &tenant, &headers, &id, "5.6.16", &[], None).await?;
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
             Ok(regs) => regs,
             Err(refused) => return Ok(*refused),
@@ -287,7 +287,6 @@ pub async fn add_temporal_attrs(
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
-        let cond = temporal_write_gate(&st, &tenant, &headers, &id, "5.6.12").await?;
         // 5.6.12 input is pushed history — the 4.5.7 deleted-instance
         // representation is legal (5.5.4 temporal exception), hence
         // allow_null (mirrors 5.6.11).
@@ -301,6 +300,17 @@ pub async fn add_temporal_attrs(
                 ..Default::default()
             },
         )?;
+        // the engine is asked with what 5.6.3 gives it: the Attributes, the body
+        let cond = temporal_write_gate(
+            &st,
+            &tenant,
+            &headers,
+            &id,
+            "5.6.12",
+            &crate::attrs::attr_iris_of(&expanded),
+            Some(&expanded),
+        )
+        .await?;
         // 5.6.12.4: forwarding — proxy modes without appendAttrsTemporal
         // are Conflict; supporting registrations receive the fragment and
         // the matching attributes are stripped from the local half.
@@ -450,8 +460,17 @@ pub async fn delete_temporal_attr(
         antares_model::check_attr_name(&attr)?;
         check_params(&params, &["datasetId", "deleteAll", "local"])?;
         let ctx = request_context(&st.loader, &headers).await?;
-        let cond = temporal_write_gate(&st, &tenant, &headers, &id, "5.6.13").await?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &ctx)?;
+        let cond = temporal_write_gate(
+            &st,
+            &tenant,
+            &headers,
+            &id,
+            "5.6.13",
+            std::slice::from_ref(&attr_iri),
+            None,
+        )
+        .await?;
         let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
         let want_ds = crate::repr::target_dataset_id(&params).map(String::from);
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
@@ -532,13 +551,17 @@ fn remove_instances(
 }
 
 /// The policy gate of a write to one Temporal Evolution under `clause`,
-/// judged on its stored image: the condition a narrowing engine answered.
+/// judged on its stored image, the expanded Attributes it writes and its
+/// expanded body, as the Core API twin of the write is: the condition a
+/// narrowing engine answered.
 async fn temporal_write_gate(
     st: &AppState,
     tenant: &antares_model::TenantId,
     headers: &HeaderMap,
     id: &str,
     clause: &'static str,
+    written: &[String],
+    fragment: Option<&Value>,
 ) -> Result<Option<crate::policy::Condition>, ApiError> {
     let pre = crate::policy::temporal_pre_image(st, tenant, id).await?;
     let granted = gate!(
@@ -546,6 +569,8 @@ async fn temporal_write_gate(
         ids: &[id],
         types: &pre.types,
         stored: pre.stored.as_ref(),
+        attrs: written,
+        body: fragment,
     )
     .await?;
     Ok(crate::policy::Condition::of(&granted))
@@ -673,13 +698,23 @@ pub async fn modify_temporal_instance(
         antares_model::EntityId::new(&instance_id)
             .map_err(|_| NgsiError::BadRequestData("invalid instance id".into()))?;
         check_params(&params, &["local"])?;
-        let cond = temporal_write_gate(&st, &tenant, &headers, &id, "5.6.14").await?;
         let parsed = parse_body(&st, &headers, &body, BodyKind::MergePatch).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &parsed.ctx)?;
         let frag_inst = instance_fragment(obj, &attr, &attr_iri, &parsed.ctx)?;
+        // as 5.6.4 is asked: the Attribute and the instance written
+        let cond = temporal_write_gate(
+            &st,
+            &tenant,
+            &headers,
+            &id,
+            "5.6.14",
+            std::slice::from_ref(&attr_iri),
+            Some(&frag_inst),
+        )
+        .await?;
         let regs =
             match temporal_write_regs(&st, &tenant, &headers, &parsed.ctx, &params, &id).await {
                 Ok(regs) => regs,
@@ -820,8 +855,17 @@ pub async fn delete_temporal_instance(
             .map_err(|_| NgsiError::BadRequestData("invalid instance id".into()))?;
         check_params(&params, &["local"])?;
         let ctx = request_context(&st.loader, &headers).await?;
-        let cond = temporal_write_gate(&st, &tenant, &headers, &id, "5.6.15").await?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &ctx)?;
+        let cond = temporal_write_gate(
+            &st,
+            &tenant,
+            &headers,
+            &id,
+            "5.6.15",
+            std::slice::from_ref(&attr_iri),
+            None,
+        )
+        .await?;
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
             Ok(regs) => regs,
             Err(refused) => return Ok(*refused),

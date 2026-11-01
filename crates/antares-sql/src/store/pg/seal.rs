@@ -12,13 +12,23 @@
 //!
 //! A value without the prefix is read as it is, so rows written before the
 //! key was set stay readable; [`super::doc::PgDocStore::seal_plaintext`]
-//! rewrites them at boot. A sealed value read without the key, or under
+//! rewrites them at boot. Without a key, a client's own text that starts
+//! with `enc:` is stored behind [`LITERAL`], so `enc:v1:` in a row always
+//! means ciphertext. A sealed value read without the key, or under
 //! another key, is an error: a notification never goes out with ciphertext in
 //! its headers.
 //!
-//! The memory/file store and the bus KV mirror keep plaintext; the
-//! Pg store is the one deployments run (ANTARES_BUS=local), seal those when a
-//! deployment runs them.
+//! A Snapshot's `receiverInfo` (Table 5.2.41-1) is the header set of its
+//! 5.16.6 notification and is sealed the same way. An endpoint URI that
+//! carries `user:password@` userinfo (7.2; an HTTP client sends it as Basic
+//! auth) is a credential as well: such a URI is sealed whole, in every kind
+//! above. A URI without userinfo stays readable.
+//!
+//! The bus KV mirror (ANTARES_BUS=nats) carries the Subscription documents
+//! between pods; the wiring seals them with [`sealed`] before the put and
+//! opens them with [`open`] where the matcher applies an entry, so the
+//! bucket holds what the row holds. The memory/file store keeps plaintext;
+//! the Pg store is the one deployments run, seal it when a deployment runs it.
 
 use base64::Engine as _;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
@@ -30,6 +40,12 @@ use super::doc::DocKind;
 /// The marker of a sealed value; `v1` names AES-256-GCM with a random
 /// 96-bit nonce prepended to the ciphertext.
 pub const PREFIX: &str = "enc:v1:";
+
+/// The marker of a client's own text stored without a key: a value that
+/// starts with `enc:` (`PREFIX` or this marker itself) is written behind it,
+/// and `open` strips it again. Without it a client's `enc:v1:…` text read
+/// back as ciphertext and failed every read of its row, the listing included.
+const LITERAL: &str = "enc:lit:";
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -129,18 +145,56 @@ impl From<Unreadable> for sqlx::Error {
     }
 }
 
+/// Whether an endpoint URI carries userinfo (`scheme://user:pass@host`), the
+/// rule `antares_notifier::redact_userinfo` strips. A URI starting with
+/// `enc:` is read as one too: it is the sealed (or escaped) form of such a URI,
+/// or a client's text that has to round-trip like one.
+fn credential_uri(uri: &Value) -> bool {
+    let Some(uri) = uri.as_str() else {
+        return false;
+    };
+    if uri.starts_with("enc:") {
+        return true;
+    }
+    uri.split_once("//").is_some_and(|(_, rest)| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
+}
+
+/// The `receiverInfo` KeyValuePair values (5.2.22) and the endpoint URI with
+/// userinfo of one endpoint object: `uri` names the URI member.
+fn endpoint_credentials<'a>(
+    endpoint: &'a mut serde_json::Map<String, Value>,
+    uri: &str,
+) -> Vec<&'a mut Value> {
+    let mut out = Vec::new();
+    for (k, v) in endpoint.iter_mut() {
+        if k == uri && credential_uri(v) {
+            out.push(v);
+        } else if k == "receiverInfo" {
+            if let Some(pairs) = v.as_array_mut() {
+                out.extend(pairs.iter_mut().filter_map(|p| p.get_mut("value")));
+            }
+        }
+    }
+    out
+}
+
 /// The string values of `doc` that hold a credential of `kind`.
 fn credentials(kind: DocKind, doc: &mut Value) -> Vec<&mut Value> {
     match kind {
         DocKind::Subscription | DocKind::CSourceSubscription => doc
-            .pointer_mut("/notification/endpoint/receiverInfo")
-            .and_then(Value::as_array_mut)
-            .map(|pairs| {
-                pairs
-                    .iter_mut()
-                    .filter_map(|p| p.get_mut("value"))
-                    .collect()
-            })
+            .pointer_mut("/notification/endpoint")
+            .and_then(Value::as_object_mut)
+            .map(|ep| endpoint_credentials(ep, "uri"))
+            .unwrap_or_default(),
+        // Table 5.2.41-1 keeps `endpoint` (the URI) and `receiverInfo` as
+        // members of the Snapshot itself
+        DocKind::Snapshot => doc
+            .as_object_mut()
+            .map(|o| endpoint_credentials(o, "endpoint"))
             .unwrap_or_default(),
         // Outbound::receiver_info and the old rendered header list are
         // `[key, value]` pairs.
@@ -148,11 +202,17 @@ fn credentials(kind: DocKind, doc: &mut Value) -> Vec<&mut Value> {
             let Some(o) = doc.as_object_mut() else {
                 return Vec::new();
             };
-            o.iter_mut()
-                .filter(|(k, _)| *k == "receiverInfo" || *k == "headers")
-                .filter_map(|(_, v)| v.as_array_mut())
-                .flat_map(|pairs| pairs.iter_mut().filter_map(|p| p.get_mut(1)))
-                .collect()
+            let mut out = Vec::new();
+            for (k, v) in o.iter_mut() {
+                if k == "uri" && credential_uri(v) {
+                    out.push(v);
+                } else if k == "receiverInfo" || k == "headers" {
+                    if let Some(pairs) = v.as_array_mut() {
+                        out.extend(pairs.iter_mut().filter_map(|p| p.get_mut(1)));
+                    }
+                }
+            }
+            out
         }
         _ => Vec::new(),
     }
@@ -162,7 +222,10 @@ fn credentials(kind: DocKind, doc: &mut Value) -> Vec<&mut Value> {
 pub(crate) fn holds_credentials(kind: DocKind) -> bool {
     matches!(
         kind,
-        DocKind::Subscription | DocKind::CSourceSubscription | DocKind::DeadLetter
+        DocKind::Subscription
+            | DocKind::CSourceSubscription
+            | DocKind::Snapshot
+            | DocKind::DeadLetter
     )
 }
 
@@ -171,7 +234,7 @@ pub(crate) fn holds_credentials(kind: DocKind) -> bool {
 /// out of a dump into another subscription (another tenant, kind or id)
 /// fails to open instead of being delivered to its new receiver.
 #[derive(Clone, Copy)]
-pub(crate) struct Row<'a> {
+pub struct Row<'a> {
     pub kind: DocKind,
     pub tenant: &'a str,
     pub id: &'a str,
@@ -182,6 +245,7 @@ impl Row<'_> {
         let kind = match self.kind {
             DocKind::Subscription => "subscription",
             DocKind::CSourceSubscription => "csource-subscription",
+            DocKind::Snapshot => "snapshot",
             DocKind::DeadLetter => "dead-letter",
             _ => "other",
         };
@@ -193,15 +257,31 @@ impl Row<'_> {
 
 /// `doc` as it is stored: every credential sealed under `key` for `row`. A
 /// value the client sent already starting with `enc:v1:` is sealed like any
-/// other text, so it reads back as that literal text, never decrypted. No
-/// key, or nothing to seal, writes the doc as it came.
-pub(crate) fn sealed<'a>(
+/// other text, so it reads back as that literal text, never decrypted.
+/// Without a key such a value is kept behind [`LITERAL`] for the same reason;
+/// nothing to seal or escape writes the doc as it came.
+pub fn sealed<'a>(
     key: Option<&SecretKey>,
     row: Row<'_>,
     doc: &'a Value,
 ) -> Result<std::borrow::Cow<'a, Value>, Unreadable> {
-    let Some(key) = key.filter(|_| holds_credentials(row.kind)) else {
+    if !holds_credentials(row.kind) {
         return Ok(std::borrow::Cow::Borrowed(doc));
+    }
+    let Some(key) = key else {
+        let mut out = doc.clone();
+        let mut escaped = false;
+        for v in credentials(row.kind, &mut out) {
+            if let Some(s) = v.as_str().filter(|s| s.starts_with("enc:")) {
+                *v = Value::String(format!("{LITERAL}{s}"));
+                escaped = true;
+            }
+        }
+        return Ok(if escaped {
+            std::borrow::Cow::Owned(out)
+        } else {
+            std::borrow::Cow::Borrowed(doc)
+        });
     };
     let aad = row.aad();
     let mut out = doc.clone();
@@ -214,31 +294,49 @@ pub(crate) fn sealed<'a>(
 }
 
 /// Open every sealed credential of the stored `doc` of `row` in place;
-/// plaintext values (rows from before the key) pass through.
-pub(crate) fn open(
-    key: Option<&SecretKey>,
-    row: Row<'_>,
-    doc: &mut Value,
-) -> Result<(), Unreadable> {
+/// plaintext values (rows from before the key) pass through, and a client's
+/// text kept behind [`LITERAL`] comes back as it was sent.
+pub fn open(key: Option<&SecretKey>, row: Row<'_>, doc: &mut Value) -> Result<(), Unreadable> {
     let aad = row.aad();
     for v in credentials(row.kind, doc) {
-        if let Some(body) = v.as_str().and_then(|s| s.strip_prefix(PREFIX)) {
+        let Some(s) = v.as_str() else {
+            continue;
+        };
+        if let Some(text) = s.strip_prefix(LITERAL) {
+            *v = Value::String(text.to_owned());
+        } else if let Some(body) = s.strip_prefix(PREFIX) {
             *v = Value::String(key.ok_or(Unreadable)?.open(body, &aad)?);
         }
     }
     Ok(())
 }
 
+/// Whether `doc` of `kind` still holds a credential that is not sealed: a
+/// value put before the key was set, or one kept behind [`LITERAL`].
+pub fn holds_plaintext(kind: DocKind, doc: &Value) -> bool {
+    let mut doc = doc.clone();
+    credentials(kind, &mut doc)
+        .into_iter()
+        .any(|v| v.as_str().is_some_and(|s| !s.starts_with(PREFIX)))
+}
+
 /// The jsonpath that finds a row still holding a plaintext credential of
-/// `kind` (the boot pass's filter).
+/// `kind` (the boot pass's filter). The URI regex is [`credential_uri`]'s
+/// userinfo rule: the authority after the first `//` holds an `@`.
 pub(crate) fn plaintext_path(kind: DocKind) -> Option<&'static str> {
     match kind {
         DocKind::Subscription | DocKind::CSourceSubscription => Some(
-            "$.notification.endpoint.receiverInfo[*].value ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))",
+            "$ ? (exists(@.notification.endpoint.receiverInfo[*].value ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
+             || exists(@.notification.endpoint.uri ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\") && @ like_regex \"^([^/]|/[^/])*//[^/?#]*@\")))",
+        ),
+        DocKind::Snapshot => Some(
+            "$ ? (exists(@.receiverInfo[*].value ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
+             || exists(@.endpoint ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\") && @ like_regex \"^([^/]|/[^/])*//[^/?#]*@\")))",
         ),
         DocKind::DeadLetter => Some(
             "$ ? (exists(@.receiverInfo[*][1] ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
-             || exists(@.headers[*][1] ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))))",
+             || exists(@.headers[*][1] ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
+             || exists(@.uri ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\") && @ like_regex \"^([^/]|/[^/])*//[^/?#]*@\")))",
         ),
         _ => None,
     }
@@ -320,6 +418,71 @@ mod tests {
         assert_eq!(back, doc);
     }
 
+    /// A Snapshot's `receiverInfo` (Table 5.2.41-1) is its notification's
+    /// header set: sealed, and opened back in its own row only.
+    #[test]
+    fn a_sealed_snapshot_shows_no_credential_and_opens_to_it() {
+        let k = key(10);
+        let doc = json!({"id": "urn:ngsi-ld:Snapshot:s", "type": "Snapshot",
+                         "endpoint": "http://h/n",
+                         "receiverInfo": [{"key": "Authorization", "value": "Bearer t"}]});
+        let stored = sealed(Some(&k), row(DocKind::Snapshot), &doc).expect("seal");
+        assert!(!stored.to_string().contains("Bearer t"), "{stored}");
+        assert_eq!(stored["receiverInfo"][0]["key"], "Authorization");
+        assert_eq!(stored["endpoint"], "http://h/n");
+        let mut back = stored.clone().into_owned();
+        open(Some(&k), row(DocKind::Snapshot), &mut back).expect("open");
+        assert_eq!(back, doc);
+        let elsewhere = Row {
+            id: "urn:ngsi-ld:Snapshot:other",
+            ..row(DocKind::Snapshot)
+        };
+        assert!(open(Some(&k), elsewhere, &mut stored.into_owned()).is_err());
+    }
+
+    /// 7.2: `user:password@` in an endpoint URI is a credential (an HTTP
+    /// client sends it as Basic auth). Such a URI is sealed whole in every
+    /// kind that keeps one; a URI without userinfo, or with an `@` only in
+    /// its path, stays readable.
+    #[test]
+    fn an_endpoint_uri_with_userinfo_is_sealed_whole() {
+        let k = key(11);
+        let secret = "https://user:pa55@h/n?x=1";
+        let docs = [
+            (
+                DocKind::Subscription,
+                json!({"notification": {"endpoint": {"uri": secret}}}),
+                "/notification/endpoint/uri",
+            ),
+            (
+                DocKind::CSourceSubscription,
+                json!({"notification": {"endpoint": {"uri": secret}}}),
+                "/notification/endpoint/uri",
+            ),
+            (DocKind::Snapshot, json!({"endpoint": secret}), "/endpoint"),
+            (DocKind::DeadLetter, json!({"uri": secret}), "/uri"),
+        ];
+        for (kind, doc, at) in docs {
+            let stored = sealed(Some(&k), row(kind), &doc).expect("seal");
+            assert!(!stored.to_string().contains("pa55"), "{kind:?}: {stored}");
+            assert!(
+                stored
+                    .pointer(at)
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| u.starts_with(PREFIX)),
+                "{kind:?}: {stored}"
+            );
+            let mut back = stored.into_owned();
+            open(Some(&k), row(kind), &mut back).expect("open");
+            assert_eq!(back, doc, "{kind:?}");
+        }
+        for bare in ["https://h/n", "mqtt://h:1883/a@b", "urn:antares:distsub:x"] {
+            let doc = json!({"notification": {"endpoint": {"uri": bare}}});
+            let stored = sealed(Some(&k), row(DocKind::Subscription), &doc).expect("seal");
+            assert_eq!(stored["notification"]["endpoint"]["uri"], bare);
+        }
+    }
+
     #[test]
     fn a_dead_letter_seals_its_resolved_pairs() {
         let k = key(1);
@@ -332,6 +495,38 @@ mod tests {
         let mut back = stored.into_owned();
         open(Some(&k), row(DocKind::DeadLetter), &mut back).expect("open");
         assert_eq!(back, doc);
+    }
+
+    /// S3-05: without a key a client's own `enc:v1:` text is stored and read
+    /// back as that text, not opened as a sealed value no key can open (which
+    /// failed every read of the row, and the whole listing with it). The boot
+    /// pass of a key set later still finds it as plaintext and seals it.
+    #[test]
+    fn a_client_prefixed_value_reads_back_without_a_key() {
+        for text in ["enc:v1:AAAA", "enc:lit:x", "Bearer t"] {
+            let doc = sub(text);
+            let stored = sealed(None, row(DocKind::Subscription), &doc)
+                .expect("no key")
+                .into_owned();
+            let mut back = stored.clone();
+            open(None, row(DocKind::Subscription), &mut back)
+                .expect("a client literal is not a sealed value");
+            assert_eq!(value_of(&back), text);
+            assert!(
+                !value_of(&stored).starts_with(PREFIX),
+                "{text} is stored as {}",
+                value_of(&stored)
+            );
+            let k = key(9);
+            let mut later = stored;
+            open(Some(&k), row(DocKind::Subscription), &mut later).expect("open under a key");
+            let resealed = sealed(Some(&k), row(DocKind::Subscription), &later)
+                .expect("seal")
+                .into_owned();
+            let mut again = resealed.clone();
+            open(Some(&k), row(DocKind::Subscription), &mut again).expect("open");
+            assert_eq!(value_of(&again), text);
+        }
     }
 
     #[test]

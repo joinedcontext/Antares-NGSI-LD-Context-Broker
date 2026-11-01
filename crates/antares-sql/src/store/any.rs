@@ -19,6 +19,7 @@ use super::pg::entity::PgEntityStore;
 #[cfg(feature = "postgres")]
 use super::pg::temporal::PgTemporalStore;
 use super::{ChangeHook, Kind, Store};
+use antares_store::ChangeVersion;
 
 /// 5.5.6: unexpected failures (database errors, timeouts) surface as
 /// InternalError. The client-visible detail is deliberately generic —
@@ -159,7 +160,13 @@ impl PgBackend {
     /// memory arm records: the hook runs real code over attacker-shaped JSON,
     /// and a panic inside it must unwind one request, not poison this lock
     /// and panic every later entity write until the process restarts.
-    async fn emit(&self, tenant: &TenantId, before: Option<Value>, after: Option<Value>) {
+    async fn emit(
+        &self,
+        tenant: &TenantId,
+        before: Option<Value>,
+        after: Option<Value>,
+        version: ChangeVersion,
+    ) {
         // cloned out of the lock first: a read guard cannot be held across
         // the await the hook now costs.
         let hook = self
@@ -168,8 +175,48 @@ impl PgBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(h) = hook {
-            h(tenant, before, after).await;
+            h(tenant, before, after, version).await;
         }
+    }
+}
+
+/// Instances per Attribute of one temporal document: every array member
+/// whose items are all objects (an Entity's own `type` list is not one).
+fn instance_counts(doc: &Value) -> std::collections::HashMap<String, usize> {
+    doc.as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| {
+            let l = v.as_array().filter(|l| l.iter().all(Value::is_object))?;
+            Some((k.clone(), l.len()))
+        })
+        .collect()
+}
+
+/// The memory/file store's history cap ([`Store::max_instances`]): the
+/// write that leaves an Attribute of `after` past `cap` instances, more than
+/// `was` held, is refused. One already past it that the write does not grow
+/// (a lowered cap) still takes corrections and deletions.
+fn past_instance_cap(
+    was: &std::collections::HashMap<String, usize>,
+    after: &Value,
+    cap: usize,
+) -> Result<(), NgsiError> {
+    if cap == 0 {
+        return Ok(());
+    }
+    match instance_counts(after)
+        .into_iter()
+        .find(|(k, n)| *n > cap && *n > was.get(k).copied().unwrap_or(0))
+    {
+        // A cap the client can do something about, refused like the batch
+        // cap (400 BadRequestData): the same request will not fit later
+        // either, until older instances are deleted or reaped.
+        Some((attr, n)) => Err(NgsiError::BadRequestData(format!(
+            "the history of Attribute {attr} would hold {n} instances, more than the \
+             {cap} instances this broker keeps per Attribute; delete older instances first"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -389,22 +436,32 @@ impl AnyStore {
         doc: Value,
     ) -> Result<bool, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.create(tenant, kind, id, doc).await),
-            #[cfg(feature = "postgres")]
-            AnyStore::Pg(p) => {
-                let created = match kind {
-                    Kind::Entity => p.entities.create(tenant, id, &doc).await.map_err(db)?,
-                    Kind::Temporal => p.temporal.create(tenant, id, &doc).await.map_err(db)?,
-                    _ => {
-                        let dk = doc_kind(kind)?;
-                        p.docs.create(tenant, dk, id, &doc).await.map_err(db)?
-                    }
-                };
-                if created && kind == Kind::Entity {
-                    p.emit(tenant, None, Some(doc)).await;
+            AnyStore::Mem(s) => {
+                if kind == Kind::Temporal {
+                    past_instance_cap(&Default::default(), &doc, s.max_instances)?;
                 }
-                Ok(created)
+                Ok(s.create(tenant, kind, id, doc).await)
             }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => match kind {
+                Kind::Entity => {
+                    let created = p
+                        .entities
+                        .create_stamped(tenant, id, &doc)
+                        .await
+                        .map_err(db)?;
+                    let hit = created.is_some();
+                    if let Some(v) = created {
+                        p.emit(tenant, None, Some(doc), v).await;
+                    }
+                    Ok(hit)
+                }
+                Kind::Temporal => p.temporal.create(tenant, id, &doc).await.map_err(db),
+                _ => {
+                    let dk = doc_kind(kind)?;
+                    p.docs.create(tenant, dk, id, &doc).await.map_err(db)
+                }
+            },
         }
     }
 
@@ -425,10 +482,15 @@ impl AnyStore {
             }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
-                let flags = p.entities.batch_create(tenant, &items).await.map_err(db)?;
-                for ((_, doc), created) in items.into_iter().zip(&flags) {
-                    if *created {
-                        p.emit(tenant, None, Some(doc)).await;
+                let created = p
+                    .entities
+                    .batch_create_stamped(tenant, &items)
+                    .await
+                    .map_err(db)?;
+                let flags = created.iter().map(Option::is_some).collect();
+                for ((_, doc), created) in items.into_iter().zip(created) {
+                    if let Some(v) = created {
+                        p.emit(tenant, None, Some(doc), v).await;
                     }
                 }
                 Ok(flags)
@@ -454,14 +516,20 @@ impl AnyStore {
             }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
-                let deleted = p.entities.batch_delete(tenant, ids).await.map_err(db)?;
-                let mut prev: std::collections::HashMap<String, Value> =
-                    deleted.into_iter().collect();
+                let deleted = p
+                    .entities
+                    .batch_delete_stamped(tenant, ids)
+                    .await
+                    .map_err(db)?;
+                let mut prev: std::collections::HashMap<String, (Value, ChangeVersion)> = deleted
+                    .into_iter()
+                    .map(|(id, before, v)| (id, (before, v)))
+                    .collect();
                 let mut out = Vec::with_capacity(ids.len());
                 for id in ids {
                     match prev.remove(id) {
-                        Some(before) => {
-                            p.emit(tenant, Some(before), None).await;
+                        Some((before, v)) => {
+                            p.emit(tenant, Some(before), None, v).await;
                             out.push(true);
                         }
                         None => out.push(false),
@@ -480,7 +548,12 @@ impl AnyStore {
         doc: Value,
     ) -> Result<bool, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.upsert(tenant, kind, id, doc).await),
+            AnyStore::Mem(s) => {
+                if kind == Kind::Temporal {
+                    past_instance_cap(&Default::default(), &doc, s.max_instances)?;
+                }
+                Ok(s.upsert(tenant, kind, id, doc).await)
+            }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => match kind {
                 Kind::Entity => {
@@ -489,32 +562,47 @@ impl AnyStore {
                     // lock), fall back to create, and on a lost create race
                     // replace after all.
                     let mut prev: Option<Value> = None;
+                    let mut version = ChangeVersion::default();
                     // one shape, two places: a closure cannot hold the await
                     // and an async closure is not a stable language feature,
                     // so the replace is written once and expanded twice
                     macro_rules! replace {
                         () => {
-                            p.entities
-                                .mutate(tenant, id, |d| {
+                            match p
+                                .entities
+                                .mutate_stamped(tenant, id, |d| {
                                     prev = Some(d.clone());
                                     *d = doc.clone();
                                     Ok::<(), std::convert::Infallible>(())
                                 })
                                 .await
                                 .map_err(db)?
-                                .is_some()
+                            {
+                                Some(Ok(((), v))) => {
+                                    version = v;
+                                    true
+                                }
+                                Some(Err(never)) => match never {},
+                                None => false,
+                            }
                         };
                     }
                     let mut existed = replace!();
                     if !existed {
-                        if p.entities.create(tenant, id, &doc).await.map_err(db)? {
+                        if let Some(v) = p
+                            .entities
+                            .create_stamped(tenant, id, &doc)
+                            .await
+                            .map_err(db)?
+                        {
+                            version = v;
                             existed = false;
                         } else {
                             // lost the create race — replace instead
                             existed = replace!();
                         }
                     }
-                    p.emit(tenant, prev, Some(doc)).await;
+                    p.emit(tenant, prev, Some(doc), version).await;
                     Ok(existed)
                 }
                 Kind::Temporal => {
@@ -601,10 +689,10 @@ impl AnyStore {
                 Kind::Entity => {
                     // the before-image comes from the DELETE's own RETURNING —
                     // same transaction, never a separate racy read
-                    let prev = p.entities.delete(tenant, id).await.map_err(db)?;
+                    let prev = p.entities.delete_stamped(tenant, id).await.map_err(db)?;
                     let hit = prev.is_some();
-                    if hit {
-                        p.emit(tenant, prev, None).await;
+                    if let Some((before, v)) = prev {
+                        p.emit(tenant, Some(before), None, v).await;
                     }
                     Ok(hit)
                 }
@@ -635,10 +723,14 @@ impl AnyStore {
             AnyStore::Pg(p) => {
                 // the before-image comes from the DELETE's own RETURNING —
                 // same transaction, never a separate racy read
-                let prev = p.entities.delete_if(tenant, id, &judge).await.map_err(db)?;
+                let prev = p
+                    .entities
+                    .delete_if_stamped(tenant, id, &judge)
+                    .await
+                    .map_err(db)?;
                 let hit = prev.is_some();
-                if hit {
-                    p.emit(tenant, prev, None).await;
+                if let Some((before, v)) = prev {
+                    p.emit(tenant, Some(before), None, v).await;
                 }
                 Ok(hit)
             }
@@ -992,10 +1084,20 @@ impl AnyStore {
                     return Ok(());
                 }
                 if s.get(tenant, Kind::Temporal, id).is_none() {
+                    // the cap the extension below applies, judged before the
+                    // shell is stored: refused there, the empty shell stayed
+                    past_instance_cap(&Default::default(), additions, s.max_instances)?;
                     // loser of a concurrent create race just extends below
                     let _ = s.create(tenant, Kind::Temporal, id, shell.clone()).await;
                 }
+                let cap = s.max_instances;
+                let mut refused = None;
                 s.mutate(tenant, Kind::Temporal, id, |doc| {
+                    let was = if cap > 0 {
+                        instance_counts(doc)
+                    } else {
+                        Default::default()
+                    };
                     let target = doc.as_object_mut().ok_or(())?;
                     // 4.8: the Entity's modifiedAt is its last write, an
                     // Attribute's update included; never moved backwards
@@ -1035,10 +1137,12 @@ impl AnyStore {
                             }
                         }
                     }
-                    Ok::<(), ()>(())
+                    past_instance_cap(&was, doc, cap).map_err(|e| {
+                        refused = Some(e);
+                    })
                 })
                 .await;
-                Ok(())
+                refused.map_or(Ok(()), Err)
             }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p
@@ -1056,6 +1160,16 @@ impl AnyStore {
             AnyStore::Mem(s) => s.temporal_only = true,
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.temporal.temporal_only = true,
+        }
+        self
+    }
+
+    /// Cap the instances one Attribute's history may hold in the memory/file
+    /// store (`0` = none); the Postgres arm keeps history in rows and has no
+    /// such document to bound.
+    pub fn max_instances(mut self, cap: usize) -> Self {
+        if let AnyStore::Mem(s) = &mut self {
+            s.max_instances = cap;
         }
         self
     }
@@ -1092,6 +1206,29 @@ impl AnyStore {
         f: impl FnOnce(&mut Value) -> Result<T, E>,
     ) -> Result<Option<Result<T, E>>, NgsiError> {
         match self {
+            AnyStore::Mem(s) if kind == Kind::Temporal && s.max_instances > 0 => {
+                // The cap's refusal is no error of the closure: it aborts the
+                // write the same way and comes back as the store's own.
+                enum Refused<E> {
+                    Closure(E),
+                    Cap(NgsiError),
+                }
+                let cap = s.max_instances;
+                let r = s
+                    .mutate(tenant, kind, id, |doc| {
+                        let was = instance_counts(doc);
+                        let t = f(doc).map_err(Refused::Closure)?;
+                        past_instance_cap(&was, doc, cap).map_err(Refused::Cap)?;
+                        Ok(t)
+                    })
+                    .await;
+                match r {
+                    None => Ok(None),
+                    Some(Ok(t)) => Ok(Some(Ok(t))),
+                    Some(Err(Refused::Closure(e))) => Ok(Some(Err(e))),
+                    Some(Err(Refused::Cap(e))) => Err(e),
+                }
+            }
             AnyStore::Mem(s) => Ok(s.mutate(tenant, kind, id, f).await),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => match kind {
@@ -1104,7 +1241,7 @@ impl AnyStore {
                     let mut after: Option<Value> = None;
                     let r = p
                         .entities
-                        .mutate(tenant, id, |d| {
+                        .mutate_stamped(tenant, id, |d| {
                             before = Some(d.clone());
                             let r = f(d);
                             if r.is_ok() {
@@ -1114,9 +1251,14 @@ impl AnyStore {
                         })
                         .await
                         .map_err(db)?;
-                    if let (Some(Ok(_)), Some(a)) = (&r, after) {
+                    let (r, version) = match r {
+                        Some(Ok((t, v))) => (Some(Ok(t)), Some(v)),
+                        Some(Err(e)) => (Some(Err(e)), None),
+                        None => (None, None),
+                    };
+                    if let (Some(v), Some(a)) = (version, after) {
                         if before.as_ref() != Some(&a) {
-                            p.emit(tenant, before, Some(a)).await;
+                            p.emit(tenant, before, Some(a), v).await;
                         }
                     }
                     Ok(r)
@@ -1164,13 +1306,19 @@ impl AnyStore {
             AnyStore::Pg(p) => {
                 let out = p
                     .entities
-                    .batch_upsert_replace(tenant, &items)
+                    .batch_upsert_replace_stamped(tenant, &items)
                     .await
                     .map_err(db)?;
-                for ((_, doc), (_, prev)) in items.iter().zip(&out) {
-                    p.emit(tenant, prev.clone(), Some(doc.clone())).await;
+                for ((_, doc), (_, prev, v)) in items.iter().zip(&out) {
+                    p.emit(
+                        tenant,
+                        prev.clone(),
+                        Some(doc.clone()),
+                        v.clone().unwrap_or_default(),
+                    )
+                    .await;
                 }
-                Ok(out.into_iter().map(|(created, _)| created).collect())
+                Ok(out.into_iter().map(|(created, _, _)| created).collect())
             }
         }
     }
@@ -1195,21 +1343,22 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 // hook images captured inside the lock, same as single mutate
-                let mut images: Vec<(Value, Value)> = Vec::new();
-                let r = p
+                let mut images: Vec<(String, Value, Value)> = Vec::new();
+                let (r, versions) = p
                     .entities
-                    .batch_mutate(tenant, ids, |id, d| {
+                    .batch_mutate_stamped(tenant, ids, |id, d| {
                         let before = d.clone();
                         let r = f(id, d);
                         if r.is_ok() && *d != before {
-                            images.push((before, d.clone()));
+                            images.push((id.to_owned(), before, d.clone()));
                         }
                         r
                     })
                     .await
                     .map_err(db)?;
-                for (before, after) in images {
-                    p.emit(tenant, Some(before), Some(after)).await;
+                for (id, before, after) in images {
+                    let v = versions.get(&id).cloned().unwrap_or_default();
+                    p.emit(tenant, Some(before), Some(after), v).await;
                 }
                 Ok(r)
             }
@@ -2355,5 +2504,135 @@ mod temporal_only_tests {
             .await
             .expect("recorded");
         assert_eq!(doc["speed"][0]["value"], 1);
+    }
+}
+
+#[cfg(test)]
+mod instance_cap_tests {
+    use super::*;
+    use antares_model::TenantId;
+    use antares_store::TemporalDriverExt;
+
+    fn t() -> TenantId {
+        TenantId::new("capped").expect("tenant")
+    }
+
+    fn inst(i: usize) -> Value {
+        serde_json::json!({"instanceId": format!("urn:i:{i}"), "type": "Property", "value": i,
+                           "observedAt": format!("2026-01-01T00:00:{:02}Z", i % 60)})
+    }
+
+    async fn append(store: &AnyStore, i: usize) -> Result<(), NgsiError> {
+        let shell = serde_json::json!({"id": "urn:a", "type": ["T"]});
+        let adds = serde_json::json!({"speed": [inst(i)]});
+        store.temporal_append(&t(), "urn:a", &shell, &adds).await
+    }
+
+    async fn speed(store: &AnyStore) -> usize {
+        store
+            .get(&t(), Kind::Temporal, "urn:a")
+            .await
+            .expect("get")
+            .and_then(|d| d["speed"].as_array().map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    /// One Attribute's history in the memory/file store is bounded: the
+    /// append past the cap is refused with an error that says why, and
+    /// nothing of it is written. The auto-recording of Entity writes
+    /// takes this path.
+    #[tokio::test]
+    async fn an_append_past_the_instance_cap_is_refused_and_writes_nothing() {
+        let store = AnyStore::Mem(Store::default())
+            .temporal_only()
+            .max_instances(3);
+        for i in 0..3 {
+            append(&store, i).await.expect("under the cap");
+        }
+        assert_eq!(speed(&store).await, 3);
+        let refused = append(&store, 3).await;
+        assert!(
+            matches!(&refused, Err(NgsiError::BadRequestData(m)) if m.contains("3 instances")),
+            "{refused:?}"
+        );
+        assert_eq!(speed(&store).await, 3, "the refused append wrote");
+        // a correction of a held instance adds none and still lands
+        append(&store, 2)
+            .await
+            .expect("same instanceId, same count");
+        // no cap, no refusal
+        let open = AnyStore::Mem(Store::default()).temporal_only();
+        for i in 0..5 {
+            append(&open, i).await.expect("uncapped");
+        }
+        assert_eq!(speed(&open).await, 5);
+    }
+
+    /// A first append past the cap is refused before anything is stored:
+    /// no attribute-less Temporal Entity is left behind it.
+    #[tokio::test]
+    async fn a_refused_first_append_leaves_no_empty_temporal_shell() {
+        let store = AnyStore::Mem(Store::default())
+            .temporal_only()
+            .max_instances(2);
+        let shell = serde_json::json!({"id": "urn:a", "type": ["T"]});
+        let adds = serde_json::json!({"speed": [inst(0), inst(1), inst(2)]});
+        assert!(store
+            .temporal_append(&t(), "urn:a", &shell, &adds)
+            .await
+            .is_err());
+        assert!(store
+            .get(&t(), Kind::Temporal, "urn:a")
+            .await
+            .expect("get")
+            .is_none());
+    }
+
+    /// The temporal API's own writes (5.6.11 create, 5.6.12 add) go through
+    /// create and mutate: the same cap, the same refusal.
+    #[tokio::test]
+    async fn the_temporal_api_writes_hit_the_same_cap() {
+        use antares_store::TemporalDriver;
+        let store = AnyStore::Mem(Store::default())
+            .temporal_only()
+            .max_instances(3);
+        let doc = |n: usize| {
+            serde_json::json!({"id": "urn:a", "type": ["T"],
+                                               "speed": (0..n).map(inst).collect::<Vec<_>>()})
+        };
+        let refused = TemporalDriver::create(&store, &t(), "urn:a", doc(4)).await;
+        assert!(
+            matches!(refused, Err(NgsiError::BadRequestData(_))),
+            "{refused:?}"
+        );
+        assert_eq!(speed(&store).await, 0, "the refused create wrote");
+        assert!(TemporalDriver::create(&store, &t(), "urn:a", doc(3))
+            .await
+            .expect("create at the cap"));
+        let grow = TemporalDriverExt::mutate(&store, &t(), "urn:a", |d| {
+            if let Some(a) = d["speed"].as_array_mut() {
+                a.push(inst(9));
+            }
+            Ok::<(), ()>(())
+        })
+        .await;
+        assert!(
+            matches!(grow, Err(NgsiError::BadRequestData(_))),
+            "{grow:?}"
+        );
+        assert_eq!(speed(&store).await, 3, "the refused add wrote");
+        // the closure's own refusal still reaches its caller as its own
+        let own = TemporalDriverExt::mutate(&store, &t(), "urn:a", |_| Err::<(), _>("mine")).await;
+        assert!(matches!(own, Ok(Some(Err("mine")))), "{own:?}");
+        // deleting instances of a full history is never refused
+        let shrink = TemporalDriverExt::mutate(&store, &t(), "urn:a", |d| {
+            if let Some(a) = d["speed"].as_array_mut() {
+                a.pop();
+            }
+            Ok::<(), ()>(())
+        })
+        .await;
+        assert!(matches!(shrink, Ok(Some(Ok(())))), "{shrink:?}");
+        assert_eq!(speed(&store).await, 2);
     }
 }

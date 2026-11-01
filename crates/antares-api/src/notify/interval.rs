@@ -83,9 +83,9 @@ pub(super) async fn claim_interval(
 }
 
 /// Give a claimed firing back (5.8.6: nothing matched, so nothing was sent).
-/// The stamp returns to what [`claim_interval`] found, which both keeps
-/// `lastNotification` truthful and leaves the subscription due, exactly as
-/// the single-process path does.
+/// The stamp returns to what [`claim_interval`] found, which keeps
+/// `lastNotification` truthful exactly as the single-process path does; the
+/// sweep parks the subscription until its next interval in this pod's mirror.
 pub(super) async fn release_interval(
     st: &AppState,
     tenant: &TenantId,
@@ -148,253 +148,53 @@ pub async fn interval_tick(st: &AppState) {
     // Earliest next-due instant seen by this sweep, per half.
     let mut next_sub = i64::MAX;
     let mut next_csub = i64::MAX;
-    // One sweep visits every tenant, and a delivery costs up to the
-    // endpoint's whole timeout (Table 5.2.15-1, 30 s at the ceiling). Awaited
-    // in turn, one unresponsive endpoint becomes the deadline of every other
-    // subscriber's periodic notification. The deliveries of a tick therefore
-    // run together, under the same width the change path uses, and the tick
-    // still does not return until they have settled: ticks never overlap, so
-    // a subscription cannot be fired twice for one period.
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut sending = tokio::task::JoinSet::new();
-    for tenant_str in read_or_warn(
+    let tenants = read_or_warn(
         st.store.subscription_tenants().await,
         "the tenants with subscriptions",
-    ) {
-        let Ok(tenant) = TenantId::new_internal(&tenant_str) else {
-            continue;
+    )
+    .into_iter()
+    .filter_map(|t| TenantId::new_internal(&t).ok());
+    // Each Tenant is swept on its own task. A Tenant waits for its own share
+    // of the delivery width before it reads its next page, so a Tenant whose
+    // endpoint hangs holds that wait for up to the endpoint's whole timeout:
+    // swept in turn, every Tenant after it would wait as long, and one
+    // Tenant would set every other Tenant's periodic deadline.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut sweeps = tokio::task::JoinSet::new();
+        let mut fold = |joined: Option<Result<(i64, i64), tokio::task::JoinError>>| match joined {
+            Some(Ok((sub, csub))) => {
+                next_sub = next_sub.min(sub);
+                next_csub = next_csub.min(csub);
+            }
+            // a sweep that died decided nothing about its Tenant: the next
+            // tick sweeps again
+            Some(Err(_)) => {
+                note_panic();
+                next_sub = next_sub.min(now_ms);
+                next_csub = next_csub.min(now_ms);
+            }
+            None => {}
         };
-        // Same source the matcher reads: the indexed mirror, with the store
-        // list only as the never-wired fallback.
-        let subs = match (&st.sub_mirror, sweep_subs) {
-            (_, false) => Vec::new(),
-            (Some(m), _) => m.periodic_docs(tenant.as_str()),
-            (None, _) => read_or_warn(
-                st.store.list(&tenant, Kind::Subscription).await,
-                "the periodic Subscriptions",
-            )
-            .into_iter()
-            .map(Arc::new)
-            .collect(),
-        };
-        for sub in subs {
-            let Some(interval) = sub.get("timeInterval").and_then(Value::as_f64) else {
-                continue;
-            };
-            if !is_active(&sub) {
-                continue;
+        for tenant in tenants {
+            // ponytail: at most tenant_sweep_width() Tenants are swept at once
+            if sweeps.len() >= tenant_sweep_width() {
+                fold(sweeps.join_next().await);
             }
-            let due_at = due_at_ms(&sub, interval);
-            if now_ms < due_at {
-                next_sub = next_sub.min(due_at);
-                continue;
-            }
-            // Due: the following firing is one interval away. Recorded before
-            // the claim, so a pod that LOSES the race (another one is firing
-            // this subscription right now) keeps sweeping on the interval
-            // instead of parking on an anchor only the winner advanced.
-            next_sub = next_sub.min(now_ms.saturating_add(interval_offset_ms(interval)));
-            // a stored q that no longer parses (one percent-encoded before
-            // 5.2.12's read-as-written) matches nothing, as conditions_match
-            // decides: no Entity to read and no Notification to send, so
-            // nothing to claim either (the claim stamped
-            // lastNotification for a firing that never ran)
-            if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
-                continue;
-            }
-            let claim = if st.nats {
-                match claim_interval(st, &tenant, Kind::Subscription, &sub, interval).await {
-                    Some(prev) => Some(prev),
-                    None => continue,
-                }
-            } else {
-                None
-            };
-            let ctx = sub_context(st, &tenant, &sub).await;
-            let now = now_iso();
-            // 5.8.6: the periodic Notification "shall include all the
-            // subscribed Entities that match the query, geoquery and Scope
-            // query conditions" — so the read is exactly this subscription's
-            // own selector (5.2.33) and conditions, never the tenant's entity
-            // set. Only predicates a store reproduces without hiding a
-            // candidate are offered (ids when every selector entry names one,
-            // types when the index proves them plain, q/scopeQ/geoQ under the
-            // store's own rule that SQL removes rows and never decides them);
-            // the selector_match/conditions_match pair below stays the
-            // arbiter, exactly as on the query path.
-            let type_groups: Vec<Vec<String>> = match index_keys(&sub) {
-                Keys::Types(ts) => ts.into_iter().map(|t| vec![t]).collect(),
-                _ => Vec::new(),
-            };
-            let ids = selector_ids(&sub);
-            // The filter borrows a term expander that is not Sync, so it lives
-            // and dies inside this block: held across the delivery await it
-            // would make the whole interval task non-Send.
-            // the match set is read a page at a time and each
-            // page's matches leave as their own Notification, so a type-only
-            // selector over a large tenant never holds its whole set; a store
-            // that cannot decide the filter answers it whole, once.
-            let page_size = st.max_limit.max(1);
-            let mut offset = 0usize;
-            let mut sent = false;
-            loop {
-                let (rows, last) = {
-                    let expand = |t: &str| ctx.expand_key(t);
-                    let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
-                    // q is read as written (5.2.12); parses shared per distinct
-                    // expression text, as in conditions_match — the sweep
-                    // re-runs per due subscription
-                    let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
-                    let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
-                        let key = serde_json::to_string(g).unwrap_or_default();
-                        antares_ql::regex::geo_query(&key, || {
-                            antares_ql::geo::GeoQuery::from_params(&geo_params(g))
-                                .ok()
-                                .flatten()
-                        })
-                    });
-                    let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(&ctx));
-                    let filter = antares_store::filter::EntityFilter {
-                        ids: ids.as_ref().map(|_| id_refs.as_slice()),
-                        types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
-                        q: q_ast.as_deref(),
-                        scope_q: sub_str(&sub, "scopeQ"),
-                        geo: geo_spec.as_slice(),
-                        expand: &expand,
-                        page: Some(antares_store::filter::Page {
-                            offset: i64::try_from(offset).unwrap_or(i64::MAX),
-                            limit: i64::try_from(page_size).unwrap_or(i64::MAX),
-                            count: false,
-                        }),
-                        ..Default::default()
-                    };
-                    match st.store.query_entities(&tenant, &filter).await {
-                        Ok(o) => {
-                            let last = !o.paged || o.rows.len() < page_size;
-                            (o.rows, last)
-                        }
-                        Err(e) => {
-                            tracing::warn!("notification path: reading the Entities a periodic Subscription notifies about failed: {e}");
-                            (Vec::new(), true)
-                        }
-                    }
-                };
-                offset = offset.saturating_add(rows.len());
-                let mut matching: Vec<Value> = Vec::new();
-                for d in rows {
-                    if !selector_match(&sub, &d, &ctx)
-                        || !linked_eval(st, &tenant, None, |l| conditions_match(&sub, &d, &ctx, l))
-                            .await
-                    {
-                        continue;
-                    }
-                    matching.extend(
-                        build_data(st, &tenant, &sub, &ctx, None, Some(&d), &[], false, &now).await,
-                    );
-                }
-                if !matching.is_empty() {
-                    sent = true;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let (st, tenant, ctx, sub) =
-                            (st.clone(), tenant.clone(), Arc::clone(&ctx), sub.clone());
-                        sending.spawn(async move {
-                            let _permits = delivery_permits(&tenant).await;
-                            deliver(&st, &tenant, &sub, matching, &ctx).await;
-                        });
-                    }
-                    #[cfg(target_arch = "wasm32")]
-                    deliver(st, &tenant, &sub, matching, &ctx).await;
-                }
-                if last {
-                    break;
-                }
-            }
-            if !sent {
-                // 5.8.6: "If there are no matching Entities, no Notification
-                // is sent" — lastNotification stays untouched, so this
-                // subscription is still due and every following tick
-                // re-checks it. A claim taken to win the firing is given back
-                // here, or the multi-pod path would stamp an instant nothing
-                // was sent at and park the subscription for a whole interval.
-                if let (Some(prev), Some(id)) = (claim, sub.get("id").and_then(Value::as_str)) {
-                    release_interval(st, &tenant, Kind::Subscription, id, prev).await;
-                }
-                next_sub = next_sub.min(due_at);
-            }
+            let st = st.clone();
+            sweeps.spawn(async move {
+                sweep_tenant(&st, &tenant, now_ms, sweep_subs, sweep_csubs).await
+            });
         }
-        if !sweep_csubs {
-            continue;
-        }
-        // csource timeInterval subs: periodic CSourceNotification with all
-        // matching registrations, independent of changes (5.11.7)
-        for sub in read_or_warn(
-            docs_where(st, &tenant, Kind::CSourceSubscription, |s| {
-                s.get("timeInterval").is_some()
-            })
-            .await,
-            "the periodic Context Source Registration Subscriptions",
-        ) {
-            let Some(interval) = sub.get("timeInterval").and_then(Value::as_f64) else {
-                continue;
-            };
-            if !is_active(&sub) {
-                continue;
-            }
-            let due_at = due_at_ms(&sub, interval);
-            if now_ms < due_at {
-                next_csub = next_csub.min(due_at);
-                continue;
-            }
-            next_csub = next_csub.min(now_ms.saturating_add(interval_offset_ms(interval)));
-            // 5.11.7 sends the periodic CSourceNotification whatever the
-            // matching set is, so this claim is never given back.
-            if st.nats
-                && claim_interval(st, &tenant, Kind::CSourceSubscription, &sub, interval)
-                    .await
-                    .is_none()
-            {
-                continue;
-            }
-            let ctx = sub_context(st, &tenant, &sub).await;
-            let spec = crate::registry::spec_for_subscription(&sub);
-            let data: Vec<Value> = read_or_warn(
-                docs_where(st, &tenant, Kind::Registration, |r| {
-                    crate::registry::csr_matches_subscription(&sub, r, &ctx)
-                })
-                .await,
-                "the registrations a periodic Context Source Notification carries",
-            )
-            .into_iter()
-            .map(|r| {
-                let mut p = crate::registry::present_registration(
-                    &filter_csr(&spec, &r, &ctx),
-                    &ctx,
-                    false,
-                );
-                arrayify_entity_types(&mut p);
-                p
-            })
-            .collect();
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let (st, tenant, ctx) = (st.clone(), tenant.clone(), Arc::clone(&ctx));
-                sending.spawn(async move {
-                    // the Tenant's share and a slot, as for Subscriptions
-                    // (a bare slot let one Tenant hold them all)
-                    let _permits = delivery_permits(&tenant).await;
-                    deliver_csource(&st, &tenant, &sub, data, &ctx, "newlyMatching").await;
-                });
-            }
-            #[cfg(target_arch = "wasm32")]
-            deliver_csource(st, &tenant, &sub, data, &ctx, "newlyMatching").await;
+        while let Some(joined) = sweeps.join_next().await {
+            fold(Some(joined));
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    while let Some(joined) = sending.join_next().await {
-        if joined.is_err() {
-            note_panic();
-        }
+    #[cfg(target_arch = "wasm32")]
+    for tenant in tenants {
+        let (sub, csub) = sweep_tenant(st, &tenant, now_ms, sweep_subs, sweep_csubs).await;
+        next_sub = next_sub.min(sub);
+        next_csub = next_csub.min(csub);
     }
     if let (Some(m), Some((sub_clock, csub_clock))) = (&st.sub_mirror, clocks) {
         // A periodic subscription written DURING the sweep has already zeroed
@@ -413,5 +213,317 @@ pub async fn interval_tick(st: &AppState) {
                 Relaxed,
             );
         }
+    }
+}
+
+/// How many Tenants one interval sweep visits at once. Each one reads the
+/// store while it runs, so the width takes at most half the connection
+/// pool (`ANTARES_PG_POOL`, default 20, which the broker has validated) and
+/// never more than 8: the request path keeps the other half. A Tenant
+/// waiting for its delivery share holds no connection.
+#[cfg(not(target_arch = "wasm32"))]
+fn tenant_sweep_width() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| sweep_width_for(std::env::var("ANTARES_PG_POOL").ok().as_deref()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sweep_width_for(pool: Option<&str>) -> usize {
+    let pool = pool.and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
+    (pool / 2).clamp(1, 8)
+}
+
+/// One Tenant's half of [`interval_tick`]: fires its due periodic
+/// Subscriptions and Context Source Registration Subscriptions and answers
+/// the earliest instant each half can next be due. It returns when its
+/// deliveries have settled, so ticks never overlap and a subscription cannot
+/// be fired twice for one period.
+async fn sweep_tenant(
+    st: &AppState,
+    tenant: &TenantId,
+    now_ms: i64,
+    sweep_subs: bool,
+    sweep_csubs: bool,
+) -> (i64, i64) {
+    let tenant = tenant.clone();
+    let mut next_sub = i64::MAX;
+    let mut next_csub = i64::MAX;
+    // A delivery costs up to the endpoint's whole timeout (Table 5.2.15-1,
+    // 30 s at the ceiling). Awaited in turn, one unresponsive endpoint becomes
+    // the deadline of every other subscriber's periodic notification. The
+    // deliveries therefore run together, under the Tenant's share of the
+    // width the change path uses.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut sending = tokio::task::JoinSet::new();
+    // Same source the matcher reads: the indexed mirror, with the store
+    // list only as the never-wired fallback.
+    let subs = match (&st.sub_mirror, sweep_subs) {
+        (_, false) => Vec::new(),
+        (Some(m), _) => m.periodic_docs(tenant.as_str()),
+        (None, _) => read_or_warn(
+            st.store.list(&tenant, Kind::Subscription).await,
+            "the periodic Subscriptions",
+        )
+        .into_iter()
+        .map(Arc::new)
+        .collect(),
+    };
+    for sub in subs {
+        let Some(interval) = sub.get("timeInterval").and_then(Value::as_f64) else {
+            continue;
+        };
+        if !is_active(&sub) {
+            continue;
+        }
+        let sub_id = sub.get("id").and_then(Value::as_str).unwrap_or_default();
+        // a firing that had nothing to send ends that interval (below)
+        let quiet = st
+            .sub_mirror
+            .as_ref()
+            .and_then(|m| m.quiet_until(tenant.as_str(), sub_id));
+        let due_at = due_at_ms(&sub, interval).max(quiet.unwrap_or(i64::MIN));
+        if now_ms < due_at {
+            next_sub = next_sub.min(due_at);
+            continue;
+        }
+        // Due: the following firing is one interval away. Recorded before
+        // the claim, so a pod that LOSES the race (another one is firing
+        // this subscription right now) keeps sweeping on the interval
+        // instead of parking on an anchor only the winner advanced.
+        next_sub = next_sub.min(now_ms.saturating_add(interval_offset_ms(interval)));
+        // a stored q that no longer parses (one percent-encoded before
+        // 5.2.12's read-as-written) matches nothing, as conditions_match
+        // decides: no Entity to read and no Notification to send, so
+        // nothing to claim either (the claim stamped
+        // lastNotification for a firing that never ran)
+        if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
+            continue;
+        }
+        let claim = if st.nats {
+            match claim_interval(st, &tenant, Kind::Subscription, &sub, interval).await {
+                Some(prev) => Some(prev),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        let ctx = sub_context(st, &tenant, &sub).await;
+        let now = now_iso();
+        // 5.8.6: the periodic Notification "shall include all the
+        // subscribed Entities that match the query, geoquery and Scope
+        // query conditions" — so the read is exactly this subscription's
+        // own selector (5.2.33) and conditions, never the tenant's entity
+        // set. Only predicates a store reproduces without hiding a
+        // candidate are offered (ids when every selector entry names one,
+        // types when the index proves them plain, q/scopeQ/geoQ under the
+        // store's own rule that SQL removes rows and never decides them);
+        // the selector_match/conditions_match pair below stays the
+        // arbiter, exactly as on the query path.
+        let type_groups: Vec<Vec<String>> = match index_keys(&sub) {
+            Keys::Types(ts) => ts.into_iter().map(|t| vec![t]).collect(),
+            _ => Vec::new(),
+        };
+        let ids = selector_ids(&sub);
+        // The filter borrows a term expander that is not Sync, so it lives
+        // and dies inside this block: held across the delivery await it
+        // would make the whole interval task non-Send.
+        // the match set is read a page at a time and each
+        // page's matches leave as their own Notification, so a type-only
+        // selector over a large tenant never holds its whole set; a store
+        // that cannot decide the filter answers it whole, once.
+        let page_size = st.max_limit.max(1);
+        let mut offset = 0usize;
+        let mut sent = false;
+        loop {
+            let (rows, last) = {
+                let expand = |t: &str| ctx.expand_key(t);
+                let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
+                // q is read as written (5.2.12); parses shared per distinct
+                // expression text, as in conditions_match — the sweep
+                // re-runs per due subscription
+                let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
+                let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
+                    let key = serde_json::to_string(g).unwrap_or_default();
+                    antares_ql::regex::geo_query(&key, || {
+                        antares_ql::geo::GeoQuery::from_params(&geo_params(g))
+                            .ok()
+                            .flatten()
+                    })
+                });
+                let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(&ctx));
+                let filter = antares_store::filter::EntityFilter {
+                    ids: ids.as_ref().map(|_| id_refs.as_slice()),
+                    types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
+                    q: q_ast.as_deref(),
+                    scope_q: sub_str(&sub, "scopeQ"),
+                    geo: geo_spec.as_slice(),
+                    expand: &expand,
+                    page: Some(antares_store::filter::Page {
+                        offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                        limit: i64::try_from(page_size).unwrap_or(i64::MAX),
+                        count: false,
+                    }),
+                    ..Default::default()
+                };
+                match st.store.query_entities(&tenant, &filter).await {
+                    Ok(o) => {
+                        let last = !o.paged || o.rows.len() < page_size;
+                        (o.rows, last)
+                    }
+                    Err(e) => {
+                        tracing::warn!("notification path: reading the Entities a periodic Subscription notifies about failed: {e}");
+                        (Vec::new(), true)
+                    }
+                }
+            };
+            offset = offset.saturating_add(rows.len());
+            let mut matching: Vec<Value> = Vec::new();
+            for d in rows {
+                if !selector_match(&sub, &d, &ctx)
+                    || !linked_eval(st, &tenant, None, |l| conditions_match(&sub, &d, &ctx, l))
+                        .await
+                {
+                    continue;
+                }
+                matching.extend(
+                    build_data(st, &tenant, &sub, &ctx, None, Some(&d), &[], false, &now).await,
+                );
+            }
+            if !matching.is_empty() {
+                sent = true;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // The slot is taken BEFORE the next page is read: a
+                    // page waiting for one is a page held in memory, and
+                    // against a slow endpoint the read would run ahead to
+                    // the end of the match set.
+                    let permits = delivery_permits(&tenant).await;
+                    let (st, tenant, ctx, sub) =
+                        (st.clone(), tenant.clone(), Arc::clone(&ctx), sub.clone());
+                    sending.spawn(async move {
+                        let _permits = permits;
+                        deliver(&st, &tenant, &sub, matching, &ctx).await;
+                    });
+                }
+                #[cfg(target_arch = "wasm32")]
+                deliver(st, &tenant, &sub, matching, &ctx).await;
+            }
+            if last {
+                break;
+            }
+        }
+        if !sent {
+            // 5.8.6: "If there are no matching Entities, no Notification
+            // is sent" — lastNotification stays untouched, and a claim
+            // taken to win the firing is given back here, or the
+            // multi-pod path would stamp an instant nothing was sent at.
+            // The firing still happened: the next one is when the next
+            // interval is reached, so the subscription parks in the
+            // mirror until then instead of re-running its query on every
+            // tick (the clock above already points there). A write to it
+            // clears the park.
+            if let Some(prev) = claim {
+                release_interval(st, &tenant, Kind::Subscription, sub_id, prev).await;
+            }
+            match &st.sub_mirror {
+                Some(m) => m.park_quiet(
+                    tenant.as_str(),
+                    sub_id,
+                    &sub,
+                    now_ms.saturating_add(interval_offset_ms(interval)),
+                ),
+                None => next_sub = next_sub.min(due_at),
+            }
+        }
+    }
+    // csource timeInterval subs: periodic CSourceNotification with all
+    // matching registrations, independent of changes (5.11.7). Skipped by
+    // an empty list, not a return: the deliveries spawned above must settle
+    // below (a dropped JoinSet aborts them).
+    let csubs = if sweep_csubs {
+        read_or_warn(
+            docs_where(st, &tenant, Kind::CSourceSubscription, |s| {
+                s.get("timeInterval").is_some()
+            })
+            .await,
+            "the periodic Context Source Registration Subscriptions",
+        )
+    } else {
+        Vec::new()
+    };
+    for sub in csubs {
+        let Some(interval) = sub.get("timeInterval").and_then(Value::as_f64) else {
+            continue;
+        };
+        if !is_active(&sub) {
+            continue;
+        }
+        let due_at = due_at_ms(&sub, interval);
+        if now_ms < due_at {
+            next_csub = next_csub.min(due_at);
+            continue;
+        }
+        next_csub = next_csub.min(now_ms.saturating_add(interval_offset_ms(interval)));
+        // 5.11.7 sends the periodic CSourceNotification whatever the
+        // matching set is, so this claim is never given back.
+        if st.nats
+            && claim_interval(st, &tenant, Kind::CSourceSubscription, &sub, interval)
+                .await
+                .is_none()
+        {
+            continue;
+        }
+        let ctx = sub_context(st, &tenant, &sub).await;
+        let spec = crate::registry::spec_for_subscription(&sub);
+        let data: Vec<Value> = read_or_warn(
+            docs_where(st, &tenant, Kind::Registration, |r| {
+                crate::registry::csr_matches_subscription(&sub, r, &ctx)
+            })
+            .await,
+            "the registrations a periodic Context Source Notification carries",
+        )
+        .into_iter()
+        .map(|r| {
+            let mut p =
+                crate::registry::present_registration(&filter_csr(&spec, &r, &ctx), &ctx, false);
+            arrayify_entity_types(&mut p);
+            p
+        })
+        .collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // the Tenant's share and a slot, as for Subscriptions (a
+            // bare slot let one Tenant hold them all), taken before the
+            // next subscription's registrations are read
+            let permits = delivery_permits(&tenant).await;
+            let (st, tenant, ctx) = (st.clone(), tenant.clone(), Arc::clone(&ctx));
+            sending.spawn(async move {
+                let _permits = permits;
+                deliver_csource(&st, &tenant, &sub, data, &ctx, "newlyMatching").await;
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        deliver_csource(st, &tenant, &sub, data, &ctx, "newlyMatching").await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    while let Some(joined) = sending.join_next().await {
+        if joined.is_err() {
+            note_panic();
+        }
+    }
+    (next_sub, next_csub)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    /// SECV-03: the sweep never takes more than half a small pool, and
+    /// keeps 8 on the default one.
+    #[test]
+    fn the_sweep_width_leaves_the_request_path_half_the_pool() {
+        assert_eq!(super::sweep_width_for(None), 8);
+        assert_eq!(super::sweep_width_for(Some("20")), 8);
+        assert_eq!(super::sweep_width_for(Some("8")), 4);
+        assert_eq!(super::sweep_width_for(Some("2")), 1);
+        assert_eq!(super::sweep_width_for(Some("1")), 1);
     }
 }

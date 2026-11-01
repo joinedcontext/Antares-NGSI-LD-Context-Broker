@@ -317,3 +317,111 @@ async fn receiver_info_is_stored_encrypted() {
         .expect("clean");
     }
 }
+
+/// The stored text of one doc row, read past the store under its tenant.
+async fn raw_row(pool: &antares_sql::sqlx::PgPool, tenant: &str, sql: &str, id: &str) -> String {
+    let mut tx = pool.begin().await.expect("tx");
+    antares_sql::sqlx::query("SELECT set_config('antares.tenant', $1, true)")
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await
+        .expect("tenant setting");
+    let row: String = antares_sql::sqlx::query_scalar(antares_sql::sqlx::AssertSqlSafe(sql))
+        .bind(tenant)
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the row");
+    tx.commit().await.expect("commit");
+    row
+}
+
+/// A Snapshot's `receiverInfo` (Table 5.2.41-1) is the header set of its
+/// 5.16.6 notification, the same credential a Subscription's is: with
+/// ANTARES_SECRET_KEY the stored row holds ciphertext, the store reads it
+/// back opened, and the SnapshotNotification carries the real header.
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_receiver_info_is_stored_encrypted() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    antares_jsonld::allow_private_egress(true);
+    let pool = antares_sql::store::pg::connect(&url, 5)
+        .await
+        .expect("connect");
+    let key = antares_sql::store::pg::seal::SecretKey::from_base64(TEST_KEY).expect("key");
+    let store = antares_sql::store::any::AnyStore::Pg(
+        antares_sql::store::any::PgBackend::new(pool.clone()).with_secret_key(key),
+    );
+    let mut st = AppState::with_store(
+        "antares-sealed-snapshot".into(),
+        std::sync::Arc::new(store),
+        "postgres",
+    );
+    antares_api::wire(&mut st).await;
+    let tenant = format!("tn{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let (uri, mut received) = header_server().await;
+    let sid = "urn:ngsi-ld:Snapshot:sealed";
+    // a Tenant exists once something is stored in it (5.5.10)
+    let (status, body) = send_as(
+        &st,
+        &tenant,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        json!({"id": "urn:ngsi-ld:Building:snap", "type": "Building"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send_as(
+        &st,
+        &tenant,
+        "POST",
+        "/ngsi-ld/v1/snapshots",
+        json!({
+            "id": sid,
+            "type": "Snapshot",
+            "endpoint": uri,
+            "receiverInfo": [{"key": "Authorization", "value": TOKEN}],
+            "snapshotQueries": [{"type": "Query", "entities": [{"type": "Building"}]}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let auth = tokio::time::timeout(std::time::Duration::from_secs(10), received.recv())
+        .await
+        .expect("a SnapshotNotification within 10 s")
+        .expect("the receiver runs");
+    assert_eq!(auth, TOKEN);
+
+    let row = raw_row(
+        &pool,
+        &tenant,
+        "SELECT doc::text FROM snapshots WHERE tenant_id = $1 AND id = $2",
+        sid,
+    )
+    .await;
+    assert!(!row.contains("the-webhook-token"), "{row}");
+    assert!(row.contains("enc:v1:"), "{row}");
+    let tid = TenantId::new(&tenant).expect("tenant");
+    let doc = st
+        .store
+        .get(&tid, Kind::Snapshot, sid)
+        .await
+        .expect("store")
+        .expect("stored");
+    assert_eq!(doc["receiverInfo"][0]["value"], json!(TOKEN));
+
+    // the database is shared: a broker started there without this key
+    // would fail every read of the sealed row
+    for table in ["entities", "snapshots"] {
+        antares_sql::sqlx::query(antares_sql::sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE tenant_id = $1"
+        )))
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .expect("clean");
+    }
+}

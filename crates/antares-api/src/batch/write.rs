@@ -390,7 +390,11 @@ impl BatchRun<'_> {
                 }
                 Ok::<(), NgsiError>(())
             })
-            .await?;
+            .await;
+        let res = match res {
+            Ok(res) => res,
+            Err(e) => return self.step_failed(&ids, e).map(|()| Vec::new()),
+        };
         crate::history::settle_all(&ids, &res);
         let mut replaces = Vec::new();
         for ((id, expanded), r) in round.iter().zip(res) {
@@ -433,7 +437,11 @@ impl BatchRun<'_> {
                 *doc = replacement(src, doc, ts);
                 Ok::<(), NgsiError>(())
             })
-            .await?;
+            .await;
+        let res = match res {
+            Ok(res) => res,
+            Err(e) => return self.step_failed(&ids, e).map(|()| free),
+        };
         for (id, r) in ids.iter().zip(res) {
             match r {
                 Some(Ok(())) => self.out.succeed(id),
@@ -456,7 +464,10 @@ impl BatchRun<'_> {
         // the loop below only needs the ids, so the batch payload
         // is never deep-cloned on the ingest hot path.
         let ids: Vec<String> = replaces.iter().map(|(id, _)| id.clone()).collect();
-        let flags = self.st.store.batch_upsert(&self.tenant, replaces).await?;
+        let flags = match self.st.store.batch_upsert(&self.tenant, replaces).await {
+            Ok(flags) => flags,
+            Err(e) => return self.step_failed(&ids, e),
+        };
         for (id, created) in ids.into_iter().zip(flags) {
             self.out.succeed(&id);
             if created {
@@ -493,7 +504,11 @@ impl BatchRun<'_> {
                 }
                 Ok::<(), NgsiError>(())
             })
-            .await?;
+            .await;
+        let res = match res {
+            Ok(res) => res,
+            Err(e) => return self.step_failed(&ids, e),
+        };
         crate::history::settle_all(&ids, &res);
         for ((id, _), r) in round.iter().zip(res) {
             match r {
@@ -520,7 +535,10 @@ impl BatchRun<'_> {
             return Ok(());
         }
         let ids: Vec<String> = creates.iter().map(|(id, _)| id.clone()).collect();
-        let flags = self.st.store.batch_create(&self.tenant, creates).await?;
+        let flags = match self.st.store.batch_create(&self.tenant, creates).await {
+            Ok(flags) => flags,
+            Err(e) => return self.step_failed(&ids, e),
+        };
         for (id, created) in ids.into_iter().zip(flags) {
             if created {
                 self.out.succeed(&id);
@@ -531,6 +549,23 @@ impl BatchRun<'_> {
                     &NgsiError::AlreadyExists(format!("entity {id} already exists")),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// A store error in one step (one transaction) of the batch. Before any
+    /// member succeeded it is the request's answer, as it always was; after
+    /// one did, that member's write stands, so the members of this step go to
+    /// E with the error and the batch goes on to its 207 (5.6.7.4, 5.6.8.4:
+    /// a BatchEntityError per Entity whose write failed). A whole-request
+    /// error there told the client nothing was applied, and its retry
+    /// replayed what was.
+    fn step_failed(&mut self, ids: &[String], e: NgsiError) -> Result<(), NgsiError> {
+        if self.out.success.is_empty() {
+            return Err(e);
+        }
+        for id in ids {
+            self.out.errors.push(err_entry(Some(id), &e));
         }
         Ok(())
     }

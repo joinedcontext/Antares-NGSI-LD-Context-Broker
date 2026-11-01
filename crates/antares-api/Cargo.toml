@@ -167,6 +167,11 @@ path = "tests/fed_bounds_5_7.rs"
 
 [[test]]
 # own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "admin_auth_subject"
+path = "tests/admin_auth_subject.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
 name = "facade_seam_f0"
 path = "tests/facade_seam_f0.rs"
 

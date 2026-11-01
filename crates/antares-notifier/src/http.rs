@@ -26,6 +26,34 @@ impl HttpSink {
     }
 }
 
+/// An absolute http(s) URL with an authority and a host, the only endpoint
+/// this binding can send to. Every other form is BadRequestData, whose
+/// message names the URI with any userinfo stripped: it travels back in
+/// `detail` (5.5.3). `http:user:pass@host` (no `//`) is refused here, and
+/// its credential is not echoed.
+pub fn check_endpoint(uri: &str) -> Result<(), NgsiError> {
+    let safe = crate::redact_userinfo(uri);
+    // IETF RFC 3986 3.1: scheme names are case-insensitive, and
+    // `SinkRegistry::scheme_of` already lowercases to pick this sink.
+    let rest = uri
+        .split_once("://")
+        .filter(|(s, _)| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| {
+            NgsiError::BadRequestData(format!("not an http(s) endpoint URI: {safe:?}"))
+        })?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = rest[..authority_end]
+        .rsplit_once('@')
+        .map_or(&rest[..authority_end], |(_, h)| h);
+    if host.is_empty() {
+        return Err(NgsiError::BadRequestData(format!(
+            "http endpoint {safe:?} has no host"
+        )));
+    }
+    Ok(())
+}
+
 impl NotificationSink for HttpSink {
     fn schemes(&self) -> &'static [&'static str] {
         &["http", "https"]
@@ -34,26 +62,7 @@ impl NotificationSink for HttpSink {
     /// 5.2.15: the endpoint URI has to be dereferenceable — for this binding,
     /// an absolute http(s) URL with an authority.
     fn parse_endpoint(&self, uri: &str, _notifier_info: &[(&str, &str)]) -> Result<(), NgsiError> {
-        let safe = crate::redact_userinfo(uri);
-        // IETF RFC 3986 3.1: scheme names are case-insensitive, and
-        // `SinkRegistry::scheme_of` already lowercases to pick this sink.
-        let rest = uri
-            .split_once("://")
-            .filter(|(s, _)| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"))
-            .map(|(_, rest)| rest)
-            .ok_or_else(|| {
-                NgsiError::BadRequestData(format!("not an http(s) endpoint URI: {safe:?}"))
-            })?;
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let host = rest[..authority_end]
-            .rsplit_once('@')
-            .map_or(&rest[..authority_end], |(_, h)| h);
-        if host.is_empty() {
-            return Err(NgsiError::BadRequestData(format!(
-                "http endpoint {safe:?} has no host"
-            )));
-        }
-        Ok(())
+        check_endpoint(uri)
     }
 
     fn deliver<'a>(

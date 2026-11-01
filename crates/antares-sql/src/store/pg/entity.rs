@@ -13,6 +13,7 @@
 
 use antares_model::{NgsiError, TenantId};
 use antares_ql::{CmpOp, QNode, QValue};
+use antares_store::ChangeVersion;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -147,6 +148,16 @@ fn first_instance_expiry(doc: &Value) -> Option<String> {
         .filter_map(|inst| inst.get("expiresAt").and_then(Value::as_str))
         .min_by_key(|s| antares_model::dt_key(s))
         .map(|s| antares_store::filter::canonical_datetime(s).into_owned())
+}
+
+/// The [`ChangeVersion`] of a delete whose `RETURNING` row is `r` (version
+/// at 2, `created_at::text` at 3): one past the version it removed, so it
+/// orders after that row's last write.
+fn deleted_version(r: &sqlx::postgres::PgRow) -> ChangeVersion {
+    ChangeVersion {
+        incarnation: r.get(3),
+        version: r.get::<i64, _>(2).saturating_add(1),
+    }
 }
 
 /// The outbox row's event JSON: what the drain turns into a
@@ -759,11 +770,22 @@ impl PgEntityStore {
         id: &str,
         doc: &Value,
     ) -> Result<bool, sqlx::Error> {
+        Ok(self.create_stamped(tenant, id, doc).await?.is_some())
+    }
+
+    /// [`Self::create`] with the created row's [`ChangeVersion`] for the
+    /// change hook, `None` when the id is taken.
+    pub async fn create_stamped(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        doc: &Value,
+    ) -> Result<Option<ChangeVersion>, sqlx::Error> {
         let e = extract(doc);
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
-        let done = sqlx::query(
+        let created = sqlx::query(
             "INSERT INTO entities
                (tenant_id, id, entity, types, scopes, created_at, modified_at, expires_at,
                 location, location_ambiguous, attrs_expire_at)
@@ -781,7 +803,8 @@ impl PgEntityStore {
                location_ambiguous = EXCLUDED.location_ambiguous,
                attrs_expire_at = EXCLUDED.attrs_expire_at,
                version = 1
-             WHERE entities.expires_at IS NOT NULL AND entities.expires_at <= now()",
+             WHERE entities.expires_at IS NOT NULL AND entities.expires_at <= now()
+             RETURNING created_at::text",
         )
         .bind(tenant.as_str())
         .bind(id)
@@ -794,10 +817,13 @@ impl PgEntityStore {
         .bind(&e.location)
         .bind(e.location_ambiguous)
         .bind(&e.attrs_expire)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?
-        .rows_affected();
-        if done == 1 && self.outbox_on() {
+        .map(|r| ChangeVersion {
+            incarnation: r.get(0),
+            version: 1,
+        });
+        if created.is_some() && self.outbox_on() {
             enqueue_change(
                 &mut tx,
                 tenant,
@@ -812,7 +838,7 @@ impl PgEntityStore {
             .await?;
         }
         tx.commit().await?;
-        Ok(done == 1)
+        Ok(created)
     }
 
     pub async fn get(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -1010,6 +1036,16 @@ impl PgEntityStore {
     /// Returns the deleted document (the before-image, captured in the same
     /// transaction as the DELETE — never re-read outside it), `None` = absent.
     pub async fn delete(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
+        Ok(self.delete_stamped(tenant, id).await?.map(|(prev, _)| prev))
+    }
+
+    /// [`Self::delete`] with the delete's [`ChangeVersion`]: one past the
+    /// deleted row's version, in its incarnation.
+    pub async fn delete_stamped(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+    ) -> Result<Option<(Value, ChangeVersion)>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         // 4.22: an already-expired row is invalid, so deleting it is a
@@ -1042,7 +1078,7 @@ impl PgEntityStore {
                 )
                 .await?;
             }
-            prev_out = Some(prev);
+            prev_out = Some((prev, deleted_version(r)));
         }
         tx.commit().await?;
         Ok(prev_out)
@@ -1064,6 +1100,19 @@ impl PgEntityStore {
         id: &str,
         keep: &(dyn for<'v> Fn(&'v Value) -> bool + Sync),
     ) -> Result<Option<Value>, sqlx::Error> {
+        Ok(self
+            .delete_if_stamped(tenant, id, keep)
+            .await?
+            .map(|(prev, _)| prev))
+    }
+
+    /// [`Self::delete_if`] with the delete's [`ChangeVersion`].
+    pub async fn delete_if_stamped(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        keep: &(dyn for<'v> Fn(&'v Value) -> bool + Sync),
+    ) -> Result<Option<(Value, ChangeVersion)>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let row = sqlx::query(
@@ -1099,8 +1148,9 @@ impl PgEntityStore {
             )
             .await?;
         }
+        let version = deleted_version(r);
         tx.commit().await?;
-        Ok(Some(prev))
+        Ok(Some((prev, version)))
     }
 
     /// Query pushdown. The predicates that compile EXACTLY go to
@@ -1585,6 +1635,20 @@ impl PgEntityStore {
         id: &str,
         f: impl FnOnce(&mut Value) -> Result<T, E>,
     ) -> Result<Option<Result<T, E>>, sqlx::Error> {
+        Ok(self
+            .mutate_stamped(tenant, id, f)
+            .await?
+            .map(|r| r.map(|(t, _)| t)))
+    }
+
+    /// [`Self::mutate`] with the version the write left, read under its
+    /// row lock.
+    pub async fn mutate_stamped<T, E>(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        f: impl FnOnce(&mut Value) -> Result<T, E>,
+    ) -> Result<Option<Result<(T, ChangeVersion), E>>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         // 4.22: an expired row is invalid, so a patch of it is a 404 —
@@ -1645,7 +1709,13 @@ impl PgEntityStore {
                     .await?;
                 }
                 tx.commit().await?;
-                Ok(Some(Ok(t)))
+                Ok(Some(Ok((
+                    t,
+                    ChangeVersion {
+                        version: updated.get(0),
+                        incarnation: updated.get(1),
+                    },
+                ))))
             }
             Err(e) => {
                 tx.rollback().await?;
@@ -1671,6 +1741,20 @@ impl PgEntityStore {
         tenant: &TenantId,
         items: &[(String, Value)],
     ) -> Result<Vec<bool>, sqlx::Error> {
+        Ok(self
+            .batch_create_stamped(tenant, items)
+            .await?
+            .into_iter()
+            .map(|v| v.is_some())
+            .collect())
+    }
+
+    /// [`Self::batch_create`] with each created row's [`ChangeVersion`].
+    pub async fn batch_create_stamped(
+        &self,
+        tenant: &TenantId,
+        items: &[(String, Value)],
+    ) -> Result<Vec<Option<ChangeVersion>>, sqlx::Error> {
         let mut seen = std::collections::HashSet::new();
         let mut payload = Vec::new();
         for (id, doc) in items {
@@ -1713,19 +1797,21 @@ impl PgEntityStore {
                     attrs_expire_at = EXCLUDED.attrs_expire_at,
                     version = 1
              WHERE entities.expires_at IS NOT NULL AND entities.expires_at <= now()
-             RETURNING id",
+             RETURNING id, created_at::text",
         )
         .bind(tenant.as_str())
         .bind(Value::Array(payload))
         .fetch_all(&mut *tx)
         .await?;
-        let created_now: std::collections::HashSet<String> =
-            rows.into_iter().map(|r| r.get::<String, _>(0)).collect();
+        let mut created_now: std::collections::HashMap<String, String> = rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect();
         if self.outbox_on() {
             let mut seen_ev = std::collections::HashSet::new();
             let mut events = Vec::new();
             for (id, doc) in items {
-                if created_now.contains(id.as_str()) && seen_ev.insert(id.as_str()) {
+                if created_now.contains_key(id.as_str()) && seen_ev.insert(id.as_str()) {
                     let e = extract(doc);
                     events.push(change_event(
                         tenant,
@@ -1742,11 +1828,17 @@ impl PgEntityStore {
             super::outbox::enqueue_many(&mut tx, tenant, &events).await?;
         }
         tx.commit().await?;
-        let mut created = created_now;
         // consume-once: a duplicate of a created id still reports false
         Ok(items
             .iter()
-            .map(|(id, _)| created.remove(id.as_str()))
+            .map(|(id, _)| {
+                created_now
+                    .remove(id.as_str())
+                    .map(|incarnation| ChangeVersion {
+                        incarnation,
+                        version: 1,
+                    })
+            })
             .collect())
     }
 
@@ -1762,6 +1854,20 @@ impl PgEntityStore {
         tenant: &TenantId,
         ids: &[String],
     ) -> Result<Vec<(String, Value)>, sqlx::Error> {
+        Ok(self
+            .batch_delete_stamped(tenant, ids)
+            .await?
+            .into_iter()
+            .map(|(id, prev, _)| (id, prev))
+            .collect())
+    }
+
+    /// [`Self::batch_delete`] with each delete's [`ChangeVersion`].
+    pub async fn batch_delete_stamped(
+        &self,
+        tenant: &TenantId,
+        ids: &[String],
+    ) -> Result<Vec<(String, Value, ChangeVersion)>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
@@ -1796,8 +1902,14 @@ impl PgEntityStore {
         }
         tx.commit().await?;
         Ok(rows
-            .into_iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<Value, _>(1)))
+            .iter()
+            .map(|r| {
+                let v = ChangeVersion {
+                    incarnation: r.get(4),
+                    version: r.get::<i64, _>(3).saturating_add(1),
+                };
+                (r.get::<String, _>(0), r.get::<Value, _>(1), v)
+            })
             .collect())
     }
 
@@ -1821,6 +1933,21 @@ impl PgEntityStore {
         tenant: &TenantId,
         items: &[(String, Value)],
     ) -> Result<Vec<(bool, Option<Value>)>, sqlx::Error> {
+        Ok(self
+            .batch_upsert_replace_stamped(tenant, items)
+            .await?
+            .into_iter()
+            .map(|(created, prev, _)| (created, prev))
+            .collect())
+    }
+
+    /// [`Self::batch_upsert_replace`] with each written row's
+    /// [`ChangeVersion`].
+    pub async fn batch_upsert_replace_stamped(
+        &self,
+        tenant: &TenantId,
+        items: &[(String, Value)],
+    ) -> Result<Vec<(bool, Option<Value>, Option<ChangeVersion>)>, sqlx::Error> {
         let mut seen = std::collections::HashSet::new();
         let mut payload = Vec::new();
         let mut ids = Vec::new();
@@ -1896,11 +2023,16 @@ impl PgEntityStore {
         .bind(Value::Array(payload))
         .fetch_all(&mut *tx)
         .await?;
-        let mut created: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut created: std::collections::HashMap<String, (bool, ChangeVersion)> =
+            std::collections::HashMap::new();
         let mut events = Vec::new();
         for r in &rows {
             let id: String = r.get(0);
             let inserted: bool = r.get(1);
+            let version = ChangeVersion {
+                version: r.get(2),
+                incarnation: r.get(3),
+            };
             // the id came out of `items`, so the lookup answers; an
             // outbox row for a document that is not there would carry no
             // payload, so there is nothing to emit either way
@@ -1920,17 +2052,17 @@ impl PgEntityStore {
                     r.get::<&str, _>(3),
                 ));
             }
-            created.insert(id, inserted);
+            created.insert(id, (inserted, version));
         }
         super::outbox::enqueue_many(&mut tx, tenant, &events).await?;
         tx.commit().await?;
         Ok(items
             .iter()
             .map(|(id, _)| {
-                (
-                    created.get(id).copied().unwrap_or(false),
-                    prevs.get(id).cloned(),
-                )
+                let (inserted, version) = created
+                    .get(id)
+                    .map_or((false, None), |(c, v)| (*c, Some(v.clone())));
+                (inserted, prevs.get(id).cloned(), version)
             })
             .collect())
     }
@@ -1945,8 +2077,25 @@ impl PgEntityStore {
         &self,
         tenant: &TenantId,
         ids: &[String],
-        mut f: impl FnMut(&str, &mut Value) -> Result<(), E>,
+        f: impl FnMut(&str, &mut Value) -> Result<(), E>,
     ) -> Result<Vec<Option<Result<(), E>>>, sqlx::Error> {
+        Ok(self.batch_mutate_stamped(tenant, ids, f).await?.0)
+    }
+
+    /// [`Self::batch_mutate`] with the [`ChangeVersion`] of each row written.
+    #[allow(clippy::type_complexity)] // the plain results and their versions
+    pub async fn batch_mutate_stamped<E>(
+        &self,
+        tenant: &TenantId,
+        ids: &[String],
+        mut f: impl FnMut(&str, &mut Value) -> Result<(), E>,
+    ) -> Result<
+        (
+            Vec<Option<Result<(), E>>>,
+            std::collections::HashMap<String, ChangeVersion>,
+        ),
+        sqlx::Error,
+    > {
         let mut tx = self.begin_batch().await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
@@ -2014,6 +2163,7 @@ impl PgEntityStore {
                 })
             })
             .collect();
+        let mut versions = std::collections::HashMap::new();
         if !payload.is_empty() {
             let updated = sqlx::query(
                 "UPDATE entities t SET
@@ -2038,21 +2188,24 @@ impl PgEntityStore {
             .bind(Value::Array(payload))
             .fetch_all(&mut *tx)
             .await?;
+            versions = updated
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<String, _>(0),
+                        ChangeVersion {
+                            version: r.get(1),
+                            incarnation: r.get(2),
+                        },
+                    )
+                })
+                .collect();
             if self.outbox_on() {
-                let meta: std::collections::HashMap<String, (i64, String)> = updated
-                    .into_iter()
-                    .map(|r| {
-                        (
-                            r.get::<String, _>(0),
-                            (r.get::<i64, _>(1), r.get::<String, _>(2)),
-                        )
-                    })
-                    .collect();
                 let events: Vec<Value> = changed
                     .iter()
                     .filter_map(|(id, before, after)| {
                         let e = extract(after);
-                        let (version, incarnation) = meta.get(id)?;
+                        let v = versions.get(id)?;
                         Some(change_event(
                             tenant,
                             "update",
@@ -2060,8 +2213,8 @@ impl PgEntityStore {
                             &e.types,
                             Some(before),
                             Some(after),
-                            *version,
-                            incarnation,
+                            v.version,
+                            &v.incarnation,
                         ))
                     })
                     .collect();
@@ -2069,7 +2222,7 @@ impl PgEntityStore {
             }
         }
         tx.commit().await?;
-        Ok(results)
+        Ok((results, versions))
     }
 
     /// Current row version (test hook for the version-monotonicity assertions).

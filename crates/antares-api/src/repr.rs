@@ -1085,6 +1085,9 @@ struct JoinWalk {
     /// The request's headers when distributed operations are on: a target
     /// held by a registered source is then read through its registration.
     remote: Option<axum::http::HeaderMap>,
+    /// simplified (keyValues): the Linking Entity's Relationships, read off
+    /// the Entity it was rendered from; taken by the walk's first level.
+    root_links: Option<std::collections::BTreeSet<String>>,
 }
 
 impl JoinWalk {
@@ -1104,13 +1107,16 @@ impl JoinWalk {
             budget,
             complete: true,
             remote: None,
+            root_links: None,
         }
     }
 }
 
 /// Linked Entity Retrieval, inline form (4.5.23.2): embed each relationship
 /// target under an "entity" member (normalized) or replace the object URI by
-/// the linked entity representation (simplified). Operates on COMPACTED docs.
+/// the linked entity representation (simplified). Operates on COMPACTED docs;
+/// `stored` is the Entity `compacted` was rendered from, in its internal
+/// form, which still tells a Relationship from a Property holding a URI.
 /// Returns false when 4.5.23.1 truncated the walk (loop, duplicate, budget).
 pub async fn inline_join(
     st: &AppState,
@@ -1118,6 +1124,7 @@ pub async fn inline_join(
     ctx: &antares_jsonld::Context,
     repr: &crate::repr::Repr,
     compacted: &mut Value,
+    stored: &Value,
     level: usize,
 ) -> bool {
     inline_join_beyond(
@@ -1126,6 +1133,7 @@ pub async fn inline_join(
         ctx,
         repr,
         compacted,
+        stored,
         level,
         &[],
         &mut { MAX_JOIN_LOOKUPS },
@@ -1145,17 +1153,26 @@ pub async fn inline_join_beyond(
     ctx: &antares_jsonld::Context,
     repr: &crate::repr::Repr,
     compacted: &mut Value,
+    stored: &Value,
     level: usize,
     contained_by: &[String],
     budget: &mut usize,
     remote: Option<&axum::http::HeaderMap>,
 ) -> bool {
     let mut walk = JoinWalk::rooted(
-        compacted.get("id").and_then(Value::as_str),
+        stored
+            .get("id")
+            .or_else(|| compacted.get("id"))
+            .and_then(Value::as_str),
         contained_by,
         *budget,
     );
     walk.remote = remote.cloned();
+    // simplified, the Linking Entity's Relationships are read off the form
+    // it was rendered from: a re-read by the rendered `id` found nothing
+    // when a projection had taken the `id` out (every URI-valued Property
+    // was then joined) or when the Entity came from a Context Source
+    walk.root_links = repr.key_values.then(|| linking_attrs(stored));
     inline_join_walk(st, tenant, ctx, repr, compacted, level, &mut walk).await;
     *budget = walk.budget;
     walk.complete
@@ -1187,12 +1204,17 @@ fn segment(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 
-/// The join slots of one compacted document, in document order.
+/// The join slots of one compacted document, in document order. `links`
+/// = the expanded Attributes of the Entity that are Relationships, which a
+/// simplified document can no longer tell from a Property holding a URI
+/// string ([`linking_attrs`]); `None` for a normalized one, whose
+/// instances say it themselves.
 fn slots_of(
     ctx: &antares_jsonld::Context,
     repr: &crate::repr::Repr,
     doc: &Value,
     at: &str,
+    links: Option<&std::collections::BTreeSet<String>>,
 ) -> Vec<Slot> {
     let mut out = Vec::new();
     let Some(obj) = doc.as_object() else {
@@ -1203,7 +1225,11 @@ fn slots_of(
         if metas.contains(&k.as_str()) {
             continue;
         }
-        let child = joined_repr(repr, k, &ctx.expand_key(k));
+        let iri = ctx.expand_key(k);
+        if links.is_some_and(|l| !l.contains(&iri)) {
+            continue;
+        }
+        let child = joined_repr(repr, k, &iri);
         slots_in(repr, &child, v, format!("{at}/{}", segment(k)), &mut out);
     }
     out
@@ -1229,7 +1255,20 @@ fn slots_in(
                 slots_in(repr, child, item, format!("{at}/{i}"), out);
             }
         }
-        Value::Object(_) if repr.key_values => {}
+        // 4.5.4 simplified multi-attribute: one value per datasetId
+        Value::Object(o) if repr.key_values => {
+            if let Some(Value::Object(ds)) = o.get("dataset") {
+                for (id, one) in ds {
+                    slots_in(
+                        repr,
+                        child,
+                        one,
+                        format!("{at}/dataset/{}", segment(id)),
+                        out,
+                    );
+                }
+            }
+        }
         Value::Object(inst) => {
             // 4.5.22.2: the compacted objectList carries {"object": URI}
             // entries (or bare URIs).
@@ -1284,12 +1323,13 @@ async fn inline_join_walk(
     level: usize,
     walk: &mut JoinWalk,
 ) {
-    let mut frontier = vec![(String::new(), repr.clone(), level)];
+    let links = walk.root_links.take();
+    let mut frontier = vec![(String::new(), repr.clone(), level, links)];
     while !frontier.is_empty() {
         let mut next = Vec::new();
-        for (at, repr, level) in frontier {
+        for (at, repr, level, links) in frontier {
             let slots = match compacted.pointer(&at) {
-                Some(doc) => slots_of(ctx, &repr, doc, &at),
+                Some(doc) => slots_of(ctx, &repr, doc, &at, links.as_ref()),
                 None => continue,
             };
             for slot in slots {
@@ -1308,7 +1348,8 @@ async fn inline_join_walk(
                     continue;
                 };
                 let single = joined.len() == 1;
-                let (docs, expand): (Vec<Value>, Vec<bool>) = joined.into_iter().unzip();
+                let (docs, expand): (Vec<Value>, Vec<(bool, Option<_>)>) =
+                    joined.into_iter().map(|(d, e, l)| (d, (e, l))).unzip();
                 let at = match slot.kind {
                     SlotKind::Replace => {
                         *place = docs.into_iter().next().unwrap_or(Value::Null);
@@ -1342,9 +1383,9 @@ async fn inline_join_walk(
                             .collect()
                     }
                 };
-                for (child_at, expand) in at.into_iter().zip(expand) {
+                for (child_at, (expand, links)) in at.into_iter().zip(expand) {
                     if expand {
-                        next.push((child_at, slot.child.clone(), level.saturating_sub(1)));
+                        next.push((child_at, slot.child.clone(), level.saturating_sub(1), links));
                     }
                 }
             }
@@ -1353,10 +1394,29 @@ async fn inline_join_walk(
     }
 }
 
+/// The expanded Attributes of an Entity (as stored) that are Relationships
+/// or ListRelationships: an instance with an `object` or an `objectList`.
+fn linking_attrs(doc: &Value) -> std::collections::BTreeSet<String> {
+    doc.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| {
+            !is_meta(k)
+                && v.as_array().is_some_and(|insts| {
+                    insts
+                        .iter()
+                        .any(|i| i.get("object").is_some() || i.get("objectList").is_some())
+                })
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 /// One Linked Entity read under the walk's budget and the narrowing: the
-/// compacted target, and whether its own links are expanded (the first time
-/// it is met, while depth remains). A target outside the narrowing reads as
-/// absent, like a dangling link.
+/// compacted target, whether its own links are expanded (the first time
+/// it is met, while depth remains) and, simplified, its Relationships
+/// ([`slots_of`]). A target outside the narrowing reads as absent, like a
+/// dangling link.
 async fn lookup_joined(
     st: &AppState,
     tenant: &TenantId,
@@ -1365,7 +1425,7 @@ async fn lookup_joined(
     id: &str,
     level: usize,
     walk: &mut JoinWalk,
-) -> Option<(Value, bool)> {
+) -> Option<(Value, bool, Option<std::collections::BTreeSet<String>>)> {
     if walk.budget == 0 {
         walk.complete = false;
         return None;
@@ -1382,6 +1442,7 @@ async fn lookup_joined(
     }
     let shaped = apply(&target, child);
     let c = compact_for(child, &shaped, ctx);
+    let links = child.key_values.then(|| linking_attrs(&target));
     let mut expand = false;
     if level > 1 {
         if walk.seen.insert(id.to_owned()) {
@@ -1392,7 +1453,7 @@ async fn lookup_joined(
             walk.complete = false;
         }
     }
-    Some((c, expand))
+    Some((c, expand, links))
 }
 
 /// 4.5.23.1 (TS 104 175 7.7.1): "Only Relationships targeting a locally

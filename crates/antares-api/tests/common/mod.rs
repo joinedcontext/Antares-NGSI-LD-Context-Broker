@@ -34,9 +34,17 @@ pub struct Double {
     rows_read: AtomicUsize,
     registration_reads: AtomicUsize,
     tenant_probes: AtomicUsize,
+    /// The change hook the API installed, so a test can call it the way a
+    /// driver would.
+    hook: std::sync::Mutex<Option<antares_store::ChangeHook>>,
 }
 
 impl Double {
+    /// The change hook the API installed through this driver.
+    pub fn change_hook(&self) -> Option<antares_store::ChangeHook> {
+        self.hook.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     /// `list` fails its first `n` calls and then behaves. It stands for both
     /// reachable causes at once: the transient connection failure, and the
     /// `TooManyResults` ceiling a tenant crosses and then drops back under.
@@ -56,6 +64,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -79,6 +88,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -102,6 +112,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -127,6 +138,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -164,6 +176,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -187,12 +200,15 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
-    /// The INSERT (create or upsert) of one document fails while the rest of the store keeps
+    /// The INSERT (create or upsert) of one document, or its conditional
+    /// delete, fails while the rest of the store keeps
     /// working — a backend that refuses one write, or loses the connection
-    /// between two of them. A caller that discards the result writes nothing
+    /// between two of them. A multi-row create or upsert holding it fails
+    /// whole, as its one transaction would. A caller that discards the result writes nothing
     /// and reports the document as stored.
     pub fn refusing_create(inner: Arc<dyn CurrentStateDriver>, kind: Kind, id: &str) -> Self {
         Self {
@@ -210,6 +226,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -338,6 +355,7 @@ impl CurrentStateDriver for Double {
         self.inner.close().await;
     }
     fn set_change_hook(&self, h: antares_store::ChangeHook) {
+        *self.hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(h.clone());
         self.inner.set_change_hook(h);
     }
     async fn create(
@@ -356,6 +374,9 @@ impl CurrentStateDriver for Double {
         tenant: &TenantId,
         items: Vec<(String, Value)>,
     ) -> Result<Vec<bool>, NgsiError> {
+        for (id, _) in &items {
+            self.refused_create(Kind::Entity, id)?;
+        }
         self.inner.batch_create(tenant, items).await
     }
     async fn batch_delete(
@@ -370,6 +391,9 @@ impl CurrentStateDriver for Double {
         tenant: &TenantId,
         items: Vec<(String, Value)>,
     ) -> Result<Vec<bool>, NgsiError> {
+        for (id, _) in &items {
+            self.refused_create(Kind::Entity, id)?;
+        }
         self.inner.batch_upsert(tenant, items).await
     }
     async fn upsert(
@@ -410,6 +434,7 @@ impl CurrentStateDriver for Double {
         keep: &(dyn for<'v> Fn(&'v Value) -> bool + Sync),
     ) -> Result<bool, NgsiError> {
         self.race(tenant, Kind::Entity, id).await?;
+        self.refused_create(Kind::Entity, id)?;
         self.inner.delete_entity_if(tenant, id, keep).await
     }
     async fn matching_registrations(

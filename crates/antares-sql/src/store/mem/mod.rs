@@ -11,14 +11,14 @@
 //! timestamps embedded (`createdAt`/`modifiedAt` at entity level and inside
 //! each attribute instance) — output layers strip them unless sysAttrs.
 
-use ::redb::{Database, Durability, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+use ::redb::{Database, Durability, ReadableDatabase, ReadableTableMetadata};
 use antares_model::{NgsiError, TenantId};
 use antares_store::{context_row_owner, context_row_visible, filter, ChangeHook, Kind};
 
 mod redb;
 use self::redb::{
-    key_bytes, split_key, table_for, Shadow, FORMAT_VERSION, T_ENTITIES, T_JSONLD_CONTEXTS, T_META,
-    T_TEMPORAL_ENTITIES,
+    key_bytes, split_key, table_for, Shadow, Table, FORMAT_VERSION, T_ENTITIES, T_JSONLD_CONTEXTS,
+    T_META, T_TEMPORAL_ENTITIES,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -185,6 +185,10 @@ fn on_blocking<T>(durable: bool, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// One write [`Store::stage`] queued: table, key, encoded doc (`None` =
+/// delete).
+type Staged = (Table, Vec<u8>, Option<Vec<u8>>);
+
 #[derive(Default)]
 pub struct Store {
     inner: RwLock<Inner>,
@@ -192,6 +196,12 @@ pub struct Store {
     /// Set when this instance serves only the temporal seam: it never holds
     /// the entities, so the append guard must not look for them here.
     pub temporal_only: bool,
+    /// Most instances one Attribute's history may hold here; `0` = no cap
+    /// (`ANTARES_MEM_MAX_INSTANCES`). An Entity's whole history is ONE
+    /// document, cloned, compared and (in `file` mode) rewritten and fsynced
+    /// whole on every append under the single write lock, so an unbounded
+    /// one makes each write slower than the last, for every Tenant.
+    pub max_instances: usize,
     /// `file` mode durability shadow; `None` = pure in-memory (`memory` mode).
     shadow: Option<Shadow>,
     /// Writers currently queued behind the single write-critical section
@@ -208,6 +218,9 @@ pub struct Store {
     /// until the emit is done. Only the local single-process path needs it:
     /// across processes the transactional outbox is the ordered channel.
     emit_order: tokio::sync::Mutex<()>,
+    /// Entity changes emitted, the version each carries to the hook: counted
+    /// under `emit_order`, so in commit order.
+    emitted: std::sync::atomic::AtomicI64,
 }
 
 #[derive(Default)]
@@ -352,8 +365,10 @@ impl Store {
             inner: RwLock::new(inner),
             hook: RwLock::new(None),
             emit_order: tokio::sync::Mutex::new(()),
+            emitted: Default::default(),
             shadow: Some(Shadow { db }),
             temporal_only: false,
+            max_instances: 0,
             write_waiters: Default::default(),
             write_waiters_peak: Default::default(),
         })
@@ -361,7 +376,7 @@ impl Store {
 
     /// Write-through for one doc (must be called inside the write-critical
     /// section so redb order equals memory order).
-    fn persist(&self, table: TableDefinition<&[u8], &[u8]>, key: &[u8], doc: Option<&Value>) {
+    fn persist(&self, table: Table, key: &[u8], doc: Option<&Value>) {
         if let Some(shadow) = &self.shadow {
             // None means DELETE the key, so a document that will not encode
             // must skip the write rather than collapse into one.
@@ -373,6 +388,36 @@ impl Store {
                 None => None,
             };
             shadow.write(table, key, bytes.as_deref());
+        }
+    }
+
+    /// Queue the write-through of one doc (`None` = delete) for
+    /// [`Self::commit_staged`]; nothing in `memory` mode. A document that
+    /// will not encode is skipped, as [`Self::persist`] skips it.
+    fn stage(&self, staged: &mut Vec<Staged>, table: Table, key: Vec<u8>, doc: Option<&Value>) {
+        if self.shadow.is_none() {
+            return;
+        }
+        let bytes = match doc {
+            Some(d) => match serde_json::to_vec(d) {
+                Ok(b) => Some(b),
+                Err(_) => return,
+            },
+            None => None,
+        };
+        staged.push((table, key, bytes));
+    }
+
+    /// Commit what [`Self::stage`] queued in one redb transaction (must be
+    /// called inside the write-critical section, as `persist`): a
+    /// multi-document change is durable whole, at the cost of one fsync.
+    fn commit_staged(&self, staged: &[Staged]) {
+        if let Some(shadow) = &self.shadow {
+            shadow.write_all(
+                staged
+                    .iter()
+                    .map(|(t, k, v)| (*t, k.as_slice(), v.as_deref())),
+            );
         }
     }
 
@@ -437,7 +482,14 @@ impl Store {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(h) = hook {
-            h(tenant, before, after).await;
+            let version = antares_store::ChangeVersion {
+                incarnation: String::new(),
+                version: self
+                    .emitted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    .saturating_add(1),
+            };
+            h(tenant, before, after, version).await;
         }
     }
 
@@ -450,9 +502,9 @@ impl Store {
     /// each removal. Returns how many docs were reaped or pruned.
     ///
     /// Runs through `on_blocking` like every other mutating path: in `file`
-    /// mode it holds the write-critical section for a full scan and issues
-    /// one `Durability::Immediate` (fsync) commit per reaped doc, which must
-    /// never happen on an async worker thread.
+    /// mode it holds the write-critical section for a full scan and one
+    /// `Durability::Immediate` (fsync) commit of every doc it reaped or
+    /// pruned, which must never happen on an async worker thread.
     pub fn sweep_expired(&self, now: &str) -> usize {
         on_blocking(true, || self.sweep_expired_locked(now))
     }
@@ -468,16 +520,24 @@ impl Store {
                 }
             }
         }
+        // One commit for the whole pass: an Entity and its history leave the
+        // file together, and the section waits for one fsync, not one a key.
+        let mut staged = Vec::new();
         for (tenant, id) in dead {
             if let Some(docs) = inner.entities.get_mut(&tenant) {
-                self.persist(T_ENTITIES, &key_bytes(&tenant, &id), None);
+                self.stage(&mut staged, T_ENTITIES, key_bytes(&tenant, &id), None);
                 docs.remove(&id);
                 reaped = reaped.saturating_add(1);
             }
             // Its history goes with it.
             if let Some(docs) = inner.temporal.get_mut(&tenant) {
                 if docs.remove(&id).is_some() {
-                    self.persist(T_TEMPORAL_ENTITIES, &key_bytes(&tenant, &id), None);
+                    self.stage(
+                        &mut staged,
+                        T_TEMPORAL_ENTITIES,
+                        key_bytes(&tenant, &id),
+                        None,
+                    );
                 }
             }
         }
@@ -495,11 +555,12 @@ impl Store {
                 for (id, doc) in docs.iter_mut() {
                     if prune_expired_instances(doc, now) {
                         reaped = reaped.saturating_add(1);
-                        self.persist(table, &key_bytes(tenant, id), Some(doc));
+                        self.stage(&mut staged, table, key_bytes(tenant, id), Some(doc));
                     }
                 }
             }
         }
+        self.commit_staged(&staged);
         reaped
     }
 
@@ -689,8 +750,8 @@ impl Store {
 
     /// Retention of current state: drop at most `batch` Entities of
     /// `tenant` typed `type_iri` that carry no `expiresAt` and whose
-    /// `modifiedAt` is before `before`. Persisted per key in `file` mode;
-    /// `dry_run` counts them and drops none.
+    /// `modifiedAt` is before `before`. Persisted in one commit in `file`
+    /// mode; `dry_run` counts them and drops none.
     pub fn retain_current(
         &self,
         tenant: &TenantId,
@@ -717,10 +778,17 @@ impl Store {
                 .map(|(id, _)| id.clone())
                 .take(batch)
                 .collect();
+            let mut staged = Vec::new();
             for id in dead.iter().filter(|_| !dry_run) {
-                self.persist(T_ENTITIES, &key_bytes(tenant.as_str(), id), None);
+                self.stage(
+                    &mut staged,
+                    T_ENTITIES,
+                    key_bytes(tenant.as_str(), id),
+                    None,
+                );
                 docs.remove(id);
             }
+            self.commit_staged(&staged);
             dead.len() as u64
         })
     }
@@ -764,6 +832,7 @@ impl Store {
             };
             let mut left = batch;
             let mut dropped = 0u64;
+            let mut staged = Vec::new();
             for (id, doc) in docs.iter_mut() {
                 if left == 0 {
                     break;
@@ -793,44 +862,67 @@ impl Store {
                     }
                 }
                 if dropped != before_count && !dry_run {
-                    self.persist(
+                    self.stage(
+                        &mut staged,
                         T_TEMPORAL_ENTITIES,
-                        &key_bytes(tenant.as_str(), id),
+                        key_bytes(tenant.as_str(), id),
                         Some(doc),
                     );
                 }
             }
+            self.commit_staged(&staged);
             dropped
         })
     }
 
     /// Drop every document of the given kinds for one tenant; `true` when
-    /// the tenant held any of them. Persisted per key in `file` mode.
+    /// the tenant held any of them. Persisted in one commit in `file` mode.
     pub fn purge_kinds(&self, tenant: &TenantId, kinds: &[Kind]) -> bool {
         on_blocking(true, || {
             let mut inner = self.write_inner();
-            let mut hit = false;
-            for kind in kinds {
-                if let Some(docs) = Self::map_mut(&mut inner, *kind).remove(tenant.as_str()) {
-                    hit = true;
-                    for id in docs.keys() {
-                        self.persist(table_for(*kind), &key_bytes(tenant.as_str(), id), None);
-                    }
-                }
-            }
+            let mut staged = Vec::new();
+            let hit = self.purge_kinds_locked(&mut inner, tenant, kinds, &mut staged);
+            self.commit_staged(&staged);
             hit
         })
     }
 
-    /// Remove the tenant from every kind, history included.
+    fn purge_kinds_locked(
+        &self,
+        inner: &mut Inner,
+        tenant: &TenantId,
+        kinds: &[Kind],
+        staged: &mut Vec<Staged>,
+    ) -> bool {
+        let mut hit = false;
+        for kind in kinds {
+            if let Some(docs) = Self::map_mut(inner, *kind).remove(tenant.as_str()) {
+                hit = true;
+                for id in docs.keys() {
+                    self.stage(
+                        staged,
+                        table_for(*kind),
+                        key_bytes(tenant.as_str(), id),
+                        None,
+                    );
+                }
+            }
+        }
+        hit
+    }
+
+    /// Remove the tenant from every kind, history included, and its own
+    /// @contexts, in one commit in `file` mode: the operator's erase path
+    /// never leaves part of a Tenant on disk.
     pub fn purge_tenant(&self, tenant: &TenantId) -> bool {
-        let existed = self.purge_kinds(tenant, &ALL_KINDS);
-        // ADR-0021: the Tenant's Hosted and ImplicitlyCreated @contexts are
-        // its documents and go with it — a row that outlived its Tenant would
-        // hand the next holder of that name a stranger's term mappings. A
-        // Cached row belongs to no Tenant and stays.
         on_blocking(true, || {
             let mut inner = self.write_inner();
+            let mut staged = Vec::new();
+            let existed = self.purge_kinds_locked(&mut inner, tenant, &ALL_KINDS, &mut staged);
+            // ADR-0021: the Tenant's Hosted and ImplicitlyCreated @contexts are
+            // its documents and go with it — a row that outlived its Tenant would
+            // hand the next holder of that name a stranger's term mappings. A
+            // Cached row belongs to no Tenant and stays.
             let dead: Vec<String> = inner
                 .contexts
                 .iter()
@@ -838,11 +930,12 @@ impl Store {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in dead {
-                self.persist(T_JSONLD_CONTEXTS, id.as_bytes(), None);
+                self.stage(&mut staged, T_JSONLD_CONTEXTS, id.as_bytes().to_vec(), None);
                 inner.contexts.remove(&id);
             }
-        });
-        existed
+            self.commit_staged(&staged);
+            existed
+        })
     }
 
     pub fn subscription_tenants(&self) -> Vec<String> {
@@ -1344,7 +1437,13 @@ impl Store {
                     "@context belongs to another tenant".into(),
                 ));
             }
-            self.persist(T_JSONLD_CONTEXTS, id.as_bytes(), Some(&doc));
+            let mut staged = Vec::new();
+            self.stage(
+                &mut staged,
+                T_JSONLD_CONTEXTS,
+                id.as_bytes().to_vec(),
+                Some(&doc),
+            );
             let cached = doc.get("kind").and_then(Value::as_str) == Some("Cached");
             inner.contexts.insert(id.to_owned(), doc);
             // 5.13.1: "Implementations shall periodically invalidate the
@@ -1357,10 +1456,12 @@ impl Store {
             if cached && inner.contexts.len() > MAX_CACHED_CONTEXTS {
                 let dead = oldest_cached(&inner.contexts);
                 for id in dead {
-                    self.persist(T_JSONLD_CONTEXTS, id.as_bytes(), None);
+                    self.stage(&mut staged, T_JSONLD_CONTEXTS, id.as_bytes().to_vec(), None);
                     inner.contexts.remove(&id);
                 }
             }
+            // the entry and the evictions it caused, in one commit
+            self.commit_staged(&staged);
             Ok(())
         })
     }
@@ -1476,7 +1577,8 @@ mod tests {
         s.set_change_hook(Arc::new(
             |_t: &TenantId,
              _b: Option<Value>,
-             after: Option<Value>|
+             after: Option<Value>,
+             _v: antares_store::ChangeVersion|
              -> antares_store::HookFuture<'_> {
                 Box::pin(async move {
                     if after.as_ref().and_then(|a| a.get("boom")).is_some() {
@@ -1537,7 +1639,8 @@ mod tests {
             s.set_change_hook(Arc::new(
                 move |_t: &TenantId,
                       _b: Option<Value>,
-                      after: Option<Value>|
+                      after: Option<Value>,
+                      _v: antares_store::ChangeVersion|
                       -> antares_store::HookFuture<'_> {
                     let (seen, entered, released) =
                         (seen.clone(), entered.clone(), released.clone());
@@ -2066,7 +2169,8 @@ mod tests {
         s.set_change_hook(Arc::new(
             move |_t: &TenantId,
                   before: Option<Value>,
-                  after: Option<Value>|
+                  after: Option<Value>,
+                  _v: antares_store::ChangeVersion|
                   -> antares_store::HookFuture<'_> {
                 let rec = Arc::clone(&rec);
                 Box::pin(async move {
@@ -2197,6 +2301,86 @@ mod tests {
                 .is_some_and(|d| d.contains_key("urn:e:3")),
             "swept entity resurrected on reopen"
         );
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3-08, S3-09: in `file` mode a sweep that reaps many documents (an
+    /// expired Entity and its history each) commits them in ONE redb
+    /// transaction. One commit per key made the reap non-atomic on disk (a
+    /// crash between the Entity and its history left an orphan history no
+    /// sweep removes) and held the write section, which every reader waits
+    /// on, for one fsync per document. Timed against a single durable
+    /// commit on the same file: the sweep may cost a few, never one per key.
+    #[test]
+    fn a_file_mode_sweep_commits_once_whatever_it_reaps() {
+        const N: usize = 400;
+        let dir = tempdir("sweep-one-commit");
+        {
+            let db = Database::create(dir.join("antares.redb")).expect("db");
+            let tx = db.begin_write().expect("tx");
+            {
+                let mut m = tx.open_table(T_META).expect("meta");
+                m.insert("format", FORMAT_VERSION).expect("insert");
+            }
+            for table in [T_ENTITIES, T_TEMPORAL_ENTITIES] {
+                let mut t = tx.open_table(table).expect("table");
+                for n in 0..N {
+                    let id = format!("urn:e:{n}");
+                    let doc = json!({"id": id, "type": ["T"], "expiresAt": "2000-01-01T00:00:00Z"});
+                    let bytes = serde_json::to_vec(&doc).expect("serialize");
+                    t.insert(key_bytes("t", &id).as_slice(), bytes.as_slice())
+                        .expect("insert");
+                }
+                let keep = serde_json::to_vec(&json!({"id": "urn:keep", "type": ["T"]}))
+                    .expect("serialize");
+                t.insert(key_bytes("t", "urn:keep").as_slice(), keep.as_slice())
+                    .expect("insert");
+            }
+            tx.commit().expect("commit");
+        }
+        let s = std::sync::Arc::new(Store::open_file(&dir).expect("open"));
+        // one durable commit on this file, the unit the sweep is held to
+        const T_META_PROBE: Table = ::redb::TableDefinition::new("probe");
+        let started = std::time::Instant::now();
+        for n in 0..5 {
+            s.persist(
+                T_META_PROBE,
+                format!("probe{n}").as_bytes(),
+                Some(&json!(n)),
+            );
+        }
+        let commit = started.elapsed() / 5;
+        let t = TenantId::new("t").expect("tenant");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (s, t, stop) = (s.clone(), t.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut worst = std::time::Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let at = std::time::Instant::now();
+                    assert!(s.get(&t, Kind::Entity, "urn:keep").is_some());
+                    worst = worst.max(at.elapsed());
+                }
+                worst
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        assert_eq!(s.sweep_expired("2026-01-01T00:00:00Z"), N);
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let worst = reader.join().expect("reader");
+        eprintln!("one commit {commit:?}; sweep of {N} {took:?}; worst read {worst:?}");
+        assert!(
+            took < commit * 20 + std::time::Duration::from_millis(200),
+            "a sweep of {N} took {took:?}, a commit {commit:?}: one commit per key"
+        );
+        drop(s);
+        let s = Store::open_file(&dir).expect("reopen");
+        let inner = s.inner.read().expect("lock");
+        assert_eq!(inner.entities.get("t").map(BTreeMap::len), Some(1));
+        assert_eq!(inner.temporal.get("t").map(BTreeMap::len), Some(1));
         drop(inner);
         let _ = std::fs::remove_dir_all(&dir);
     }

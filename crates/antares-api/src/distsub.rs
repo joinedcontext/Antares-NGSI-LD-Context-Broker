@@ -310,6 +310,9 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
         .get("csr_sub")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // the initial Context Source Notification of the updated Registration
+    // Subscription, started once the mapped copies are read below
+    let mut initial: Option<String> = None;
     match csr_id {
         None => {
             // became distributed only now (e.g. localOnly flipped off)
@@ -356,9 +359,41 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
                     Ok::<(), NgsiError>(())
                 })
                 .await;
+            // 5.11.3.4 after the update: every registration matching now is
+            // notified, so one the update newly matches gets its copy
+            // (newlyMatching); one already mapped is left to the PATCH below
+            initial = Some(csr_id);
         }
     }
+    // the updated Registration Subscription decides which mapped copies
+    // still match
+    let csr = match ds_get(st, tenant, own_id)
+        .await
+        .get("csr_sub")
+        .and_then(Value::as_str)
+    {
+        Some(csr_id) => st
+            .store
+            .get(tenant, Kind::DistSub, csr_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let csr_ctx = match &csr {
+        Some(c) => Some(crate::notify::sub_context(st, tenant, c).await),
+        None => None,
+    };
     let remotes: Vec<(String, (String, String))> = ds_remotes(&ds_get(st, tenant, own_id).await);
+    // Read before the initial notification runs: a registration it maps now
+    // is getting its copy by POST, and a PATCH raced against that create
+    // reaches a remote subscription that may not exist yet.
+    if let Some(csr_id) = initial {
+        let (st2, t2) = (st.clone(), tenant.clone());
+        crate::spawn(async move {
+            crate::notify::csource_initial(&st2, &t2, &csr_id).await;
+        });
+    }
     for (reg_id, (endpoint, remote_id)) in remotes {
         let Some(reg) = st
             .store
@@ -369,16 +404,34 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
         else {
             continue;
         };
-        if !crate::federation::doc_supports(&reg, "updateSubscription") {
-            continue;
+        // 5.11.2.4 noLongerMatching: the copy at a registration the updated
+        // Subscription no longer matches is deleted there and unmapped
+        if let (Some(c), Some(ctx)) = (&csr, &csr_ctx) {
+            if !crate::registry::csr_matches_subscription(c, &reg, ctx) {
+                let (st2, t2, own) = (st.clone(), tenant.clone(), own_id.to_owned());
+                crate::spawn(async move {
+                    on_csource_notification(&st2, &t2, &own, Some("noLongerMatching"), &[reg])
+                        .await;
+                });
+                continue;
+            }
         }
         let (st2, t2, sub2) = (st.clone(), tenant.clone(), sub.clone());
         let ctx_url = sub_ctx_url(st, &sub);
+        let own = own_id.to_owned();
         crate::spawn(async move {
             let ctx = crate::notify::sub_context(&st2, &t2, &sub2).await;
             let Some(mut copy) = reduced_copy(&st2, &sub2, &reg, &remote_id, &ctx) else {
+                // nothing this registration covers is watched any more:
+                // the copy there has nothing left to notify. Decided before
+                // the updateSubscription gate: a source without it still
+                // has its copy deleted (and unmapped) here.
+                on_csource_notification(&st2, &t2, &own, Some("noLongerMatching"), &[reg]).await;
                 return;
             };
+            if !crate::federation::doc_supports(&reg, "updateSubscription") {
+                return;
+            }
             copy.as_object_mut().map(|o| o.remove("id"));
             forward_sub(
                 &st2,
@@ -601,23 +654,30 @@ pub(crate) async fn on_csource_notification(
                 )
                 .await;
             }
-            ("noLongerMatching", Some((_, remote_id)))
-                if crate::federation::doc_supports(reg, "deleteSubscription") =>
-            {
-                forward_sub(
-                    st,
-                    tenant,
-                    reqwest::Method::DELETE,
-                    format!("{endpoint}/ngsi-ld/v1/subscriptions/{remote_id}"),
-                    reg_id,
-                    reg,
-                    &ctx_url,
-                    &via,
-                    None,
-                )
-                .await;
+            ("noLongerMatching", Some((_, remote_id))) => {
+                // The copy no longer serves this Subscription, whatever the
+                // source supports: unmapped first, so a notification it
+                // still sends is not forwarded to the subscriber while the
+                // delete is in flight, or forever where the source cannot
+                // delete it.
                 ds_set_remote(st, tenant, own_id, reg_id, None).await;
                 inbound_delete(st, &remote_id).await;
+                // 5.8.1.4: the delete is forwarded where the registration
+                // "indicates support for the delete Subscription operation"
+                if crate::federation::doc_supports(reg, "deleteSubscription") {
+                    forward_sub(
+                        st,
+                        tenant,
+                        reqwest::Method::DELETE,
+                        format!("{endpoint}/ngsi-ld/v1/subscriptions/{remote_id}"),
+                        reg_id,
+                        reg,
+                        &ctx_url,
+                        &via,
+                        None,
+                    )
+                    .await;
+                }
             }
             _ => {}
         }
@@ -1460,6 +1520,45 @@ mod tests {
                 .flatten()
                 .is_none(),
             "the mapping document must not survive the flip"
+        );
+    }
+
+    /// 5.8.1.4 noLongerMatching: a registration that cannot delete the
+    /// remote copy still loses its mapping, so a notification the orphaned
+    /// copy keeps sending reaches nobody.
+    #[tokio::test]
+    async fn clause_5_8_1_no_longer_matching_unmaps_a_source_without_delete() {
+        let st = AppState::new("antares-ds-nolonger".into());
+        let t = TenantId::default();
+        let sub = sub_doc();
+        let own = sub["id"].as_str().expect("id").to_owned();
+        st.store
+            .create(&t, Kind::Subscription, &own, sub)
+            .await
+            .expect("create");
+        ds_put(&st, &t, &own, json!({"csr_sub": "urn:csr:nolonger"})).await;
+        let mut reg = reg_doc();
+        reg["operations"] = json!(["createSubscription", "updateSubscription"]);
+        let reg_id = reg["id"].as_str().expect("id").to_owned();
+        assert!(
+            ds_set_remote(
+                &st,
+                &t,
+                &own,
+                &reg_id,
+                Some(json!(["http://source.example.org", "urn:remote:nolonger"]))
+            )
+            .await
+        );
+        inbound_put(&st, "urn:remote:nolonger", &t, &own).await;
+        on_csource_notification(&st, &t, &own, Some("noLongerMatching"), &[reg]).await;
+        assert!(
+            ds_remotes(&ds_get(&st, &t, &own).await).is_empty(),
+            "the mapping outlived noLongerMatching"
+        );
+        assert!(
+            inbound_get(&st, "urn:remote:nolonger").await.is_none(),
+            "the inbound key outlived noLongerMatching"
         );
     }
 

@@ -320,13 +320,28 @@ impl DeliveryPolicy {
 /// member of the ProblemDetails body (5.5.3) and into the delivery logs —
 /// neither may carry the subscription's password. Everything after the
 /// authority's last `@` is kept; an `@` in the path or topic is data.
+///
+/// A URI written without the `//` (`http:user:pass@host/n`) has no
+/// authority in RFC 3986 terms, yet a WHATWG URL parser (the one reqwest
+/// uses) reads one there and sends that userinfo. Such a URI is stripped the
+/// same way, from the first `:` on. The authority starts right after the
+/// scheme's `:` (and its `//`, when present), never at a `//` later in the
+/// path or query, which would leave the userinfo in place.
 pub fn redact_userinfo(uri: &str) -> String {
-    if let Some(scheme_end) = uri.find("//") {
-        let rest = &uri[scheme_end + 2..];
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some(at) = rest[..authority_end].rfind('@') {
-            return format!("{}{}", &uri[..scheme_end + 2], &rest[at + 1..]);
-        }
+    let Some(colon) = uri.find(':') else {
+        return uri.to_owned();
+    };
+    let start = colon
+        + 1
+        + if uri[colon + 1..].starts_with("//") {
+            2
+        } else {
+            0
+        };
+    let rest = &uri[start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if let Some(at) = rest[..authority_end].rfind('@') {
+        return format!("{}{}", &uri[..start], &rest[at + 1..]);
     }
     uri.to_owned()
 }
@@ -597,6 +612,31 @@ mod tests {
         );
         // an '@' beyond the authority is path data, not userinfo
         assert_eq!(redact_userinfo("http://h/p@x"), "http://h/p@x");
+    }
+
+    /// `http:user:pass@host` has no `//`, but a WHATWG parser still reads
+    /// userinfo there: the redaction strips it, and the http binding refuses
+    /// the URI without echoing the credential.
+    #[test]
+    fn userinfo_without_the_double_slash_is_redacted_and_refused() {
+        let uri = "http:hook:pa55word@localhost:1/n";
+        let red = redact_userinfo(uri);
+        assert!(!red.contains("pa55word") && !red.contains("hook"), "{red}");
+        assert_eq!(red, "http:localhost:1/n");
+        let err = http::check_endpoint(uri).expect_err("no authority");
+        assert!(!format!("{err:?}").contains("pa55word"), "{err:?}");
+        // SECV-02: a `//` later in the path does not move the authority
+        for uri in [
+            "http:hook:pa55word@h/n//x",
+            "http:hook:pa55word@h/n?u=//x",
+            "mqtt://u:pa55word@h/a//b",
+        ] {
+            let red = redact_userinfo(uri);
+            assert!(!red.contains("pa55word"), "{uri} -> {red}");
+            if let Err(err) = http::check_endpoint(uri) {
+                assert!(!format!("{err:?}").contains("pa55word"), "{err:?}");
+            }
+        }
     }
 
     /// An unregistered scheme resolves to no sink at delivery time either —

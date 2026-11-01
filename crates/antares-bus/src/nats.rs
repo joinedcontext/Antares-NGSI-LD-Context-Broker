@@ -18,6 +18,10 @@
 //! prefetch.
 
 use crate::{subjects, ChangeEvent};
+/// The consumer handle the balanced and broadcast constructors hand out.
+pub use async_nats::jetstream::consumer::PullConsumer;
+/// The handle [`NatsBus::subs_kv`] answers.
+pub use async_nats::jetstream::kv::Store as KvStore;
 use async_nats::jetstream::{self, consumer, stream};
 use futures_util::StreamExt;
 
@@ -44,6 +48,13 @@ pub const SUBS_BUCKET: &str = "antares_subscriptions";
 /// Bounded prefetch: how many unacked messages one consumer may
 /// hold. Any unbounded queue is a 3am page.
 pub const MAX_ACK_PENDING: i64 = 256;
+
+/// The balanced durables on `ANTARES_CHANGES`. Interest retention keeps a
+/// message only while a consumer is interested in it, so these exist from
+/// the first connect of ANY role: an api pod that publishes before a matcher
+/// pod has ever run would otherwise publish into a stream that discards
+/// every change, and its outbox drain frees the row on the publish ack.
+pub const BALANCED_DURABLES: &[&str] = &["matcher"];
 
 pub struct NatsBus {
     js: jetstream::Context,
@@ -179,6 +190,9 @@ impl NatsBus {
             })
             .await
             .map_err(err)?;
+        for durable in BALANCED_DURABLES {
+            self.consume_balanced(durable).await?;
+        }
         self.js
             .get_or_create_stream(stream::Config {
                 name: REGISTRY_STREAM.into(),
@@ -248,6 +262,60 @@ impl NatsBus {
         Ok(())
     }
 
+    /// The stream sequence of the newest delta held for one registration,
+    /// `0` when none is (never published, or aged out by the stream's
+    /// `max_age`): the revision [`Self::publish_registration`] compares
+    /// against.
+    pub async fn registration_revision(&self, tenant: &str, id: &str) -> Result<u64, BusError> {
+        let tenant = antares_model::TenantId::new_internal(tenant).map_err(err)?;
+        let s = self
+            .js
+            .get_stream_no_info(REGISTRY_STREAM)
+            .await
+            .map_err(err)?;
+        match s
+            .get_last_raw_message_by_subject(&subjects::registration_subject(&tenant, id))
+            .await
+        {
+            Ok(m) => Ok(m.sequence),
+            Err(e) if e.kind() == stream::LastRawMessageErrorKind::NoMessageFound => Ok(0),
+            Err(e) => Err(err(e)),
+        }
+    }
+
+    /// Publish one registration's delta on its own subject, only while
+    /// `revision` is still the newest delta held for it
+    /// (`Nats-Expected-Last-Subject-Sequence`; `0` = none held). A publish
+    /// that a newer one overtook fails, and its caller re-reads: a stream
+    /// has no key to overwrite, so this is what keeps a late delta from
+    /// landing after a newer one in every mirror.
+    pub async fn publish_registration(
+        &self,
+        tenant: &str,
+        id: &str,
+        delta: &serde_json::Value,
+        revision: u64,
+    ) -> Result<(), BusError> {
+        let tenant = antares_model::TenantId::new_internal(tenant).map_err(err)?;
+        let bytes = serde_json::to_vec(delta).map_err(err)?;
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+            revision.to_string().as_str(),
+        );
+        self.js
+            .publish_with_headers(
+                subjects::registration_subject(&tenant, id),
+                headers,
+                bytes.into(),
+            )
+            .await
+            .map_err(err)?
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
+
     /// BALANCED consumption (matcher, temporal recorder): a shared durable —
     /// instances with the same `durable` name split the work. Explicit-ack,
     /// bounded prefetch; the caller acks AFTER processing.
@@ -256,17 +324,15 @@ impl NatsBus {
         durable: &str,
     ) -> Result<consumer::PullConsumer, BusError> {
         let s = self.js.get_stream(CHANGES_STREAM).await.map_err(err)?;
-        s.get_or_create_consumer(
-            durable,
-            consumer::pull::Config {
-                durable_name: Some(durable.into()),
-                ack_policy: consumer::AckPolicy::Explicit,
-                max_ack_pending: MAX_ACK_PENDING,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(err)
+        // Get-or-create, never create-or-update: rewriting a live durable's
+        // config from every connecting pod at once crashed a NATS 2.10.29
+        // server (consumer updateConfig → cleanupNoInterestMessages on this
+        // Interest stream). A durable an older build made keeps its config
+        // — the server's 30 s ack_wait, which ACK_WAIT equals, and no
+        // max_deliver — until an operator edits or recreates it.
+        s.get_or_create_consumer(durable, balanced_config(durable))
+            .await
+            .map_err(err)
     }
 
     /// BROADCAST consumption (per-instance registry mirror): an ephemeral
@@ -296,7 +362,7 @@ impl NatsBus {
     }
 
     /// The KV bucket holding the compiled-subscription mirror.
-    pub async fn subs_kv(&self) -> Result<async_nats::jetstream::kv::Store, BusError> {
+    pub async fn subs_kv(&self) -> Result<KvStore, BusError> {
         self.js.get_key_value(SUBS_BUCKET).await.map_err(err)
     }
 
@@ -324,6 +390,128 @@ impl NatsBus {
             "bus topology asserted: balanced durables present on {CHANGES_STREAM}"
         );
         Ok(())
+    }
+}
+
+/// How long the server waits for a balanced message's ack before it
+/// redelivers it — to whichever pod pulls next. Explicit, not the server
+/// default, because [`run_balanced`]'s heartbeat is paced from it.
+pub const ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Deliveries of one balanced message before the server gives up on it.
+/// With the heartbeat a redelivery means the pod working on it stopped
+/// (crash, hang, lost connection); a change that takes ten pods down with it
+/// is a poison message, and dropping it beats a fleet in a crash loop.
+pub const MAX_DELIVER: i64 = 10;
+
+/// Messages one pull asks for. Each is held unacked until its turn, so this
+/// bounds what one slow message delays on this pod — the rest of the
+/// stream stays with the other pods of the durable.
+pub const PULL_BATCH: usize = 16;
+
+/// How long one pull waits for its batch to fill: messages arriving in the
+/// meantime are handed over at once, so this is no latency, only the
+/// cadence at which an idle consumer re-asks.
+const PULL_EXPIRES: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The configuration of a balanced durable (`ack_wait` and `max_deliver`
+/// above; the caller acks after processing).
+pub fn balanced_config(durable: &str) -> consumer::pull::Config {
+    consumer::pull::Config {
+        durable_name: Some(durable.into()),
+        ack_policy: consumer::AckPolicy::Explicit,
+        max_ack_pending: MAX_ACK_PENDING,
+        ack_wait: ACK_WAIT,
+        max_deliver: MAX_DELIVER,
+        ..Default::default()
+    }
+}
+
+/// Drive a balanced consumer: `work` runs once per message, in delivery
+/// order, and the message is acked when it has returned — never before
+/// (ADR-0002, at-least-once).
+///
+/// Messages are pulled [`PULL_BATCH`] at a time, and every one this pod
+/// holds unacked — the one in `work` and the rest of its batch already
+/// delivered behind it — gets an `AckKind::Progress` every third of the
+/// consumer's `ack_wait`. Without it one slow message (a notification
+/// endpoint at its timeout) outlived `ack_wait`, and the server redelivered
+/// it and everything queued behind it, so each was matched and notified
+/// twice. Now only a pod that stops working lets `ack_wait` pass.
+///
+/// Returns on a pull that fails (a deleted consumer, a lost connection); the
+/// caller re-opens.
+pub async fn run_balanced<F, Fut>(
+    consumer: &consumer::PullConsumer,
+    mut work: F,
+) -> Result<(), BusError>
+where
+    F: FnMut(&async_nats::jetstream::Message) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let ack_wait = match consumer.cached_info().config.ack_wait {
+        w if w.is_zero() => ACK_WAIT,
+        w => w,
+    };
+    let every = ack_wait / 3;
+    loop {
+        let mut batch = consumer
+            .batch()
+            .max_messages(PULL_BATCH)
+            .expires(PULL_EXPIRES)
+            .messages()
+            .await
+            .map_err(err)?;
+        // delivered and not yet worked on, in delivery order
+        let mut held = std::collections::VecDeque::new();
+        let mut open = true;
+        let mut failed = None;
+        // One clock for the whole pull: the messages in `held` were
+        // delivered when the batch was, so their `ack_wait` runs from there
+        // whatever happens to each one before them. A clock restarted per
+        // message never ticked behind a run of messages each shorter than
+        // a third of `ack_wait`, and the batch behind them was redelivered.
+        let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let msg = match held.pop_front() {
+                Some(m) => m,
+                None if open => match batch.next().await {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => return Err(err(e)),
+                    None => break,
+                },
+                None => break,
+            };
+            let job = work(&msg);
+            tokio::pin!(job);
+            loop {
+                tokio::select! {
+                    () = &mut job => break,
+                    _ = beat.tick() => {
+                        for m in std::iter::once(&msg).chain(held.iter()) {
+                            if let Err(e) = m.ack_with(jetstream::AckKind::Progress).await {
+                                tracing::warn!("progress ack failed: {e}");
+                            }
+                        }
+                    }
+                    next = batch.next(), if open => match next {
+                        Some(Ok(m)) => held.push_back(m),
+                        Some(Err(e)) => {
+                            open = false;
+                            failed = Some(err(e));
+                        }
+                        None => open = false,
+                    },
+                }
+            }
+            if let Err(e) = msg.ack().await {
+                tracing::warn!("ack failed: {e}");
+            }
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
     }
 }
 

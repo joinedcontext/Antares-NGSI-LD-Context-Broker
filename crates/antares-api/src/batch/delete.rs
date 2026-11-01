@@ -63,11 +63,15 @@ async fn batch_delete_inner(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    let mut flags = delete_local(st, &tenant, &id_strs, &conds)
-        .await?
-        .into_iter();
+    let (flags, failed) = delete_local(st, &tenant, &id_strs, &conds).await?;
+    // a store error after a committed delete: the ids from the failing one
+    // on were not attempted, and go to E with that error (5.6.10.4 reports
+    // each Entity) rather than a 5xx that hides the deletes that landed
+    let attempted = flags.len();
+    let mut flags = flags.into_iter();
     let mut local_ok: std::collections::HashSet<String> = Default::default();
     let mut local_miss: Vec<String> = Vec::new();
+    let mut seen = 0usize;
     for id in ids {
         let Some(id) = id.as_str() else {
             out.errors.push(err_entry(
@@ -76,6 +80,11 @@ async fn batch_delete_inner(
             ));
             continue;
         };
+        seen = seen.saturating_add(1);
+        if let Some(e) = failed.as_ref().filter(|_| seen > attempted) {
+            out.errors.push(err_entry(Some(id), e));
+            continue;
+        }
         if flags.next().unwrap_or(false) {
             // 5.6.10 deletes carry the same temporal-deletion semantics
             // as 5.6.6 — without this, batch-deleted entities live on in
@@ -89,8 +98,13 @@ async fn batch_delete_inner(
             local_miss.push(id.to_owned());
         }
     }
-    let remote = forward_deletes(st, &tenant, headers, &regs, &id_strs).await;
-    delete_outcome(&mut out, &id_strs, &local_ok, local_miss, remote);
+    let id_strs = if failed.is_some() {
+        id_strs.get(..attempted).unwrap_or(&id_strs)
+    } else {
+        &id_strs
+    };
+    let remote = forward_deletes(st, &tenant, headers, &regs, id_strs).await;
+    delete_outcome(&mut out, id_strs, &local_ok, local_miss, remote);
     Ok(out.respond(&tenant, StatusCode::NO_CONTENT, false))
 }
 
@@ -196,22 +210,30 @@ async fn decide_deletes(
 /// or an engine's condition each delete reads its Entity under the lock and
 /// leaves one out of the view, or one the condition does not select, which
 /// then answers as absent.
+///
+/// Those deletes commit one by one. A store error before any of them
+/// deleted anything is the request's answer; one after is returned beside
+/// the flags of the ids attempted before it, and the rest are not tried.
 async fn delete_local(
     st: &AppState,
     tenant: &antares_model::TenantId,
     id_strs: &[String],
     conds: &Conditions,
-) -> Result<Vec<bool>, NgsiError> {
+) -> Result<(Vec<bool>, Option<NgsiError>), NgsiError> {
     let judged = !conds.0.is_empty();
     if !judged {
-        return st.store.batch_delete(tenant, id_strs).await;
+        return Ok((st.store.batch_delete(tenant, id_strs).await?, None));
     }
     let mut flags = Vec::with_capacity(id_strs.len());
     for id in id_strs {
         let keep = |d: &Value| conds.holds(id, d);
-        flags.push(st.store.delete_entity_if(tenant, id, &keep).await?);
+        match st.store.delete_entity_if(tenant, id, &keep).await {
+            Ok(deleted) => flags.push(deleted),
+            Err(e) if !flags.contains(&true) => return Err(e),
+            Err(e) => return Ok((flags, Some(e))),
+        }
     }
-    Ok(flags)
+    Ok((flags, None))
 }
 
 /// 5.6.10.4 support ladder: deleteBatch -> one batch forward; else

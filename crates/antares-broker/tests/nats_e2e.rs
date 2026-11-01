@@ -362,6 +362,127 @@ fn an_update_over_the_claim_check_ceiling_still_notifies() {
     });
 }
 
+/// 32 zero bytes in base64: a test key that is plainly not a secret.
+const TEST_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+/// With ANTARES_SECRET_KEY the subscription KV mirror carries the
+/// notification credentials sealed: the bucket entry holds neither the
+/// receiverInfo value nor the URI's userinfo, and the matcher pod, which
+/// only learns of the subscription through that entry, still delivers with
+/// the real header and the real Basic credentials.
+#[test]
+fn the_kv_mirror_carries_sealed_credentials_and_still_delivers() {
+    let _serial = serial();
+    let (Ok(db), Ok(nats)) = (
+        std::env::var("ANTARES_TEST_DATABASE_URL"),
+        std::env::var("ANTARES_TEST_NATS_URL"),
+    ) else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL / ANTARES_TEST_NATS_URL not set");
+        return;
+    };
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let tenant = format!("kv{run}");
+    let key = [("ANTARES_SECRET_KEY", TEST_KEY)];
+
+    let api_port = free_port();
+    let worker_port = free_port();
+    let _api = start_env(api_port, "api", &db, &nats, &key);
+    let _worker = start_env(worker_port, "matcher,notifier", &db, &nats, &key);
+    wait_healthy(api_port);
+    wait_healthy(worker_port);
+
+    let (rx_port, seen) = receiver();
+    let sid = format!("urn:ngsi-ld:Subscription:kv:{run}");
+    let sub = format!(
+        r#"{{"id":"{sid}","type":"Subscription","entities":[{{"type":"SealedKv"}}],
+            "notification":{{"endpoint":{{"uri":"http://hook:pa55word@127.0.0.1:{rx_port}/notify",
+            "receiverInfo":[{{"key":"X-Token","value":"kv-token-{run}"}}]}}}}}}"#
+    );
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(&tenant),
+        Some(&sub),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "sub create: {resp}");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let entry = rt.block_on(async {
+        let kv = antares_bus::nats::NatsBus::connect(&nats)
+            .await
+            .expect("bus")
+            .subs_kv()
+            .await
+            .expect("kv");
+        for _ in 0..150 {
+            let mut keys = kv.keys().await.expect("keys");
+            while let Some(Ok(k)) = futures_util::StreamExt::next(&mut keys).await {
+                if !k.starts_with(&format!("{tenant}.")) {
+                    continue;
+                }
+                if let Ok(Some(v)) = kv.get(k).await {
+                    return String::from_utf8_lossy(&v).into_owned();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        panic!("the subscription never reached the KV");
+    });
+    assert!(
+        !entry.contains("kv-token") && !entry.contains("pa55word"),
+        "plaintext credential in the KV: {entry}"
+    );
+    assert!(entry.contains("enc:v1:"), "{entry}");
+
+    let eid = format!("urn:ngsi-ld:SealedKv:{run}");
+    let ent = format!(r#"{{"id":"{eid}","type":"SealedKv","v":{{"type":"Property","value":1}}}}"#);
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(&tenant),
+        Some(&ent),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "entity create: {resp}");
+    wait_for("the notification through the KV mirror", 30, || {
+        seen.lock().expect("seen").iter().any(|b| b.contains(&eid))
+    });
+    let got = seen
+        .lock()
+        .expect("seen")
+        .iter()
+        .find(|b| b.contains(&eid))
+        .cloned()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        got.contains(&format!("x-token: kv-token-{run}")),
+        "the real receiverInfo header did not arrive"
+    );
+    // base64("hook:pa55word")
+    assert!(
+        got.contains("authorization: basic ag9vazpwytu1d29yza=="),
+        "the real userinfo credentials did not arrive"
+    );
+    // the rows are sealed under the test key: a later broker on this
+    // database without it would fail to read them
+    let resp = http(
+        api_port,
+        "DELETE",
+        &format!("/ngsi-ld/v1/subscriptions/{sid}"),
+        Some(&tenant),
+        None,
+    );
+    assert!(resp.starts_with("HTTP/1.1 204"), "sub delete: {resp}");
+}
+
 /// N≥2 api pods + N≥2 worker pods. A subscription created through api-1
 /// matches an entity created through api-2 (any pod, one broker), and after
 /// one worker dies with SIGKILL the shared durable rebalances — notifications

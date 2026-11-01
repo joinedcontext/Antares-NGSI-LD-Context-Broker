@@ -70,7 +70,8 @@ fn shutdown(st: AppState) {
     st.store.set_change_hook(std::sync::Arc::new(
         |_: &antares_model::TenantId,
          _: Option<serde_json::Value>,
-         _: Option<serde_json::Value>|
+         _: Option<serde_json::Value>,
+         _: antares_store::ChangeVersion|
          -> antares_store::HookFuture<'_> { Box::pin(async {}) },
     ));
     let store = st.store.clone();

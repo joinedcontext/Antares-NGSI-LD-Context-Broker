@@ -18,6 +18,10 @@ spec:
   policyTypes: [Ingress]
 ---
 # The API pods are the entry point: 9090 is the NGSI-LD surface plus /q.
+# A NetworkPolicy cannot tell the two apart by path, so the /q admin routes
+# (tenant purge, dead letters) sit behind the broker's own credential:
+# every broker Deployment mounts the antares-admin Secret as
+# ANTARES_ADMIN_TOKEN_FILE.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -66,6 +70,37 @@ spec:
             matchLabels: { app: antares }
       ports:
         - { port: 5432, protocol: TCP }
+---
+# The production database (postgres-cnpg.yaml): CloudNativePG labels every
+# instance pod of the Cluster with its name. The brokers reach 5432, the
+# instances stream to each other (and a joining replica clones) over 5432,
+# and the CNPG operator reaches each instance manager on 8000 for status,
+# promotion and failover. The operator runs in cnpg-system, the namespace
+# its release manifest installs into.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-cnpg-ingress
+  namespace: antares
+spec:
+  podSelector:
+    matchLabels: { cnpg.io/cluster: antares-pg }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: antares }
+        - podSelector:
+            matchLabels: { cnpg.io/cluster: antares-pg }
+      ports:
+        - { port: 5432, protocol: TCP }
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: cnpg-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: cloudnative-pg }
+      ports:
+        - { port: 8000, protocol: TCP }
 ---
 # Brokers reach NATS on the client port; the cluster port is peer-to-peer
 # between the StatefulSet's own pods.

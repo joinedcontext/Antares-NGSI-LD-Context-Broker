@@ -132,7 +132,9 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
 /// served only with the admin bearer token and answers `401` otherwise,
 /// with no credential configured as well. So a pod that merely reaches the
 /// API port neither registers a Context Source nor creates a Tenant. A
-/// request with a subject goes on to the policy engine unchanged.
+/// request with a subject from a caller the broker believes
+/// ([`vouched_subject`]) goes on to the policy engine unchanged; one from
+/// anybody else is answered as if it carried none.
 pub async fn subject_or_admin(State(st): State<AppState>, req: Request, next: Next) -> Response {
     if admitted(&st, req.headers()) {
         return next.run(req).await;
@@ -153,20 +155,24 @@ fn admitted(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
             .is_some_and(|a| a.admits(presented))
 }
 
-/// A subject header from a caller the broker believes: an
-/// in-process call, which only this process makes, or, on a broker that
-/// names its gateway (`AppState::provenance_from`), a request carrying that
-/// gateway's mesh identity. A pod that only reaches the API port cannot
-/// pass by adding the header. An empty value counts: the gateway sends an
-/// anonymous caller as a roles header with none.
+/// A subject header from a caller the broker believes: an in-process
+/// call, which only this process makes. [`from_named_gateway`] is the seam
+/// for a gateway's mesh identity and believes nobody today, so a request
+/// from outside the process is never vouched for by its subject header. A
+/// pod that only reaches the API port cannot pass by adding the header. An
+/// empty value counts: an in-process caller may send an anonymous subject
+/// as a roles header with none.
 fn vouched_subject(names: &[String], st: &AppState, headers: &axum::http::HeaderMap) -> bool {
     names.iter().any(|name| headers.contains_key(name.as_str()))
         && (crate::state::in_process_depth() > 0 || from_named_gateway(st, headers))
 }
 
-/// This broker names no gateway identity, so no gateway is named.
+/// This broker reads no mesh identity (`provenance` reads no header), so
+/// no request proves it comes from the gateway `provenance_from` names, and
+/// a broker that names none believes nobody: a subject header from outside
+/// the process vouches for nothing.
 fn from_named_gateway(_st: &AppState, _headers: &axum::http::HeaderMap) -> bool {
-    true
+    false
 }
 
 /// `401` with a bearer challenge and `detail`.

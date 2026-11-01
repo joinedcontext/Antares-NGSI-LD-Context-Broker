@@ -261,7 +261,11 @@ jobs:
     # The binaries and the browser proof are in the set on purpose: the
     # image and :latest move only when the whole release can ship, so a red
     # binary never leaves a version on the registry that has no release.
-    needs: [tag, matrix, build-arm, release-binaries, wasm]
+    # `success()` reads this set (and its ancestors) only, so every release
+    # gate is named here: the upgrade path from N-1 and the wasm Node tier
+    # too, or a tag whose binary cannot serve the previous release's data
+    # still moves :latest. github-release inherits them through this job.
+    needs: [tag, matrix, build-arm, release-binaries, wasm, etsi-wasm, upgrade-path]
     runs-on: ubuntu-latest
     permissions:
       packages: write

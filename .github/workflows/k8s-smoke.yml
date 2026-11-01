@@ -54,6 +54,11 @@ jobs:
       - name: Deploy the self-contained subset
         run: |
           kubectl apply -f deploy/k8s/namespace.yaml
+          # the /q admin bearer every broker Deployment mounts; the
+          # manifests ship no Secret, so each deployment mints its own
+          kubectl -n antares create secret generic antares-admin \
+            --from-literal=token="$(openssl rand -hex 32)" \
+            --from-literal=secret-key="$(openssl rand -hex 32)"
           kubectl apply -f deploy/k8s/nats.yaml -f deploy/k8s/postgres-dev.yaml
           # kind has one PG: point the brokers at postgres-dev's antares_app
           # role — non-superuser, no BYPASSRLS, so ANTARES_REQUIRE_RLS=1 stays

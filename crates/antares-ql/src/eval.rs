@@ -313,6 +313,10 @@ fn terminal(
             // value shall be expanded according to the @context."
             out.push((kind, expand_vocab(v, ctx)));
         }
+        // 4.9: with no target language "the target value is defined as a
+        // value from any of the key-value pairs held within the languageMap"
+        // — the bare name reads as `[*]`, never as the map object
+        (None, TargetKind::LanguageMap) => terminal(inst, Some(&["*".to_owned()]), ctx, out),
         (None, _) => push_target(kind, v, out),
         (Some(b), TargetKind::LanguageMap) => {
             let Some(map) = v.as_object() else { return };
@@ -744,6 +748,40 @@ mod clause_4_9_extensions {
         assert!(!q(&e, r#"color[en]!="red""#));
         assert!(!q(&e, r#"color[*]!="red""#), "some language holds red");
         assert!(q(&e, r#"color[*]!="blau""#));
+    }
+
+    /// 4.9: "If the target element is a LanguageProperty, and no target
+    /// language is specified, the target value is defined as a value from
+    /// any of the key-value pairs held within the languageMap" — a bare
+    /// name reads like `[*]`, not like the map object.
+    #[test]
+    fn language_property_without_a_filter_compares_any_language_value() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "color": {"type": "LanguageProperty",
+                "languageMap": {"fr": "rouge", "en": "red"}},
+            "names": {"type": "LanguageProperty",
+                "languageMap": {"fr": ["chat", "rouge"], "en": ["red", "cat"]}}}));
+        assert!(q(&e, r#"color=="red""#), "a value of any key-value pair");
+        assert!(q(&e, r#"color=="blau","rouge""#));
+        assert!(!q(&e, r#"color=="blau""#));
+        assert!(!q(&e, r#"color!="red""#), "some language holds red");
+        assert!(q(&e, r#"color!="blau""#));
+        assert!(q(&e, r#"names=="cat""#), "an element of an array value");
+        assert!(!q(&e, r#"names!="chat""#));
+        assert!(q(&e, "color~=ou"));
+        assert!(q(&e, "color"), "existence still holds");
+    }
+
+    /// 4.9 `patternOp RegExp`: an unquoted digit pattern is a regex over the
+    /// String target, not a Number compared to it.
+    #[test]
+    fn an_unquoted_digit_pattern_matches_strings() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "code": {"type": "Property", "value": "A123"}}));
+        assert!(q(&e, "code~=123"));
+        assert!(q(&e, "code~=A..3"));
+        assert!(!q(&e, "code!~=123"));
+        assert!(!q(&e, "code~=124"));
     }
 
     /// 4.9: "If the target element is a VocabProperty, the target value shall

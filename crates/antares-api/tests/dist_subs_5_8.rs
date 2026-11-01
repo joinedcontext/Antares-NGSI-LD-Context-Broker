@@ -1914,3 +1914,125 @@ async fn the_internal_distsub_endpoint_cannot_be_named_by_a_client() {
     let (status, _) = send(&st, "GET", &format!("/ngsi-ld/v1/subscriptions/{id}"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "no subscription was created");
 }
+
+/// 5.8.2.4: the update re-maps the Subscription to its Registration
+/// Subscription, which is updated per 5.11.3 — and 5.11.3.4 notifies "all
+/// currently matching" registrations after an update. A Subscription widened
+/// from Vehicle to Building therefore reaches the Building-only Context
+/// Source it did not match before (5.11.2.4 newlyMatching).
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_8_2_4_widening_update_reaches_a_newly_matching_source() {
+    allow_private();
+    std::env::set_var("ANTARES_PUBLIC_URL", "http://127.0.0.1:9999");
+    let mut st = AppState::new("antares-distsub-widen".into());
+    antares_api::wire(&mut st).await;
+    let (port, seen) = recording_mock();
+    let reg = json!({"id": "urn:ngsi-ld:ContextSourceRegistration:w1",
+        "type": "ContextSourceRegistration",
+        "information": [{"entities": [{"type": "Building"}]}],
+        "operations": ["federationOps"],
+        "endpoint": format!("http://127.0.0.1:{port}")});
+    let (s, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/csourceRegistrations",
+        Some(reg.to_string()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let sub = json!({"id": "urn:ngsi-ld:Subscription:widen", "type": "Subscription",
+        "entities": [{"type": "Vehicle"}],
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9998/o"}}});
+    let (s, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(sub.to_string()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        seen.lock().expect("seen").is_empty(),
+        "a Vehicle Subscription has no copy at a Building source"
+    );
+    let patch = json!({"entities": [{"type": "Building"}]}).to_string();
+    let (s, _) = send(
+        &st,
+        "PATCH",
+        "/ngsi-ld/v1/subscriptions/urn:ngsi-ld:Subscription:widen",
+        Some(patch),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    wait_for("a copy at the newly matching source", || {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .any(|r| r.starts_with("POST /ngsi-ld/v1/subscriptions"))
+    })
+    .await;
+}
+
+/// 5.8.2.4 the other way: narrowed from Vehicle to Building, the Subscription
+/// no longer matches the Vehicle source, whose copy is deleted there
+/// (5.11.2.4 noLongerMatching) instead of notifying on for a selector the
+/// subscriber dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_8_2_4_narrowing_update_deletes_the_copy_that_no_longer_matches() {
+    allow_private();
+    std::env::set_var("ANTARES_PUBLIC_URL", "http://127.0.0.1:9999");
+    let mut st = AppState::new("antares-distsub-narrow".into());
+    antares_api::wire(&mut st).await;
+    let (port, seen) = recording_mock();
+    let reg = json!({"id": "urn:ngsi-ld:ContextSourceRegistration:n1",
+        "type": "ContextSourceRegistration",
+        "information": [{"entities": [{"type": "Vehicle"}]}],
+        "operations": ["federationOps"],
+        "endpoint": format!("http://127.0.0.1:{port}")});
+    let (s, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/csourceRegistrations",
+        Some(reg.to_string()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let sub = json!({"id": "urn:ngsi-ld:Subscription:narrow", "type": "Subscription",
+        "entities": [{"type": "Vehicle"}],
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9998/o"}}});
+    let (s, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(sub.to_string()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    wait_for("the copy at the Vehicle source", || {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .any(|r| r.starts_with("POST /ngsi-ld/v1/subscriptions"))
+    })
+    .await;
+    let patch = json!({"entities": [{"type": "Building"}]}).to_string();
+    let (s, _) = send(
+        &st,
+        "PATCH",
+        "/ngsi-ld/v1/subscriptions/urn:ngsi-ld:Subscription:narrow",
+        Some(patch),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    wait_for(
+        "the copy deleted at the source that no longer matches",
+        || {
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .any(|r| r.starts_with("DELETE /ngsi-ld/v1/subscriptions/"))
+        },
+    )
+    .await;
+}

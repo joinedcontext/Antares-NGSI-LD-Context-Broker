@@ -1508,3 +1508,154 @@ async fn a_busy_pool_fails_a_geoquery_once() {
         "one acquire wall, not two: {waited:?}"
     );
 }
+
+/// S3-11: the 4.22 history reap of one table reads that table's partial
+/// `expires_at` index (built by the maintenance job, migration 0030) and
+/// deletes by ctid, where the reap it replaces read every row of the history
+/// each tick. One partition or chunk of `attr_instances` and `attr_versions`,
+/// 20 000 rows each, 20 of them stamped. Run as the broker's role, the
+/// statement goes through each table's own policies: under one Tenant it
+/// deletes that Tenant's expired rows only, under the service escape every
+/// Tenant's (attr_versions carries RLS in both modes, ADR-0006).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_history_reap_reads_the_expires_at_index_under_rls() {
+    use antares_sql::store::pg::maintenance::{expired_history_sql, history_expiry_index};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let (ta, tb) = ("pgexplain-reap-a", "pgexplain-reap-b");
+    for stmt in [
+        "DELETE FROM attr_instances WHERE tenant_id IN ('pgexplain-reap-a', 'pgexplain-reap-b')",
+        "DELETE FROM attr_versions WHERE tenant_id IN ('pgexplain-reap-a', 'pgexplain-reap-b')",
+        // a stamp on every thousandth row, half of them past
+        "INSERT INTO attr_instances (tenant_id, entity_id, attr_id, instance_id, observed_at,
+                                     created_at, modified_at, data, expires_at)
+         SELECT t, 'urn:r:' || (g % 100), 'https://x/speed', 'urn:i:' || g,
+                now() - make_interval(secs => g), now(), now(),
+                CASE WHEN g % 1000 = 0 THEN jsonb_build_object('expiresAt',
+                       CASE WHEN g % 2000 = 0 THEN '2020-01-01T00:00:00Z' ELSE '2099-01-01T00:00:00Z' END)
+                     ELSE '{}'::jsonb END,
+                CASE WHEN g % 2000 = 0 THEN timestamptz '2020-01-01T00:00:00Z'
+                     WHEN g % 1000 = 0 THEN timestamptz '2099-01-01T00:00:00Z' END
+           FROM unnest(ARRAY['pgexplain-reap-a', 'pgexplain-reap-b']) t, generate_series(1, 10000) g",
+        "INSERT INTO attr_versions (tenant_id, entity_id, attr_id, instance_id, observed_at,
+                                    version, data, expires_at)
+         SELECT tenant_id, entity_id, attr_id, instance_id, observed_at, 1, data, expires_at
+           FROM attr_instances WHERE tenant_id IN ('pgexplain-reap-a', 'pgexplain-reap-b')",
+    ] {
+        sqlx::query(stmt).execute(&pool).await.expect(stmt);
+    }
+    // the table of the newest rows, named as the maintenance job names it
+    let (part, index): (String, String) = sqlx::query_as(
+        "SELECT format('%I.%I', n.nspname, c.relname), left(c.relname, 54) || '_expires'
+           FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.oid = (SELECT tableoid FROM attr_instances WHERE tenant_id = 'pgexplain-reap-a'
+                          ORDER BY observed_at DESC LIMIT 1)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("partition");
+    // that table alone: an ANALYZE of the parent would give every empty
+    // partition a zero-page estimate, which other plans here read as a Seq Scan
+    let analyze = format!("ANALYZE {part}, attr_versions");
+    sqlx::query(sqlx::AssertSqlSafe(analyze.clone()))
+        .execute(&pool)
+        .await
+        .expect(&analyze);
+    let built = |name: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
+                                 WHERE c.relname = $1 AND x.indisvalid)",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .expect("index")
+        }
+    };
+    for _ in 0..100 {
+        history_expiry_index(&pool).await.expect("build");
+        if built(index.clone()).await && built("attr_versions_expires".into()).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let mut bad = Vec::new();
+    for (table, index) in [
+        (part.as_str(), index.as_str()),
+        ("public.attr_versions", "attr_versions_expires"),
+    ] {
+        let plan = plan_as(&pool, "", true, &expired_history_sql(table)).await;
+        if !plan.contains(index) || plan.contains("Seq Scan") {
+            bad.push(format!("{table} (wants {index}):\n{plan}"));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "history reaps that walk:\n\n{}",
+        bad.join("\n\n")
+    );
+
+    // the same statement executed as the broker's role
+    let reap_as = |tenant: &'static str, service: bool| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.expect("tx");
+            sqlx::query("SET LOCAL ROLE antares_app")
+                .execute(&mut *tx)
+                .await
+                .expect("role");
+            sqlx::query(
+                "SELECT set_config('antares.tenant', $1, true), set_config('antares.service', $2, true)",
+            )
+            .bind(tenant)
+            .bind(if service { "on" } else { "off" })
+            .execute(&mut *tx)
+            .await
+            .expect("tenant");
+            sqlx::query(sqlx::AssertSqlSafe(expired_history_sql(
+                "public.attr_versions",
+            )))
+            .execute(&mut *tx)
+            .await
+            .expect("reap");
+            tx.commit().await.expect("commit");
+        }
+    };
+    let stamped = || async {
+        sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT tenant_id, count(*) FILTER (WHERE expires_at < now()),
+                    count(*) FILTER (WHERE expires_at >= now())
+               FROM attr_versions WHERE tenant_id IN ('pgexplain-reap-a', 'pgexplain-reap-b')
+              GROUP BY 1 ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("count")
+    };
+    assert_eq!(stamped().await, [(ta.into(), 5, 5), (tb.into(), 5, 5)]);
+    reap_as(ta, false).await;
+    assert_eq!(
+        stamped().await,
+        [(ta.into(), 0, 5), (tb.into(), 5, 5)],
+        "a Tenant's session reaps its own rows only"
+    );
+    reap_as("", true).await;
+    assert_eq!(
+        stamped().await,
+        [(ta.into(), 0, 5), (tb.into(), 0, 5)],
+        "the service escape reaps every Tenant's"
+    );
+    for stmt in [
+        "DELETE FROM attr_instances WHERE tenant_id IN ('pgexplain-reap-a', 'pgexplain-reap-b')",
+        "DELETE FROM attr_versions WHERE tenant_id IN ('pgexplain-reap-a', 'pgexplain-reap-b')",
+        // the statistics the other plans here read, without these rows
+        analyze.as_str(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .expect(stmt);
+    }
+}

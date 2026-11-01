@@ -475,7 +475,7 @@ Five phases exist. Extensions attach to a phase; they never define one.
 | phase | fires | seam in code | failure policy |
 |---|---|---|---|
 | `on_request` | after parse and validation, before the operation | `policy::decide`, called by the `gate!` in each handler | fail-closed |
-| `on_change` | after commit, with the before/after documents | `ChangeHook` (`antares-store`); on Postgres the same change rides the transactional outbox to the bus | fail-open |
+| `on_change` | after commit, with the before/after documents and the `ChangeVersion` the write left (two writers' hooks may run in either order on Postgres; a consumer keeping the newest image drops an older change through `NewestSeen`) | `ChangeHook` (`antares-store`); on Postgres the same change rides the transactional outbox to the bus | fail-open |
 | `temporal_event` | in the post-response drain, with the whole request's events | `history::drain` and the gate chain in `crates/antares-api/src/history.rs` | fail-open |
 | `pre_notify` | notification built, before send | `policy::pre_notify`, then the `NotificationSink` | fail-closed: an engine that panics drops the notification |
 | `on_response` | render and annotate | tower layer | fail-closed |

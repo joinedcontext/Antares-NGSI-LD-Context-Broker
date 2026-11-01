@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 /// entry is a fragment that appears in exactly one literal.
 const EXEMPT: &[(&str, &str)] = &[
     (
-        "WHERE try_timestamptz(data->>'expiresAt') < now()",
+        "WHERE data ? 'expiresAt' AND try_timestamptz(data->>'expiresAt') < now()",
         "the 4.22 expired-instance reap (both history parents): cross-tenant \
          work under the service role, which is what lets it collect every tenant's expired rows in \
          one statement",

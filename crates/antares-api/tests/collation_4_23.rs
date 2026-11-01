@@ -2,8 +2,9 @@
 //! 4.23 Entity ordering through query parameters.
 //!
 //! 4.23.1 / 4.23.3 EXAMPLES 6/7: the collation parameter — orderBy string
-//! comparison under an ICU collation (RFC 6067 tag) instead of codepoint
-//! order; 5.2.43 maps the OrderingParams `collation` member onto it.
+//! comparison under an ICU collation (RFC 6067 tag), the ICU root collation
+//! when none is named; 5.2.43 maps the OrderingParams `collation` member
+//! onto it.
 //!
 //! 4.23.3 EXAMPLES 8/9/10: distance ordering, whose reference geometry is
 //! `orderFrom` (+ `orderGeometry`, default Point). The clause writes those
@@ -75,20 +76,33 @@ fn names(body: &Value) -> Vec<String> {
         .collect()
 }
 
+/// 4.23.1: "for strings the default collation order shall be defined as
+/// using ICU \"root\" collation order (\"und-x-icu\")", and 5.2.43 says the
+/// same of a Query's OrderingParams: no collation parameter is the root
+/// collation, not codepoint order.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_23_1_default_string_order_is_icu_root() {
+    let st = AppState::new("me".into());
+    seed(&st, "1", "b").await;
+    seed(&st, "2", "A").await;
+    seed(&st, "3", "á").await;
+    let (status, body) = get(&st, "/ngsi-ld/v1/entities?type=Vehicle&orderBy=name").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(names(&body), vec!["A", "á", "b"], "{body}");
+    let (status, body) = get(&st, "/ngsi-ld/v1/entities?type=Vehicle&orderBy=name;desc").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(names(&body), vec!["b", "á", "A"], "{body}");
+}
+
 /// 4.23.3 EXAMPLE 6/7: under the root collation "á" sorts with "a" (before
-/// "b"); under codepoint order it sorts after "b". Both orders asserted so
-/// the collation path is proven distinct from the default.
+/// "b"); under codepoint order it would sort after "b". Named, the root
+/// collation answers what the default answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn clause_4_23_3_collation_orders_accented_strings() {
     let st = AppState::new("me".into());
     seed(&st, "1", "b").await;
     seed(&st, "2", "A").await;
     seed(&st, "3", "á").await;
-
-    // codepoint default: "A" < "b" < "á"
-    let (status, body) = get(&st, "/ngsi-ld/v1/entities?type=Vehicle&orderBy=name").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(names(&body), vec!["A", "b", "á"], "{body}");
 
     // root collation: "A" < "á" < "b"
     let (status, body) = get(
@@ -101,8 +115,9 @@ async fn clause_4_23_3_collation_orders_accented_strings() {
 }
 
 /// 4.23.3 EXAMPLE 6: -u-ks- strength — level1 (primary) makes case
-/// differences tie so "abc" ranks before "ABD"; codepoint order puts
-/// "ABD" first.
+/// differences tie so "abc" ranks before "ABD"; so does the root default,
+/// whose difference on the third letter outranks case. Codepoint order, a
+/// collation 4.23 names nowhere, would put "ABD" first.
 #[tokio::test(flavor = "multi_thread")]
 async fn clause_4_23_3_strength_keyword_is_honoured() {
     let st = AppState::new("me".into());
@@ -111,7 +126,7 @@ async fn clause_4_23_3_strength_keyword_is_honoured() {
 
     let (status, body) = get(&st, "/ngsi-ld/v1/entities?type=Vehicle&orderBy=name").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(names(&body), vec!["ABD", "abc"], "codepoint: {body}");
+    assert_eq!(names(&body), vec!["abc", "ABD"], "root default: {body}");
 
     let (status, body) = get(
         &st,

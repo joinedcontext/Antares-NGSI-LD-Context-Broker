@@ -283,3 +283,124 @@ async fn join_expands_an_entity_at_its_shallowest_depth() {
         "{flat}"
     );
 }
+
+/// 4.5.23.2 simplified: the inline join replaces a Relationship's object URI
+/// by the Linked Entity. A Property whose value happens to be a URI string
+/// links nothing — in keyValues the two look alike, so the walk reads the
+/// attribute type off the Entity, not off the simplified string — and a
+/// multi-instance Relationship (the `dataset` map) joins per instance. The
+/// same holds one level down, inside a joined Entity, and on a query page.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyvalues_inline_join_follows_relationships_only() {
+    let st = AppState::new("kv-join".into());
+    create(&st, json!({"id": "urn:ngsi-ld:T:1", "type": "T"})).await;
+    create(
+        &st,
+        json!({"id": "urn:ngsi-ld:M:1", "type": "M",
+               "note": {"type": "Property", "value": "urn:ngsi-ld:T:1"},
+               "next": {"type": "Relationship", "object": "urn:ngsi-ld:T:1"}}),
+    )
+    .await;
+    create(
+        &st,
+        json!({"id": "urn:ngsi-ld:R:1", "type": "R",
+               "note": {"type": "Property", "value": "urn:ngsi-ld:T:1"},
+               "notes": {"type": "ListProperty", "valueList": ["urn:ngsi-ld:T:1"]},
+               "rel": {"type": "Relationship", "object": "urn:ngsi-ld:M:1"},
+               "many": [{"type": "Relationship", "object": "urn:ngsi-ld:T:1"},
+                        {"type": "Relationship", "object": "urn:ngsi-ld:T:1",
+                         "datasetId": "urn:ngsi-ld:Dataset:b"}]}),
+    )
+    .await;
+    let get = |uri: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    };
+    let (status, _, one) = send(
+        &st,
+        get("/ngsi-ld/v1/entities/urn:ngsi-ld:R:1?format=keyValues&join=inline&joinLevel=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    let (status, _, page) = send(
+        &st,
+        get("/ngsi-ld/v1/entities?type=R&format=keyValues&join=inline&joinLevel=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    for v in [&one, &page[0]] {
+        assert_eq!(
+            v["note"], "urn:ngsi-ld:T:1",
+            "a Property value is not a Linked Entity: {v}"
+        );
+        assert_eq!(
+            v["notes"],
+            json!(["urn:ngsi-ld:T:1"]),
+            "nor a ListProperty's: {v}"
+        );
+        assert_eq!(
+            v["rel"]["id"], "urn:ngsi-ld:M:1",
+            "the Relationship joins: {v}"
+        );
+        assert_eq!(
+            v["rel"]["note"], "urn:ngsi-ld:T:1",
+            "one level down too: {v}"
+        );
+        assert_eq!(v["rel"]["next"]["id"], "urn:ngsi-ld:T:1", "{v}");
+        for ds in ["@none", "urn:ngsi-ld:Dataset:b"] {
+            assert_eq!(
+                v["many"]["dataset"][ds]["id"], "urn:ngsi-ld:T:1",
+                "each instance of a multi-instance Relationship joins: {v}"
+            );
+        }
+    }
+}
+
+/// 4.5.23 with `omit=id`: the rendered Entity carries no id, yet the inline
+/// join still reads the Relationships of the Entity it was rendered from,
+/// so a keyValues Relationship is joined and a URI-valued Property is not.
+#[tokio::test]
+async fn keyvalues_inline_join_reads_relationships_when_the_id_is_omitted() {
+    let st = AppState::new("kv-join-omit".into());
+    create(&st, json!({"id": "urn:ngsi-ld:T:1", "type": "T"})).await;
+    create(
+        &st,
+        json!({"id": "urn:ngsi-ld:R:1", "type": "R",
+               "note": {"type": "Property", "value": "urn:ngsi-ld:T:1"},
+               "rel": {"type": "Relationship", "object": "urn:ngsi-ld:T:1"}}),
+    )
+    .await;
+    let get = |uri: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request")
+    };
+    let (status, _, one) = send(
+        &st,
+        get("/ngsi-ld/v1/entities/urn:ngsi-ld:R:1?format=keyValues&join=inline&omit=id"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    let (status, _, page) = send(
+        &st,
+        get("/ngsi-ld/v1/entities?type=R&format=keyValues&join=inline&omit=id"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    for v in [&one, &page[0]] {
+        assert!(v.get("id").is_none(), "omit=id drops the id: {v}");
+        assert_eq!(
+            v["note"], "urn:ngsi-ld:T:1",
+            "a Property stays a value: {v}"
+        );
+        assert_eq!(
+            v["rel"]["id"], "urn:ngsi-ld:T:1",
+            "the Relationship joins: {v}"
+        );
+    }
+}

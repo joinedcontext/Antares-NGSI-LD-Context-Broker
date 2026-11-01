@@ -53,13 +53,108 @@ pub fn stored_object(doc: &mut Value) -> Result<&mut serde_json::Map<String, Val
 /// fires the hook awaits it before its own write returns.
 pub type HookFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
-/// Called with (tenant, before, after) on every entity write — the local-mode
-/// change feed: create ⇒ (None, Some), delete ⇒ (Some, None). Shared rather
-/// than owned: a driver clones it out of its lock before awaiting, since a
-/// lock guard cannot be held across an await.
+/// Called with (tenant, before, after, version) on every entity write — the
+/// local-mode change feed: create ⇒ (None, Some), delete ⇒ (Some, None).
+/// Shared rather than owned: a driver clones it out of its lock before
+/// awaiting, since a lock guard cannot be held across an await. Two writers
+/// of one Entity may run their hooks in either order; `version` is the order
+/// they committed in ([`ChangeVersion`]).
 pub type ChangeHook = std::sync::Arc<
-    dyn for<'a> Fn(&'a TenantId, Option<Value>, Option<Value>) -> HookFuture<'a> + Send + Sync,
+    dyn for<'a> Fn(&'a TenantId, Option<Value>, Option<Value>, ChangeVersion) -> HookFuture<'a>
+        + Send
+        + Sync,
 >;
+
+/// Where one entity change stands among the changes of its Entity, read
+/// under the write's row lock: the incarnation (the stored row's creation
+/// stamp, which tells a recreated Entity from the one deleted before it, as
+/// its version starts again at 1) and the version the write left, one past
+/// the deleted row's for a delete. Ordered: of two changes of one (Tenant,
+/// id), the greater committed last. A driver without row versions counts
+/// its commits instead, under the order it emits in; one that cannot tell
+/// the order passes the default, and equal versions are all admitted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChangeVersion {
+    /// The stored row's creation stamp as the driver spells it; empty on a
+    /// driver that counts commits.
+    pub incarnation: String,
+    /// The row version the write left, or the driver's commit count.
+    pub version: i64,
+}
+
+/// The newest [`ChangeVersion`] a change-hook consumer has seen per (Tenant,
+/// Entity id), so it drops a change a later commit's hook overtook instead
+/// of ending with the older image. Bounded: two generations of at most `cap`
+/// entries, the older forgotten when the newer fills, so memory stays at
+/// `2 * cap` keys whatever the number of Entities. A key forgotten admits
+/// its next change: hooks overtake each other within the few writes in
+/// flight at once, far fewer than `cap`.
+pub struct NewestSeen {
+    cap: usize,
+    gens: std::sync::Mutex<[std::collections::HashMap<(String, String), Seen>; 2]>,
+}
+
+/// The newest version admitted per incarnation of one key, newest
+/// incarnation last; at most [`INCARNATIONS`] of them.
+type Seen = Vec<(String, i64)>;
+
+/// Incarnations remembered per key: a delete and recreate burst longer than
+/// this forgets the oldest, whose next change is then admitted.
+const INCARNATIONS: usize = 4;
+
+impl NewestSeen {
+    /// A map of at most `2 * cap` keys.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            gens: std::sync::Mutex::default(),
+        }
+    }
+
+    /// `false` when a change of `(tenant, id)` newer than `v` was admitted;
+    /// otherwise `v` becomes the newest and `true`. An equal version is
+    /// admitted: a change seen twice is delivered twice, never lost.
+    ///
+    /// Versions are compared only within one incarnation, never across
+    /// them. The incarnation is a wall-clock creation stamp: one recreated in
+    /// the same millisecond, or by a pod whose clock runs behind, does not
+    /// sort after the deleted one's. Nor does arrival order rank them: with
+    /// A, C and B arriving in that order from hooks that overtook each
+    /// other, any rule that drops a "superseded" incarnation ends up muting
+    /// the live one. So a change is dropped only when its own incarnation
+    /// already delivered a newer version (the delete leaves one past the
+    /// row's, so a late update of a deleted incarnation whose delete was seen
+    /// is dropped). A late change of another incarnation is admitted: at
+    /// worst a stale image, never a lost one.
+    pub fn admit(&self, tenant: &str, id: &str, v: &ChangeVersion) -> bool {
+        // a poisoned map is a panic between two plain map operations: the
+        // map itself is whole
+        let mut gens = self
+            .gens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (tenant.to_owned(), id.to_owned());
+        let mut seen: Seen = gens[0]
+            .get(&key)
+            .or_else(|| gens[1].get(&key))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(i) = seen.iter().position(|(inc, _)| *inc == v.incarnation) {
+            if seen[i].1 > v.version {
+                return false;
+            }
+            seen.remove(i);
+        } else if seen.len() >= INCARNATIONS {
+            seen.remove(0);
+        }
+        seen.push((v.incarnation.clone(), v.version));
+        if gens[0].len() >= self.cap && !gens[0].contains_key(&key) {
+            gens[1] = std::mem::take(&mut gens[0]);
+        }
+        gens[0].insert(key, seen);
+        true
+    }
+}
 
 /// Which resource family an operation touches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -934,48 +1029,67 @@ pub struct TemporalEvent {
 /// [`TemporalDriver::event_list`]'s default: consecutive events of one Entity
 /// become one `temporal_append`; a scope change goes through `mutate`, in
 /// order. A driver that overrides `event_list` falls back to it.
+///
+/// An Entity run the driver refuses (a memory/file history at its cap)
+/// loses its own events and no other's: the drain goes on, and answers the
+/// first refusal once the whole request is through.
 pub async fn drain_events<D: TemporalDriver + ?Sized>(
     d: &D,
     evs: &[TemporalEvent],
 ) -> Result<(), NgsiError> {
+    let mut first = None;
     let mut i = 0;
     while i < evs.len() {
         let (tenant, id) = (&evs[i].tenant, evs[i].entity_id.as_str());
-        let mut additions = serde_json::Map::new();
-        let mut shell = &evs[i].shell;
-        let mut j = i;
-        while j < evs.len() && evs[j].tenant == *tenant && evs[j].entity_id == id {
-            let ev = &evs[j];
-            shell = &ev.shell;
-            if ev.op == TemporalOp::ScopeChanged {
-                // the additions before it first: they may create the doc the
-                // scope instance goes on, and history keeps production order
-                if !additions.is_empty() {
-                    let pending = Value::Object(std::mem::take(&mut additions));
-                    d.temporal_append(tenant, id, shell, &pending).await?;
-                }
-                if push_scope(d, tenant, id, &ev.instance).await?.is_none() {
-                    // no temporal doc yet: create the shell, then record
-                    let empty = Value::Object(serde_json::Map::new());
-                    d.temporal_append(tenant, id, shell, &empty).await?;
-                    push_scope(d, tenant, id, &ev.instance).await?;
-                }
-            } else {
-                if let Some(arr) = additions
-                    .entry(ev.attr.clone())
-                    .or_insert_with(|| Value::Array(Vec::new()))
-                    .as_array_mut()
-                {
-                    arr.push(ev.instance.clone());
-                }
+        let end = i + evs[i..]
+            .iter()
+            .take_while(|e| e.tenant == *tenant && e.entity_id == id)
+            .count();
+        if let Err(e) = drain_run(d, &evs[i..end]).await {
+            first.get_or_insert(e);
+        }
+        i = end;
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// One Entity's consecutive events of [`drain_events`].
+async fn drain_run<D: TemporalDriver + ?Sized>(
+    d: &D,
+    run: &[TemporalEvent],
+) -> Result<(), NgsiError> {
+    let Some(head) = run.first() else {
+        return Ok(());
+    };
+    let (tenant, id) = (&head.tenant, head.entity_id.as_str());
+    let mut additions = serde_json::Map::new();
+    let mut shell = &head.shell;
+    for ev in run {
+        shell = &ev.shell;
+        if ev.op == TemporalOp::ScopeChanged {
+            // the additions before it first: they may create the doc the
+            // scope instance goes on, and history keeps production order
+            if !additions.is_empty() {
+                let pending = Value::Object(std::mem::take(&mut additions));
+                d.temporal_append(tenant, id, shell, &pending).await?;
             }
-            j += 1;
+            if push_scope(d, tenant, id, &ev.instance).await?.is_none() {
+                // no temporal doc yet: create the shell, then record
+                let empty = Value::Object(serde_json::Map::new());
+                d.temporal_append(tenant, id, shell, &empty).await?;
+                push_scope(d, tenant, id, &ev.instance).await?;
+            }
+        } else if let Some(arr) = additions
+            .entry(ev.attr.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+        {
+            arr.push(ev.instance.clone());
         }
-        if !additions.is_empty() {
-            d.temporal_append(tenant, id, shell, &Value::Object(additions))
-                .await?;
-        }
-        i = j;
+    }
+    if !additions.is_empty() {
+        d.temporal_append(tenant, id, shell, &Value::Object(additions))
+            .await?;
     }
     Ok(())
 }
@@ -1417,6 +1531,113 @@ impl TemporalDriver for NoTemporal {
 mod tests {
     use super::*;
 
+    /// A recreate whose creation stamp sorts at or below the deleted
+    /// incarnation's (one millisecond, a clock behind) is still admitted,
+    /// and so are its updates; within one incarnation an overtaken change
+    /// is still dropped.
+    #[test]
+    fn a_recreated_incarnation_is_admitted_whatever_its_stamp() {
+        let seen = NewestSeen::new(16);
+        let v = |incarnation: &str, version| ChangeVersion {
+            incarnation: incarnation.to_owned(),
+            version,
+        };
+        let old = "2026-01-01 00:00:00.500+00";
+        assert!(seen.admit("t", "urn:e", &v(old, 3)));
+        // the delete leaves one past the deleted row's version
+        assert!(seen.admit("t", "urn:e", &v(old, 4)));
+        let recreated = "2026-01-01 00:00:00.400+00";
+        assert!(
+            seen.admit("t", "urn:e", &v(recreated, 1)),
+            "the recreate was dropped"
+        );
+        assert!(
+            seen.admit("t", "urn:e", &v(recreated, 2)),
+            "its update was dropped"
+        );
+        assert!(
+            !seen.admit("t", "urn:e", &v(recreated, 1)),
+            "an overtaken change of one incarnation is still dropped"
+        );
+        assert!(
+            !seen.admit("t", "urn:e", &v(old, 3)),
+            "a late change of the superseded incarnation is still dropped"
+        );
+    }
+
+    /// SECV-01: incarnations arriving out of order (A, C, then a late B)
+    /// never mute the live one: C's next update still goes out.
+    #[test]
+    fn a_late_third_incarnation_never_mutes_the_live_one() {
+        let v = |inc: &str, n: i64| ChangeVersion {
+            incarnation: inc.into(),
+            version: n,
+        };
+        let seen = NewestSeen::new(16);
+        assert!(seen.admit("t", "e", &v("A", 1)));
+        assert!(seen.admit("t", "e", &v("A", 2)), "A's delete");
+        assert!(seen.admit("t", "e", &v("C", 1)));
+        assert!(seen.admit("t", "e", &v("B", 1)), "B's change arrives late");
+        assert!(
+            seen.admit("t", "e", &v("C", 2)),
+            "the live Entity was muted"
+        );
+        assert!(
+            !seen.admit("t", "e", &v("C", 1)),
+            "C's own order still holds"
+        );
+        assert!(
+            !seen.admit("t", "e", &v("A", 1)),
+            "A's late update after its delete"
+        );
+        for i in 0..INCARNATIONS {
+            assert!(seen.admit("t", "e", &v(&format!("n{i}"), 1)));
+        }
+        assert!(
+            seen.admit("t", "e", &v("C", 1)),
+            "forgotten past the bound: admitted"
+        );
+    }
+
+    /// S3-18: a change an overtaken hook delivers late is dropped, a newer
+    /// one, an equal one and a recreated Entity's first are admitted, and the
+    /// map forgets past two generations.
+    #[test]
+    fn newest_seen_drops_what_a_later_commit_overtook() {
+        let v = |inc: &str, n: i64| ChangeVersion {
+            incarnation: inc.into(),
+            version: n,
+        };
+        let seen = NewestSeen::new(2);
+        assert!(seen.admit("t", "e", &v("a", 2)));
+        assert!(
+            !seen.admit("t", "e", &v("a", 1)),
+            "the older image arrives last"
+        );
+        assert!(
+            seen.admit("t", "e", &v("a", 2)),
+            "seen twice, delivered twice"
+        );
+        assert!(seen.admit("u", "e", &v("a", 1)), "another Tenant's Entity");
+        assert!(seen.admit("t", "e", &v("b", 1)), "recreated after a delete");
+        assert!(
+            !seen.admit("t", "e", &v("a", 1)),
+            "a late change of the deleted incarnation older than one it delivered"
+        );
+        for i in 0..4 {
+            assert!(seen.admit("t", &format!("x{i}"), &v("a", 1)));
+        }
+        let held = seen
+            .gens
+            .lock()
+            .expect("map")
+            .iter()
+            .map(|g| g.len())
+            .sum::<usize>();
+        assert!(held <= 4, "two generations of two: {held}");
+        assert!(seen.admit("t", "e", &v("a", 1)), "forgotten past the bound");
+    }
+
     /// a short type rule wins over the Tenant's level, a longer type
     /// rule among the types or the Entity's own retention keeps it logged.
     #[test]
@@ -1687,6 +1908,8 @@ mod tests {
     struct Recorder {
         appends: std::sync::Mutex<Vec<(String, Value)>>,
         doc: std::sync::Mutex<Option<Value>>,
+        /// the Entity whose appends this driver refuses (a full history)
+        refuse: Option<&'static str>,
     }
     #[async_trait::async_trait]
     impl TemporalDriver for Recorder {
@@ -1697,6 +1920,9 @@ mod tests {
             shell: &Value,
             additions: &Value,
         ) -> Result<(), NgsiError> {
+            if self.refuse == Some(id) {
+                return Err(NgsiError::BadRequestData("history full".into()));
+            }
             self.appends
                 .lock()
                 .expect("lock")
@@ -1815,6 +2041,33 @@ mod tests {
             "instances live under their attribute: {first}"
         );
         assert_eq!(appends[2].1["speed"][0]["value"], 5);
+    }
+
+    /// One Entity whose append the driver refuses (its history is full)
+    /// loses its own history of the request, never the other Entities':
+    /// the drain goes on and reports the refusal once it is done.
+    #[tokio::test]
+    async fn a_refused_append_drops_only_its_own_entity() {
+        let d = Recorder {
+            refuse: Some("urn:a"),
+            ..Recorder::default()
+        };
+        let r = d
+            .event_list(&[
+                ev(TemporalOp::AttrModified, "urn:a", "speed", 1),
+                ev(TemporalOp::AttrModified, "urn:b", "speed", 2),
+                ev(TemporalOp::AttrModified, "urn:c", "speed", 3),
+            ])
+            .await;
+        assert!(matches!(r, Err(NgsiError::BadRequestData(_))), "{r:?}");
+        let ids: Vec<String> = d
+            .appends
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(ids, ["urn:b", "urn:c"]);
     }
 
     /// 4.5.6: a scope change becomes a scope instance on the held temporal

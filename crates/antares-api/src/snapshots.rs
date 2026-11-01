@@ -224,6 +224,12 @@ pub(crate) async fn sweep_expired_snapshots(st: &AppState, tenant: &TenantId) ->
     .await
     .is_err()
     {
+        // nothing is freed this round, and that is not silent: the tenant
+        // only, no error text (a value that would not open is a credential)
+        tracing::error!(
+            tenant = tenant.as_str(),
+            "the expired-snapshot sweep could not list this tenant's snapshots"
+        );
         return 0;
     }
     let n = dead.len();
@@ -277,10 +283,79 @@ fn purge_data_bg(st: &AppState, meta: &Value) {
 }
 
 /// The snapshot document as presented to clients (internal members hidden).
+/// `receiverInfo` and userinfo in `endpoint` are the credentials the 5.16.6
+/// notification is sent with, so a read answers them masked, exactly as a
+/// Subscription's (`subscriptions::mask_receiver_info`).
 fn present(meta: &Value) -> Value {
     let mut out = meta.clone();
     crate::policy::strip_internal(&mut out);
+    if let Some(o) = out.as_object_mut() {
+        let mut n = as_notification(o);
+        crate::subscriptions::mask_receiver_info(&mut n);
+        from_notification(o, n);
+    }
     out
+}
+
+/// A Snapshot's `endpoint` and `receiverInfo` (Table 5.2.41-1) in the
+/// `notification.endpoint` shape a Subscription keeps them in (5.2.15), so
+/// both go through the one masking rule.
+fn as_notification(o: &Map<String, Value>) -> Map<String, Value> {
+    let mut ep = Map::new();
+    if let Some(u) = o.get("endpoint") {
+        ep.insert("uri".into(), u.clone());
+    }
+    if let Some(r) = o.get("receiverInfo") {
+        ep.insert("receiverInfo".into(), r.clone());
+    }
+    Map::from_iter([("endpoint".to_owned(), Value::Object(ep))])
+}
+
+/// [`as_notification`] back: the members it carried, as they now stand.
+fn from_notification(o: &mut Map<String, Value>, n: Map<String, Value>) {
+    let Some(Value::Object(ep)) = n.get("endpoint") else {
+        return;
+    };
+    for (from, to) in [("uri", "endpoint"), ("receiverInfo", "receiverInfo")] {
+        if let (Some(v), true) = (ep.get(from), o.contains_key(to)) {
+            o.insert(to.into(), v.clone());
+        }
+    }
+}
+
+/// 5.16.4 update of the notification members. A client that read the
+/// Snapshot and writes it back sends the masked values it was answered:
+/// those keep the stored credential, and only beside the stored endpoint
+/// (`subscriptions::keep_masked_receiver_info`). The credential stays with
+/// its endpoint the other way too: an update that moves the endpoint and
+/// sends no `receiverInfo` drops the stored one, or the next notification
+/// would carry it to whatever host the update named.
+fn keep_receiver_info(
+    frag: &mut Map<String, Value>,
+    stored: &Map<String, Value>,
+) -> Result<(), NgsiError> {
+    if !frag.contains_key("endpoint") && !frag.contains_key("receiverInfo") {
+        return Ok(());
+    }
+    let mut f = Map::from_iter([(
+        "notification".to_owned(),
+        Value::Object(as_notification(frag)),
+    )]);
+    let held = Map::from_iter([(
+        "notification".to_owned(),
+        Value::Object(as_notification(stored)),
+    )]);
+    crate::subscriptions::keep_masked_receiver_info(&mut f, &held)?;
+    if let Some(Value::Object(n)) = f.remove("notification") {
+        from_notification(frag, n);
+    }
+    let moved = frag
+        .get("endpoint")
+        .is_some_and(|e| Some(e) != stored.get("endpoint"));
+    if moved && !frag.contains_key("receiverInfo") && stored.contains_key("receiverInfo") {
+        frag.insert("receiverInfo".into(), Value::Null);
+    }
+    Ok(())
 }
 
 enum Mode {
@@ -340,8 +415,23 @@ fn validate(body: &Value, mode: Mode) -> Result<Map<String, Value>, NgsiError> {
             if matches!(mode, Mode::Update) && o.contains_key("id") {
                 return Err(bad("the snapshot id cannot be modified (5.2.41)".into()));
             }
+            // 5.16.4.4 modifies the Snapshot "as mandated by clause 5.5.8":
+            // a member whose value is an NGSI-LD Null, in either form, is
+            // removed. It reaches the merge as JSON null, which the type
+            // checks below pass by.
+            if matches!(mode, Mode::Update) {
+                for k in UPDATE_MEMBERS {
+                    if o.get(*k)
+                        .is_some_and(|v| v.is_null() || v.as_str() == Some("urn:ngsi-ld:null"))
+                    {
+                        o.insert((*k).to_owned(), Value::Null);
+                    }
+                }
+            }
         }
     }
+    // an update's removal (above); anywhere else a null is a wrong type
+    let removed = |v: &Value| matches!(mode, Mode::Update) && v.is_null();
     for (key, temporal) in [
         ("snapshotQueries", false),
         ("snapshotTemporalQueries", true),
@@ -367,7 +457,7 @@ fn validate(body: &Value, mode: Mode) -> Result<Map<String, Value>, NgsiError> {
             }
         }
     }
-    if let Some(p) = o.get("snapshotPriority") {
+    if let Some(p) = o.get("snapshotPriority").filter(|v| !removed(v)) {
         let ok = p.as_i64().is_some_and(|n| (1..=10).contains(&n));
         if !ok {
             return Err(bad(
@@ -375,7 +465,7 @@ fn validate(body: &Value, mode: Mode) -> Result<Map<String, Value>, NgsiError> {
             ));
         }
     }
-    if let Some(l) = o.get("snapshotLifetime") {
+    if let Some(l) = o.get("snapshotLifetime").filter(|v| !removed(v)) {
         let ok = l
             .as_str()
             .and_then(crate::entity_map::iso8601_secs)
@@ -388,19 +478,29 @@ fn validate(body: &Value, mode: Mode) -> Result<Map<String, Value>, NgsiError> {
     }
     // Table 5.2.41-1: endpoint is a "Dereferenceable URI", so a string that is
     // no URI at all names nothing the 5.16.6 notification could be sent to.
-    if let Some(e) = o.get("endpoint") {
+    if let Some(e) = o.get("endpoint").filter(|v| !removed(v)) {
         let uri = e
             .as_str()
             .ok_or_else(|| bad("endpoint must be a URI string (5.2.41)".into()))?;
-        antares_model::EntityId::new(uri)
-            .map_err(|_| bad(format!("endpoint is not a valid URI: {uri:?} (5.2.41)")))?;
+        antares_model::EntityId::new(uri).map_err(|_| {
+            bad(format!(
+                "endpoint is not a valid URI: {:?} (5.2.41)",
+                antares_notifier::redact_userinfo(uri)
+            ))
+        })?;
+        // 5.16.6 sends the SnapshotNotification by HTTP POST: an endpoint
+        // that binding cannot send to (one written `http:user:pass@host`,
+        // without the `//`, included) names nothing the notification could
+        // reach, and its userinfo would escape the masking and the sealing,
+        // which read the credential after a `//`
+        antares_notifier::http::check_endpoint(uri)?;
     }
     // Table 5.2.41-1: receiverInfo is a KeyValuePair[] (5.2.22 — both members
     // Strings), and 5.16.6 renders each pair as one header on the
     // SnapshotNotification POST. 6.3.8 binds those to RFC 7230 for the same
     // reason it binds a Subscription's: a pair that cannot be a header leaves
     // a Snapshot whose notification can only ever fail, silently.
-    if let Some(ri) = o.get("receiverInfo") {
+    if let Some(ri) = o.get("receiverInfo").filter(|v| !removed(v)) {
         let pairs = ri
             .as_array()
             .ok_or_else(|| bad("receiverInfo must be a KeyValuePair array (5.2.41)".into()))?;
@@ -519,18 +619,20 @@ pub(crate) async fn asking_tenant(st: &AppState, tenant: &TenantId) -> TenantId 
 /// snapshot is never the victim. Evicted snapshots with an endpoint are
 /// notified with expiresAt set before notifiedAt — the 5.3.4 deletion
 /// encoding.
-async fn evict_over_cap(st: &AppState, tenant: &TenantId, keep: &str) {
+///
+/// A registry that cannot be listed is an error, not an empty one: read as
+/// empty, the cap was never enforced while the listing failed.
+async fn evict_over_cap(st: &AppState, tenant: &TenantId, keep: &str) -> Result<(), NgsiError> {
     let victims: Vec<Value> = {
         let mut metas: Vec<Value> = st
             .store
             .list(tenant, Kind::Snapshot)
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .filter(is_snapshot)
             .collect();
         if metas.len() <= st.snapshot_cap {
-            return;
+            return Ok(());
         }
         let over = metas.len().saturating_sub(st.snapshot_cap);
         metas.sort_by_key(|v| {
@@ -563,6 +665,7 @@ async fn evict_over_cap(st: &AppState, tenant: &TenantId, keep: &str) {
             send_notification(&st2, &meta).await;
         });
     }
+    Ok(())
 }
 
 // ---------- 5.16.1 Create Snapshot (POST /snapshots, 6.36.3.1) ----------
@@ -579,13 +682,19 @@ pub async fn create_snapshot(
         gate!(st, &tenant, &headers, "5.16.1").await?;
         // 6.3.5: the @context rules apply to the snapshot body like to any
         // other POST payload (media type, Link header, body @context)
-        let v = parse_body(&st, &headers, &body, BodyKind::Standard)
-            .await?
-            .value;
-        let o = validate(&v, Mode::Create)?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
+        let mut o = validate(&parsed.value, Mode::Create)?;
+        // The queries are written in the terms of this request's @context
+        // (6.3.5) and run after it has been answered, so the context is
+        // recorded with them, as a Subscription records its own.
+        o.insert("__context".into(), parsed.ctx.source.clone());
         let (id, meta) = new_meta(o, &tenant, &headers)?;
         snap_insert(&st, &tenant, &id, &meta).await?;
-        evict_over_cap(&st, &tenant, &id).await;
+        // the cap cannot be checked: the new snapshot does not stay
+        if let Err(e) = evict_over_cap(&st, &tenant, &id).await {
+            snap_remove(&st, &tenant, &id, &meta).await;
+            return Err(e.into());
+        }
         let (st2, t2, id2) = (st.clone(), tenant.clone(), id.clone());
         crate::spawn(async move {
             fill_snapshot(&st2, &t2, &id2).await;
@@ -604,7 +713,7 @@ async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
     let Some(synth) = synth_tenant(&meta) else {
         return;
     };
-    let ctx = st.loader.core();
+    let ctx = snapshot_context(st, tenant, &meta).await;
     let (mut n_fail, mut n_res, mut n_empty, mut copied) = (0usize, 0usize, 0usize, 0usize);
     let mut detail = |r: Result<usize, NgsiError>| -> Value {
         match r {
@@ -650,7 +759,8 @@ async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
         if fill_cancelled(st, tenant, id, &synth).await {
             return;
         }
-        let r = run_temporal_query(st, tenant, &synth, id, q, cap.saturating_sub(copied)).await;
+        let r =
+            run_temporal_query(st, tenant, &synth, id, q, &ctx, cap.saturating_sub(copied)).await;
         if let Ok(n) = &r {
             copied = copied.saturating_add(*n);
         }
@@ -669,6 +779,24 @@ async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
         "failure"
     };
     finish(st, tenant, id, status, Some((q_details, tq_details))).await;
+}
+
+/// The @context the creating request was expanded with (6.3.5), resolved
+/// within the Snapshot's Tenant (5.5.10); the core context for a Snapshot
+/// stored without one, or one whose context no longer loads.
+async fn snapshot_context(
+    st: &AppState,
+    tenant: &TenantId,
+    meta: &Value,
+) -> std::sync::Arc<antares_jsonld::Context> {
+    match meta.get("__context").filter(|v| !v.is_null()) {
+        Some(v) => st
+            .loader
+            .resolve_quiet_for(tenant, v)
+            .await
+            .unwrap_or_else(|_| st.loader.core()),
+        None => st.loader.core(),
+    }
 }
 
 /// One 5.2.23 Query executed per the DISTRIBUTED query behaviour
@@ -793,6 +921,7 @@ async fn run_temporal_query(
     synth: &TenantId,
     id: &str,
     q: &Value,
+    ctx: &antares_jsonld::Context,
     budget: usize,
 ) -> Result<usize, NgsiError> {
     let qo = q
@@ -807,7 +936,6 @@ async fn run_temporal_query(
     // whole Evolution would hand a snapshot reader history the query never
     // asked for.
     let tq = crate::temporalq::TemporalQ::from_params(&vp, true)?;
-    let ctx = st.loader.core();
     let attrs: Option<Vec<String>> = vp
         .get("attrs")
         .map(|a| a.split(',').map(|t| ctx.expand_key(t.trim())).collect());
@@ -827,6 +955,17 @@ async fn run_temporal_query(
     let mut headers = HeaderMap::new();
     if let Ok(v) = tenant.as_str().parse() {
         headers.insert("NGSILD-Tenant", v);
+    }
+    // The query expands its terms with `ctx`, passed below; a URL context
+    // rides as the Link a request carries (6.3.5) as well, which a Context
+    // Source the query reaches is handed.
+    if let Some(url) = ctx.source.as_str() {
+        let link = format!(
+            "<{url}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\""
+        );
+        if let Ok(v) = link.parse() {
+            headers.insert("Link", v);
+        }
     }
     // 5.16.1.4: "If the size of the respective results require pagination,
     // all pages are to be retrieved completely."
@@ -855,6 +994,7 @@ async fn run_temporal_query(
             &headers,
             &crate::policy::Filter::default(),
             Some(&mut merged),
+            Some(std::sync::Arc::new(ctx.clone())),
         )
         .await
         .map_err(|e| match e {
@@ -1061,12 +1201,29 @@ pub async fn purge_snapshots(
             ))
             .into());
         }
+        // `endpoint` (its userinfo) and `receiverInfo` are the credentials
+        // the 5.16.6 notification is sent with, which every read answers
+        // masked (`present`). A purge matching on them answers 204 either
+        // way and shows by which snapshots are gone whether a guessed
+        // token matched, so a q may not name them.
+        if let Some(secret) = ast
+            .attribute_paths()
+            .into_iter()
+            .find(|a| ["endpoint", "receiverInfo"].contains(a))
+        {
+            return Err(bad(format!(
+                "purge q may not filter on {secret:?}: it holds the notification \
+                 credentials (5.16.7.4)"
+            ))
+            .into());
+        }
         let ctx = st.loader.core();
+        // a listing that fails purges nothing, and says so: a 204 here
+        // would report a purge that never ran
         let victims: Vec<Value> = st
             .store
             .list(&tenant, Kind::Snapshot)
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .filter(|meta| is_snapshot(meta) && crate::registry::csf_matches(&ast, meta, &ctx))
             .collect();
@@ -1134,15 +1291,17 @@ pub async fn update_snapshot(
         let tenant = open_snapshot(&params, &headers, &id)?;
         gate!(st, &tenant, &headers, "5.16.4", ids: &[&id]).await?;
         let accept = parse_accept(&headers)?;
-        // 5.16.4.4 binds this operation to 5.5.4, hence to the 6.3.5 rules
-        let v = parse_body(&st, &headers, &body, BodyKind::Standard)
+        // 5.16.4.4 binds this operation to 5.5.4, hence to the 6.3.5 rules;
+        // a PATCH may name its body application/merge-patch+json (6.3.4)
+        let v = parse_body(&st, &headers, &body, BodyKind::MergePatch)
             .await?
             .value;
-        let frag = validate(&v, Mode::Update)?;
+        let mut frag = validate(&v, Mode::Update)?;
         let mut meta = snap_get(&st, &tenant, &id)
             .await
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
         if let Some(o) = meta.as_object_mut() {
+            keep_receiver_info(&mut frag, o)?;
             // 5.16.4.4 / 5.5.8 merge of the updatable members
             for k in [
                 "snapshotLifetime",
@@ -1164,6 +1323,9 @@ pub async fn update_snapshot(
                 // "it is possible to indirectly update expiresAt" (5.2.41)
                 o.insert("expiresAt".into(), Value::String(expires_at(o)?));
             }
+            // a removed priority is the default one again (Table 5.2.41-1)
+            o.entry("snapshotPriority".to_owned())
+                .or_insert(Value::Number(5.into()));
             o.insert("modifiedAt".into(), Value::String(now_iso()));
         }
         let meta = snap_put(&st, &tenant, &meta, UPDATE_MEMBERS)
@@ -1240,7 +1402,10 @@ pub async fn clone_snapshot(
         // a clone is a new snapshot: 5.5.15 resource pressure applies to it
         // exactly as it does to a create, so cloning cannot grow the
         // registry past the cap
-        evict_over_cap(&st, &tenant, &new_id).await;
+        if let Err(e) = evict_over_cap(&st, &tenant, &new_id).await {
+            snap_remove(&st, &tenant, &new_id, &meta).await;
+            return Err(e.into());
+        }
         let (st2, t2, sid, nid) = (st.clone(), tenant.clone(), id.clone(), new_id.clone());
         crate::spawn(async move {
             clone_fill(&st2, &t2, &sid, &nid).await;
@@ -1631,6 +1796,80 @@ mod clause_5_16 {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         (status, headers, body)
+    }
+
+    /// 5.16.4.4 modifies the Snapshot "as mandated by clause 5.5.8": a
+    /// member whose value is an NGSI-LD Null (JSON null or
+    /// "urn:ngsi-ld:null") is removed, and 6.3.4 lets a PATCH name its body
+    /// application/merge-patch+json. The type checks refused the null with
+    /// 400, the literal "urn:ngsi-ld:null" was stored as the endpoint, and a
+    /// merge-patch body was 415.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_16_4_4_an_ngsi_ld_null_removes_a_member() {
+        let st = state().await;
+        let snap = json!({"type": "Snapshot", "endpoint": "http://127.0.0.1:9/n",
+            "snapshotPriority": 3, "snapshotLifetime": "PT1H",
+            "receiverInfo": [{"key": "X-A", "value": "1"}],
+            "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]});
+        let (status, headers, b) = post_json(&st, "/ngsi-ld/v1/snapshots", &snap).await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+        let loc = header(&headers, "Location").expect("Location").to_owned();
+        let patch = json!({"endpoint": null, "receiverInfo": "urn:ngsi-ld:null",
+            "snapshotPriority": null, "snapshotLifetime": "urn:ngsi-ld:null"});
+        let (status, _, body) = send(
+            &st,
+            "PATCH",
+            &loc,
+            Some(("application/merge-patch+json", patch.to_string())),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for k in ["endpoint", "receiverInfo", "snapshotLifetime"] {
+            assert!(body.get(k).is_none(), "{k} not removed: {body}");
+        }
+        assert_eq!(body["snapshotPriority"], 5, "the default priority: {body}");
+        // a null where no update removes it stays a wrong type
+        let mut bad = snap.clone();
+        bad["endpoint"] = Value::Null;
+        let (status, _, b) = post_json(&st, "/ngsi-ld/v1/snapshots", &bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+    }
+
+    /// 5.16.6 notifies by HTTP POST: an endpoint written `http:user:pass@host`
+    /// (no `//`) is refused on create and on update, without the credential
+    /// in the answer; stored, its userinfo would be neither masked nor sealed
+    /// and reqwest would still send it.
+    #[tokio::test]
+    async fn an_endpoint_without_the_double_slash_is_refused_unechoed() {
+        let st = state().await;
+        let uri = "http:hook:pa55word@localhost:1/n";
+        let snap = json!({"type": "Snapshot", "endpoint": uri,
+            "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]});
+        let (status, _, b) = post_json(&st, "/ngsi-ld/v1/snapshots", &snap).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            !b.to_string().contains("pa55word"),
+            "the credential was echoed"
+        );
+        let ok = json!({"type": "Snapshot",
+            "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]});
+        let (status, headers, b) = post_json(&st, "/ngsi-ld/v1/snapshots", &ok).await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+        let loc = header(&headers, "Location").expect("Location").to_owned();
+        let (status, _, b) = send(
+            &st,
+            "PATCH",
+            &loc,
+            Some(("application/json", json!({"endpoint": uri}).to_string())),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{b}");
+        assert!(
+            !b.to_string().contains("pa55word"),
+            "the credential was echoed"
+        );
     }
 
     async fn post_json(st: &AppState, path: &str, doc: &Value) -> (StatusCode, HeaderMap, Value) {

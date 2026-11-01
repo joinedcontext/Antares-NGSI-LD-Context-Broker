@@ -1,8 +1,8 @@
 *** Settings ***
 Documentation       Verify 4.23.3 EXAMPLES 6/7: the collation parameter —
 ...                 orderBy string comparison under an ICU collation
-...                 (IETF RFC 6067 tag) instead of codepoint order; an
-...                 invalid tag is 400 BadRequestData.
+...                 (IETF RFC 6067 tag), the ICU root collation when none
+...                 is named (4.23.1); an invalid tag is 400 BadRequestData.
 ...                 Antares extension TP — no official collation coverage.
 
 Library             RequestsLibrary
@@ -23,8 +23,9 @@ ${v_accent}=    urn:ngsi-ld:Vehicle:coll4233acc
 *** Test Cases ***
 4233_01_01 Root Collation Ranks Accents With Their Base Letter
     [Documentation]    4.23.3 EXAMPLE 6/7: collation=und ranks "á" with "a"
-    ...    (before "b"); the codepoint default ranks it after "b" — both
-    ...    asserted so the collation path is proven distinct.
+    ...    (before "b"), and so does the default, which 4.23.1 makes the
+    ...    ICU root collation ("und-x-icu"); codepoint order would rank it
+    ...    after "b".
     [Tags]    em-usage    4_23_3    4_23_1    since_v1.9.1
 
     ${response}=    GET
@@ -33,7 +34,7 @@ ${v_accent}=    urn:ngsi-ld:Vehicle:coll4233acc
     ...    expected_status=any
     Check Response Status Code    200    ${response.status_code}
     ${names}=    Evaluate    [e["name"]["value"] for e in $response.json()]
-    Should Be Equal As Strings    ${names}    ['A', 'b', 'á']
+    Should Be Equal As Strings    ${names}    ['A', 'á', 'b']
 
     ${response}=    GET
     ...    url=${url}/entities

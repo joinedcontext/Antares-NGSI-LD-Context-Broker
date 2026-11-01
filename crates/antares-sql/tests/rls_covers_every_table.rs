@@ -88,8 +88,10 @@ fn named_after(sql: &str, kw: &str) -> Vec<String> {
 }
 
 /// The tables the migrations leave behind: created, minus dropped, minus the
-/// partitions (a partition takes its policies from the parent when it is
-/// reached through the parent, which is how the request path reaches it).
+/// DEFAULT partitions: those, like every weekly one, are policed by
+/// `history_partition_rls` (0029) through a loop over the catalog this
+/// text cannot see, and `pg_rls_pentest.rs`
+/// `a_history_partition_read_directly_keeps_the_belt` holds them to it.
 fn live_tables(sql: &str) -> BTreeSet<String> {
     let mut created: BTreeSet<String> = named_after(sql, "create table").into_iter().collect();
     // 0023: the unlogged short history is a table like any other

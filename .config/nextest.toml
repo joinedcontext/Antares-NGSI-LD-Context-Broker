@@ -34,7 +34,7 @@ store-failure-output = true
 db-exclusive = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg) or binary(pg_explain) or binary(pg_retention)'
+filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg) or binary(pg_explain) or binary(pg_retention) or binary(pg_seal)'
 test-group = 'db-exclusive'
 
 # The restart gap is a wall-clock gate (2 s at 10 000 entities): beside the
