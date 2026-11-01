@@ -623,7 +623,7 @@ mod tests {
         let red = redact_userinfo(uri);
         assert!(!red.contains("pa55word") && !red.contains("hook"), "{red}");
         assert_eq!(red, "http:localhost:1/n");
-        let err = http::check_endpoint(uri).expect_err("no authority");
+        let err = http::check_http_endpoint(uri).expect_err("no authority");
         assert!(!format!("{err:?}").contains("pa55word"), "{err:?}");
         // SECV-02: a `//` later in the path does not move the authority
         for uri in [
@@ -633,7 +633,7 @@ mod tests {
         ] {
             let red = redact_userinfo(uri);
             assert!(!red.contains("pa55word"), "{uri} -> {red}");
-            if let Err(err) = http::check_endpoint(uri) {
+            if let Err(err) = http::check_http_endpoint(uri) {
                 assert!(!format!("{err:?}").contains("pa55word"), "{err:?}");
             }
         }

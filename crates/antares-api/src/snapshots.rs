@@ -493,7 +493,7 @@ fn validate(body: &Value, mode: Mode) -> Result<Map<String, Value>, NgsiError> {
         // without the `//`, included) names nothing the notification could
         // reach, and its userinfo would escape the masking and the sealing,
         // which read the credential after a `//`
-        antares_notifier::http::check_endpoint(uri)?;
+        antares_notifier::http::check_http_endpoint(uri)?;
     }
     // Table 5.2.41-1: receiverInfo is a KeyValuePair[] (5.2.22 — both members
     // Strings), and 5.16.6 renders each pair as one header on the

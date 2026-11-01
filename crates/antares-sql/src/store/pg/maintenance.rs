@@ -1240,7 +1240,7 @@ async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
 }
 
 /// One batch of the 4.22 history reap on `table`, a quoted name from
-/// [`HISTORY_TABLES`]: at most `REAP_BATCH` rows its `expires_at` index finds
+/// `HISTORY_TABLES`: at most `REAP_BATCH` rows its `expires_at` index finds
 /// past, deleted by ctid. `ONLY` the table, as a ctid names a row of one
 /// table. The row's `data` decides: a correction by an older release leaves
 /// the column stale (0030's rollback note), and a row whose `expiresAt` has
@@ -1311,8 +1311,8 @@ async fn expiry_scan_daily(pool: &PgPool) -> Result<Option<u64>, sqlx::Error> {
 const EXPIRY_INDEX_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The partial index on `expires_at` (migration 0030) that
-/// [`reap_expired_instances`] reads, built on each history table of
-/// [`HISTORY_TABLES`] by name with `CREATE INDEX CONCURRENTLY` (writes go
+/// `reap_expired_instances` reads, built on each history table of
+/// `HISTORY_TABLES` by name with `CREATE INDEX CONCURRENTLY` (writes go
 /// on), smallest first, as [`history_one_index`] builds 0017's: never by a
 /// migration, never on a parent. A pass starts builds while it has spent
 /// less than `EXPIRY_INDEX_BUDGET`, so the empty weeks created ahead are

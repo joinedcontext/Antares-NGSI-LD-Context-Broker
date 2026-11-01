@@ -778,16 +778,7 @@ async fn query_entities_inner(
         .map(|q| antares_ql::parse_narrowed_q(q))
         .transpose()?;
     // 5.7.2.4 validation bullets (p.201), in the spec's own order.
-    if params.get("type").map(String::as_str) == Some("*")
-        && params.get("local").map(String::as_str) == Some("false")
-    {
-        return Err(NgsiError::BadRequestData(
-            "type=* implies local and shall not be combined with local=false \
-             (Table 6.4.3.2-1)"
-                .into(),
-        )
-        .into());
-    }
+    star_type_local(params)?;
     if params.contains_key("geometryProperty") && accept != Accept::GeoJson {
         return Err(NgsiError::BadRequestData(
             "geometryProperty requires Accept: application/geo+json (5.7.2.4)".into(),
@@ -1049,6 +1040,21 @@ async fn query_entities_inner(
     }
     filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
+}
+
+/// Table 6.4.3.2-1: `type=*` implies local scope and shall not be combined
+/// with `local=false`.
+pub(crate) fn star_type_local(params: &HashMap<String, String>) -> Result<(), NgsiError> {
+    if params.get("type").map(String::as_str) == Some("*")
+        && params.get("local").map(String::as_str) == Some("false")
+    {
+        return Err(NgsiError::BadRequestData(
+            "type=* implies local and shall not be combined with local=false \
+             (Table 6.4.3.2-1)"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// 5.7.2.4 / 5.7.4.4 / 5.14.4.4 a-e: a query qualifies (is not "too wide")
@@ -2264,16 +2270,7 @@ async fn purge_inner(
         .into());
     }
     // Table 6.4.3.2-1, as on the entity query (5.7.2.4)
-    if params.get("type").map(String::as_str) == Some("*")
-        && params.get("local").map(String::as_str) == Some("false")
-    {
-        return Err(NgsiError::BadRequestData(
-            "type=* implies local and shall not be combined with local=false \
-             (Table 6.4.3.2-1)"
-                .into(),
-        )
-        .into());
-    }
+    star_type_local(params)?;
     // 5.6.21.4: a syntactically invalid context source filter is
     // BadRequestData.
     if let Some(csf) = params.get("csf") {

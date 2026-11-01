@@ -614,7 +614,13 @@ async fn within<T>(fut: impl std::future::Future<Output = T>, d: std::time::Dura
 
 #[cfg(target_arch = "wasm32")]
 async fn within<T>(fut: impl std::future::Future<Output = T>, d: std::time::Duration) -> Option<T> {
-    io_deadline(fut, u32::try_from(d.as_millis()).unwrap_or(u32::MAX)).await
+    // the gloo timer is !Send; wrapped like an HTTP interaction so the
+    // handlers that resolve a @context stay Send
+    http_interaction(io_deadline(
+        fut,
+        u32::try_from(d.as_millis()).unwrap_or(u32::MAX),
+    ))
+    .await
 }
 
 /// Ceiling on a header-supplied cache lifetime: one year. The values are

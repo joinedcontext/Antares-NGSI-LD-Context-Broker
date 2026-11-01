@@ -133,7 +133,7 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
 /// with no credential configured as well. So a pod that merely reaches the
 /// API port neither registers a Context Source nor creates a Tenant. A
 /// request with a subject from a caller the broker believes
-/// ([`vouched_subject`]) goes on to the policy engine unchanged; one from
+/// (`vouched_subject`) goes on to the policy engine unchanged; one from
 /// anybody else is answered as if it carried none.
 pub async fn subject_or_admin(State(st): State<AppState>, req: Request, next: Next) -> Response {
     if admitted(&st, req.headers()) {

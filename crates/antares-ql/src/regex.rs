@@ -306,6 +306,16 @@ pub(crate) fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
+    fn near_point() -> Option<crate::geo::GeoQuery> {
+        crate::geo::GeoQuery::from_params(&HashMap::from([
+            ("georel".to_owned(), "near;maxDistance==10".to_owned()),
+            ("geometry".to_owned(), "Point".to_owned()),
+            ("coordinates".to_owned(), "[1,2]".to_owned()),
+        ]))
+        .ok()
+        .flatten()
+    }
+
     /// The same pattern text is compiled once: the second call gets the very
     /// program the first one built (4.9 patternOp / 5.2.33 idPattern are
     /// evaluated per candidate, so this identity is the whole point).
@@ -495,13 +505,7 @@ mod tests {
         let builds = std::cell::Cell::new(0);
         let build = || {
             builds.set(builds.get() + 1);
-            crate::geo::GeoQuery::from_params(&HashMap::from([
-                ("georel".to_owned(), "near;maxDistance==10".to_owned()),
-                ("geometry".to_owned(), "Point".to_owned()),
-                ("coordinates".to_owned(), "[1,2]".to_owned()),
-            ]))
-            .ok()
-            .flatten()
+            near_point()
         };
         geo_query("keep-geo-a", build).expect("geo");
         geo_query("keep-geo-b", build).expect("geo");
@@ -539,16 +543,7 @@ mod tests {
     fn an_oversized_geo_key_is_not_retained() {
         let _serial = serial_lock();
         let key = format!("big-geo-{}", "x".repeat(MAX_GEO_KEY_BYTES));
-        let build = || {
-            crate::geo::GeoQuery::from_params(&HashMap::from([
-                ("georel".to_owned(), "near;maxDistance==10".to_owned()),
-                ("geometry".to_owned(), "Point".to_owned()),
-                ("coordinates".to_owned(), "[1,2]".to_owned()),
-            ]))
-            .ok()
-            .flatten()
-        };
-        geo_query(&key, build).expect("geo");
+        geo_query(&key, near_point).expect("geo");
         assert!(
             GEO_CACHE
                 .read()

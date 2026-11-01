@@ -2269,6 +2269,16 @@ fn admits_import(reg: &FedReg, spec: &crate::registry::CsrSpec, id: &str) -> boo
             .is_some_and(|p| antares_ql::regex::compile(p).is_ok_and(|re| re.find(id).is_some()))
 }
 
+/// The scope gate of a fan-out answer: `c` is this source's data (4.3.6.1:
+/// a type outside the registration's EntityInfo is not, whatever the client
+/// asked for) and [`admits_import`] admits its id.
+fn in_scope(reg: &FedReg, spec: &crate::registry::CsrSpec, ctx: &Context, c: &Value) -> bool {
+    c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+        && c.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|i| admits_import(reg, spec, i))
+}
+
 /// Whether a query parameter travels on a forward. A narrowed `q` (the
 /// caller's joined with a policy's, `antares_ql::parse_narrowed_q`) can be
 /// past the caps a peer counts it with, `antares_ql::parse_q`'s; the peer's
@@ -2471,16 +2481,11 @@ pub async fn fed_query(
             continue;
         }
         if let Value::Array(a) = &body {
-            // Scope gate — see admits_import.
-            for c in a.iter().filter(|c| {
-                // 4.3.6.1: a type outside the registration's EntityInfo is
-                // not this source's data, whatever the client asked for
-                c.as_object()
-                    .is_some_and(|o| reg.covers_types(o, actx.as_deref().unwrap_or(ctx)))
-                    && c.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|i| admits_import(&reg, &spec, i))
-            }) {
+            // Scope gate — see in_scope.
+            for c in a
+                .iter()
+                .filter(|c| in_scope(&reg, &spec, actx.as_deref().unwrap_or(ctx), c))
+            {
                 match import_entity(c, &reg, actx.as_deref().unwrap_or(ctx)) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
                     None => warnings.push(warning(
@@ -2746,15 +2751,10 @@ pub async fn fed_query_temporal(
         }
         if let Value::Array(a) = &body {
             // Same scope gate as the non-temporal query fan-out.
-            for c in a.iter().filter(|c| {
-                // 4.3.6.1: a type outside the registration's EntityInfo is
-                // not this source's data, whatever the client asked for
-                c.as_object()
-                    .is_some_and(|o| reg.covers_types(o, actx.as_deref().unwrap_or(ctx)))
-                    && c.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|i| admits_import(&reg, &spec, i))
-            }) {
+            for c in a
+                .iter()
+                .filter(|c| in_scope(&reg, &spec, actx.as_deref().unwrap_or(ctx), c))
+            {
                 match import_temporal(c, &reg, actx.as_deref().unwrap_or(ctx)) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
                     None => warnings.push(warning(

@@ -198,31 +198,8 @@ pub(super) async fn check_temporal_query(
     q_ast: Option<&antares_ql::QNode>,
 ) -> ApiResult<()> {
     // Table 6.4.3.2-1, as on the entity query (5.7.2.4)
-    if params.get("type").map(String::as_str) == Some("*")
-        && params.get("local").map(String::as_str) == Some("false")
-    {
-        return Err(NgsiError::BadRequestData(
-            "type=* implies local and shall not be combined with local=false \
-             (Table 6.4.3.2-1)"
-                .into(),
-        )
-        .into());
-    }
-    let attrs_qualify = params.get("attrs").is_some_and(|a| {
-        a.split(',')
-            .any(|n| antares_ql::is_non_system_attr(n.trim()))
-    });
-    let q_qualifies = q_ast.is_some_and(|ast| {
-        ast.attribute_paths()
-            .iter()
-            .any(|h| antares_ql::is_non_system_attr(h))
-    });
-    let has_filter = params.contains_key("type")
-        || attrs_qualify
-        || q_qualifies
-        || params.contains_key("georel")
-        || params.get("local").map(String::as_str) == Some("true");
-    if !has_filter {
+    crate::entities::star_type_local(params)?;
+    if !crate::entities::qualifies_non_wide(params, q_ast) {
         return Err(NgsiError::BadRequestData(
             "temporal query needs at least one of type, attrs, q, georel (5.7.4)".into(),
         )

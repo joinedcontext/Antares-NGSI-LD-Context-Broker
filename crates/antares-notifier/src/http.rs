@@ -31,7 +31,7 @@ impl HttpSink {
 /// message names the URI with any userinfo stripped: it travels back in
 /// `detail` (5.5.3). `http:user:pass@host` (no `//`) is refused here, and
 /// its credential is not echoed.
-pub fn check_endpoint(uri: &str) -> Result<(), NgsiError> {
+pub fn check_http_endpoint(uri: &str) -> Result<(), NgsiError> {
     let safe = crate::redact_userinfo(uri);
     // IETF RFC 3986 3.1: scheme names are case-insensitive, and
     // `SinkRegistry::scheme_of` already lowercases to pick this sink.
@@ -62,7 +62,7 @@ impl NotificationSink for HttpSink {
     /// 5.2.15: the endpoint URI has to be dereferenceable — for this binding,
     /// an absolute http(s) URL with an authority.
     fn parse_endpoint(&self, uri: &str, _notifier_info: &[(&str, &str)]) -> Result<(), NgsiError> {
-        check_endpoint(uri)
+        check_http_endpoint(uri)
     }
 
     fn deliver<'a>(

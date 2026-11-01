@@ -19,6 +19,7 @@ use super::pg::entity::PgEntityStore;
 #[cfg(feature = "postgres")]
 use super::pg::temporal::PgTemporalStore;
 use super::{ChangeHook, Kind, Store};
+#[cfg(feature = "postgres")]
 use antares_store::ChangeVersion;
 
 /// 5.5.6: unexpected failures (database errors, timeouts) surface as
@@ -1167,6 +1168,7 @@ impl AnyStore {
     /// Cap the instances one Attribute's history may hold in the memory/file
     /// store (`0` = none); the Postgres arm keeps history in rows and has no
     /// such document to bound.
+    #[cfg_attr(not(feature = "postgres"), allow(irrefutable_let_patterns))]
     pub fn max_instances(mut self, cap: usize) -> Self {
         if let AnyStore::Mem(s) = &mut self {
             s.max_instances = cap;

@@ -884,9 +884,9 @@ fn check_object(name: &str, objv: &Value, opts: ExpandOpts) -> Result<(), NgsiEr
 }
 
 /// 4.5.22.2/4.5.22.3: objectList is an ordered array of Relationship
-/// objects — {"object": <URI>} objects (normalized) or bare URI strings
+/// objects — `{"object": <URI>}` objects (normalized) or bare URI strings
 /// (concise). Internal form is bare URIs; the normalized output shape is
-/// restored at compaction. The [null] deletion form (single NGSI-LD Null)
+/// restored at compaction. The `[null]` deletion form (single NGSI-LD Null)
 /// passes through under allow_null.
 fn object_list(name: &str, l: &Value, opts: ExpandOpts) -> Result<Value, NgsiError> {
     let bad = NgsiError::BadRequestData;

@@ -13,7 +13,7 @@
 //! A value without the prefix is read as it is, so rows written before the
 //! key was set stay readable; [`super::doc::PgDocStore::seal_plaintext`]
 //! rewrites them at boot. Without a key, a client's own text that starts
-//! with `enc:` is stored behind [`LITERAL`], so `enc:v1:` in a row always
+//! with `enc:` is stored behind `LITERAL`, so `enc:v1:` in a row always
 //! means ciphertext. A sealed value read without the key, or under
 //! another key, is an error: a notification never goes out with ciphertext in
 //! its headers.
@@ -258,7 +258,7 @@ impl Row<'_> {
 /// `doc` as it is stored: every credential sealed under `key` for `row`. A
 /// value the client sent already starting with `enc:v1:` is sealed like any
 /// other text, so it reads back as that literal text, never decrypted.
-/// Without a key such a value is kept behind [`LITERAL`] for the same reason;
+/// Without a key such a value is kept behind `LITERAL` for the same reason;
 /// nothing to seal or escape writes the doc as it came.
 pub fn sealed<'a>(
     key: Option<&SecretKey>,
@@ -295,7 +295,7 @@ pub fn sealed<'a>(
 
 /// Open every sealed credential of the stored `doc` of `row` in place;
 /// plaintext values (rows from before the key) pass through, and a client's
-/// text kept behind [`LITERAL`] comes back as it was sent.
+/// text kept behind `LITERAL` comes back as it was sent.
 pub fn open(key: Option<&SecretKey>, row: Row<'_>, doc: &mut Value) -> Result<(), Unreadable> {
     let aad = row.aad();
     for v in credentials(row.kind, doc) {
@@ -312,7 +312,7 @@ pub fn open(key: Option<&SecretKey>, row: Row<'_>, doc: &mut Value) -> Result<()
 }
 
 /// Whether `doc` of `kind` still holds a credential that is not sealed: a
-/// value put before the key was set, or one kept behind [`LITERAL`].
+/// value put before the key was set, or one kept behind `LITERAL`.
 pub fn holds_plaintext(kind: DocKind, doc: &Value) -> bool {
     let mut doc = doc.clone();
     credentials(kind, &mut doc)
