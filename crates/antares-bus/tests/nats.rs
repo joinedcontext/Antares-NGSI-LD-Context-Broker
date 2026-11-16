@@ -563,15 +563,12 @@ async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
     assert_eq!(info.num_ack_pending, 0, "a message was left unacked");
 }
 
-/// A draining pod (#64): once `stop` is set, the message being worked on
-/// finishes and is acked, and the ones of the same pull still queued behind
-/// it go back to the server, for another pod well inside `ack_wait`, instead
-/// of waiting it out on a pod that is leaving. The acked one is never handed
-/// out again, so the pod that takes over cannot notify it a second time.
-/// NAKed for at once they went back into the leaving pod's own open pull,
-/// which nobody read any more, and waited out `ack_wait` there.
+/// A draining pod (#64) makes no new pull, and works and acks everything
+/// its open pull delivers, so nothing it was handed is redelivered and
+/// nothing waits for another pod: a change matched late meets subscriptions
+/// created after it and notifies them too (ETSI 586_01 under a roll).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
+async fn a_stopped_consumer_works_what_its_pull_delivered_and_pulls_no_more() {
     use async_nats::jetstream::{self, stream};
     use std::sync::atomic::{AtomicBool, Ordering};
     let url = require_nats!();
@@ -587,8 +584,6 @@ async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
         })
         .await
         .expect("stream");
-    // the production ack_wait (30 s): a message left unacked would come back
-    // only after it, far past every wait below
     let consumer: antares_bus::nats::PullConsumer = s
         .create_consumer(antares_bus::nats::balanced_config("worker"))
         .await
@@ -606,13 +601,94 @@ async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
     let ran = tokio::time::timeout(
         Duration::from_secs(10),
         antares_bus::nats::run_balanced(&consumer, &stop, |msg| {
-            let body = String::from_utf8_lossy(&msg.payload).into_owned();
-            log.lock().expect("lock").push(body);
+            log.lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&msg.payload).into_owned());
+            // the SIGTERM lands while the first change is being delivered
+            flag.store(true, Ordering::SeqCst);
+            async {}
+        }),
+    )
+    .await;
+    assert!(
+        matches!(ran, Ok(Ok(()))),
+        "a stopped consumer returns Ok: {ran:?}"
+    );
+    assert_eq!(*seen.lock().expect("lock"), ["0", "1", "2"]);
+    // no pull of the stopped pod is left open to swallow the next change
+    js.publish(format!("{subject}.m"), "3".into())
+        .await
+        .expect("publish")
+        .await
+        .expect("ack");
+    let mut next = consumer
+        .batch()
+        .max_messages(1)
+        .expires(Duration::from_secs(2))
+        .messages()
+        .await
+        .expect("pull");
+    let m = next
+        .next()
+        .await
+        .expect("the next change")
+        .expect("message");
+    assert_eq!(&m.payload[..], b"3");
+    m.ack().await.expect("ack");
+    let info = s.consumer_info("worker").await.expect("info");
+    let _ = js.delete_stream(&name).await;
+    assert_eq!(info.num_redelivered, 0, "the server redelivered");
+}
+
+/// A draining pod stuck behind a slow message whose pull has closed (it
+/// filled) hands the rest back with a NAK, which reaches the pod taking over
+/// at once instead of after `ack_wait`. The message it worked on is acked and
+/// never handed out again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_consumer_hands_back_what_a_closed_pull_left_it_holding() {
+    use async_nats::jetstream::{self, stream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let url = require_nats!();
+    let js = jetstream::new(async_nats::connect(&url).await.expect("connect"));
+    let n = nonce();
+    let name = format!("ANTARES_TEST_STOPFULL_{n}");
+    let subject = format!("stopfull{n}");
+    let s = js
+        .create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{subject}.>")],
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    // the production ack_wait (30 s): a message left unacked would come back
+    // only after it, far past every wait below
+    let consumer: antares_bus::nats::PullConsumer = s
+        .create_consumer(antares_bus::nats::balanced_config("worker"))
+        .await
+        .expect("consumer");
+    let total = antares_bus::nats::PULL_BATCH;
+    for i in 0..total {
+        js.publish(format!("{subject}.m"), i.to_string().into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (flag, log) = (stop.clone(), seen.clone());
+    let ran = tokio::time::timeout(
+        Duration::from_secs(10),
+        antares_bus::nats::run_balanced(&consumer, &stop, |msg| {
+            log.lock()
+                .expect("lock")
+                .push(String::from_utf8_lossy(&msg.payload).into_owned());
             let flag = flag.clone();
             async move {
-                // the SIGTERM lands while the first change is being delivered
                 flag.store(true, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                // slow enough for the full pull to arrive and close behind it
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }),
     )
@@ -626,14 +702,12 @@ async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
         ["0"],
         "worked on past the stop"
     );
-    // the pod taking over gets the two handed back, and only those, long
-    // before `ack_wait` would have released them
     let handed_back = std::time::Instant::now();
     let mut again = Vec::new();
-    while again.len() < 2 && handed_back.elapsed() < Duration::from_secs(15) {
+    while again.len() < total - 1 && handed_back.elapsed() < Duration::from_secs(15) {
         let mut next = consumer
             .batch()
-            .max_messages(3)
+            .max_messages(total)
             .expires(Duration::from_secs(2))
             .messages()
             .await
@@ -645,11 +719,8 @@ async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
     }
     let waited = handed_back.elapsed();
     let _ = js.delete_stream(&name).await;
-    assert_eq!(
-        again,
-        ["1", "2"],
-        "the handed-back messages, and only those"
-    );
+    let want: Vec<String> = (1..total).map(|i| i.to_string()).collect();
+    assert_eq!(again, want, "the handed-back messages, and only those");
     assert!(
         waited < antares_bus::nats::ACK_WAIT / 2,
         "handed back only after {waited:?}"
