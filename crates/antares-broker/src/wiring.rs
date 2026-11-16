@@ -566,8 +566,8 @@ pub async fn wire_nats(
         // one of them is processed (a slow endpoint must not let ack_wait
         // pass and have the server hand them all out a second time).
         //
-        // A draining broker stops taking changes (`run_balanced` hands back
-        // what it holds) and the loop ends after its last ack. It counts as
+        // A draining broker makes no new pull (`run_balanced` works what
+        // the open one delivers) and the loop ends after its last ack. It counts as
         // one pending change while it runs, so the shutdown drain closes
         // the pools only after that ack: a change booked and delivered here
         // but never acked went to the next pod and was notified twice (#64).
