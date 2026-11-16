@@ -7,12 +7,18 @@
 # bumps would queue forty of them. A major bump comes alone, because it is
 # the one that needs reading. Security updates ignore the schedule and
 # open the day the advisory lands.
+#
+# A version is proposed only once it has been published for more than a
+# week (cooldown, 8 days): a hijacked or broken release is usually yanked
+# within days, before it reaches a pull request here. Security updates
+# skip the cooldown.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
+    cooldown: { default-days: 8 }
     groups:
       cargo:
         update-types: [minor, patch]
@@ -22,6 +28,7 @@ updates:
     directory: /
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
+    cooldown: { default-days: 8 }
     groups:
       actions:
         update-types: [minor, patch]
@@ -30,11 +37,13 @@ updates:
     directory: /
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
+    cooldown: { default-days: 8 }
 
   - package-ecosystem: npm
     directory: /www
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
+    cooldown: { default-days: 8 }
     groups:
       playground:
         update-types: [minor, patch]
