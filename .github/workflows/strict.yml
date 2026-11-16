@@ -90,6 +90,30 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@v7
+      # The suite starts brokers by the hundred, up to ten per test, each with
+      # the default 20-connection pool (ANTARES_PG_POOL), and since the
+      # interval sweep visits up to eight Tenants at once a booting notifier
+      # really draws on it. The image's 100 connections then ran out: the log
+      # showed "too many clients already" and the tests "connect: PoolTimedOut"
+      # or a notification that never came. docs/src/operations.md sizes
+      # max_connections from the pools that share it; this sizes the test
+      # database the same way. A service takes no server flags, so the
+      # setting goes in through ALTER SYSTEM and a restart.
+      - name: Postgres sized for the suite's broker pools
+        run: |
+          ready() {
+            for _ in $(seq 60); do
+              docker exec "$1" pg_isready -U antares -q && return
+              sleep 1
+            done
+          }
+          for c in ${{ job.services.postgis.id }}; do
+            ready "$c"
+            docker exec "$c" psql -U antares -d antares -qc "ALTER SYSTEM SET max_connections = 500"
+            docker restart "$c" >/dev/null
+            ready "$c"
+            docker exec "$c" psql -U antares -d antares -tAc "SHOW max_connections" | grep -qx 500
+          done
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

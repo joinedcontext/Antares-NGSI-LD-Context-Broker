@@ -288,7 +288,10 @@ repeated, and the two attempts share one fetch deadline.
 On SIGTERM the broker flips `/q/health` to 503, keeps serving for
 `ANTARES_DRAIN_DELAY_MS` (default 2000) so the load balancer notices, then
 waits up to `ANTARES_DRAIN_DEADLINE_SECS` (default 20) for in-flight
-requests before exiting. Set the container's stop grace period above the
+requests before exiting. A matcher pod on NATS stops taking changes as the
+drain begins: it finishes and acks the change it is delivering and hands
+the ones it holds back to the stream, which redelivers them to another pod
+at once. Set the container's stop grace period above the
 sum. The rolling-update section below relies on exactly this sequence.
 
 ## Bulk load (postgres, timescale)

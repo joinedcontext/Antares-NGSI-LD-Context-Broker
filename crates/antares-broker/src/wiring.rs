@@ -209,6 +209,9 @@ pub async fn wire_nats(
                 let secret = key_for_hook.clone();
                 let key = kv_key(tenant.as_str(), kind, id);
                 let (tenant, id) = (tenant.clone(), id.to_owned());
+                // fired by the first put that lands; dropped unsent when the
+                // sync gives up, which ends the writer's wait as well
+                let (synced, landed) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     // The store row is already committed. A lost put leaves this
                     // subscription invisible to every matcher pod — silently, and
@@ -279,7 +282,10 @@ pub async fn wire_nats(
                         });
                         let bytes = serde_json::to_vec(&value).unwrap_or_default();
                         match kv.update(key.clone(), bytes.into(), revision).await {
-                            Ok(_) => return,
+                            Ok(_) => {
+                                let _ = synced.send(());
+                                return;
+                            }
                             Err(e) => {
                                 tracing::warn!("sub KV sync attempt {} failed: {e}", attempt + 1);
                                 tokio::time::sleep(mirror_sync_backoff(attempt)).await;
@@ -291,6 +297,7 @@ pub async fn wire_nats(
                      until the next restart"
                     );
                 });
+                Some(landed)
             },
         ));
 
@@ -558,12 +565,22 @@ pub async fn wire_nats(
         // with progress heartbeats for every message this pod holds while
         // one of them is processed (a slow endpoint must not let ack_wait
         // pass and have the server hand them all out a second time).
+        //
+        // A draining broker stops taking changes (`run_balanced` hands back
+        // what it holds) and the loop ends after its last ack. It counts as
+        // one pending change while it runs, so the shutdown drain closes
+        // the pools only after that ack: a change booked and delivered here
+        // but never acked went to the next pod and was notified twice (#64).
         durables.push("matcher");
         let consumer = bus.consume_balanced("matcher").await?;
         let st = state.clone();
+        st.pending_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let live = MatcherLive(st.pending_changes.clone());
         tokio::spawn(async move {
+            let _live = live;
             loop {
-                let run = nats::run_balanced(&consumer, |msg| {
+                let run = nats::run_balanced(&consumer, &st.draining, |msg| {
                     // Change lag = stream-publish → matcher-processing
                     // age, from the JetStream metadata timestamp.
                     if let Ok(info) = msg.info() {
@@ -596,6 +613,10 @@ pub async fn wire_nats(
                     }
                 })
                 .await;
+                if st.draining.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::info!("matcher consumer stopped for the drain");
+                    break;
+                }
                 if let Err(e) = run {
                     tracing::warn!("matcher consumer stream failed: {e}");
                 }
@@ -623,6 +644,17 @@ pub async fn wire_nats(
     bus.assert_topology(&durables).await?;
     tracing::info!(?roles, "bus=nats wired");
     Ok(bus)
+}
+
+/// The matcher loop's share of `pending_changes`, given back however the
+/// task ends (a panic included), so a drain never waits out its deadline on
+/// a loop that is gone.
+struct MatcherLive(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for MatcherLive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Whether a change message is on its last delivery: the matcher durable
@@ -1552,6 +1584,48 @@ mod tests {
             "mirrored under another key"
         );
         let _ = kv.purge(key).await;
+    }
+
+    /// The sync answers once the bucket holds the Subscription, never
+    /// before: the API awaits that answer before its 201, so a change the
+    /// client writes next cannot reach a matcher pod ahead of the
+    /// Subscription and notify nobody.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_sub_sync_answers_once_the_kv_holds_the_subscription() {
+        let Some(url) = nats_url() else { return };
+        let mut st = AppState::new("antares".into());
+        let _bus = wire_nats(&mut st, &url, Roles::parse("api").expect("roles"), None)
+            .await
+            .expect("wire");
+        let tenant = TenantId::new("syncanswer").expect("tenant");
+        let id = format!("urn:ngsi-ld:Subscription:syncanswer{}", std::process::id());
+        let doc = json!({"id": id, "type": "Subscription",
+            "entities": [{"type": "https://x/T"}],
+            "notification": {"endpoint": {"uri": "http://localhost:1/n"}}});
+        st.store
+            .create(&tenant, Kind::Subscription, &id, doc.clone())
+            .await
+            .expect("create");
+        let kv = NatsBus::connect(&url)
+            .await
+            .expect("connect")
+            .subs_kv()
+            .await
+            .expect("kv");
+        let key = kv_key(tenant.as_str(), Kind::Subscription, &id);
+        let _ = kv.purge(key.clone()).await;
+        let sync = st.sub_sync.clone().expect("api role installs the sync");
+        let landed = sync(&tenant, Kind::Subscription, &id, Some(&doc)).expect("the bus answers");
+        tokio::time::timeout(std::time::Duration::from_secs(10), landed)
+            .await
+            .expect("answered in time")
+            .expect("the put landed");
+        let held = kv.get(key.clone()).await.expect("get");
+        let _ = kv.purge(key).await;
+        assert!(
+            held.is_some(),
+            "answered before the KV held the Subscription"
+        );
     }
 
     /// A Context Source Registration Subscription's KV entry only wakes the

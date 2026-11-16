@@ -46,10 +46,10 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-matcher` | 530 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
 | `antares-store` | 4 500 | `CurrentStateDriver`, `TemporalDriver` (object-safe, `lib.rs:140`, `:385`), `Kind`, filters/paging (`filter.rs`) | pull a backend |
 | `antares-sql` | 16 300 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
-| `antares-bus` | 850 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
+| `antares-bus` | 1 070 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
 | `antares-notifier` | 2 100 | `NotificationSink` (schemes, `parse_endpoint`, `deliver`, `network`) chosen from `SinkRegistry` by endpoint scheme: http (`http.rs`), mqtt behind the feature, delivery policy, `Outbound` | match or store |
 | `antares-api` | 66 600 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
-| `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
+| `antares-broker` | 5 050 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
 
 ## 3. Module map of `antares-api/src`
@@ -80,9 +80,9 @@ module's header comment.
 | `contexts.rs` | 1 100 | 5.13 `/jsonldContexts` |
 | `conformance.rs` | 855 | 6.3.21 version negotiation |
 | `repr.rs` | 2 500 | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
-| `history.rs` | 880 | the producer side of temporal recording: the per-request change buffer and the 4.5.7/4.5.8 delete mirrors that record a deleted Entity or Attribute in history |
+| `history.rs` | 1 180 | the producer side of temporal recording: the per-request change buffer and the 4.5.7/4.5.8 delete mirrors that record a deleted Entity or Attribute in history |
 | `stamp.rs` | 50 | 4.8, 5.2.4 system attributes of a write: `createdAt`/`modifiedAt` on the entity and on every attribute instance |
-| `mirror.rs` | 620 | the change event and the two document mirrors (`Change`, `DocMirror`, `SubMirror`, `TenantIndex`) that state, notify and history share, with the registration index (`reg_keys`, `bucketed`, `matching`) the federation read path selects candidates through; names no other module |
+| `mirror.rs` | 700 | the change event and the two document mirrors (`Change`, `DocMirror`, `SubMirror`, `TenantIndex`) that state, notify and history share, with the registration index (`reg_keys`, `bucketed`, `matching`) the federation read path selects candidates through; names no other module |
 | `bounds.rs` | 1 000 | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |
 | `egress.rs` | 470 | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
 | `surface.rs` | 100 | `ApiSurface`: HTTP surfaces mounted beside the API root, on the reserved prefixes `/q` and `/x` |

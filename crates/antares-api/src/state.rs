@@ -401,12 +401,18 @@ pub struct Shared {
     pub pending_changes: Arc<std::sync::atomic::AtomicUsize>,
     /// Called after every Subscription and Context Source Registration
     /// Subscription CUD, so the mirror the matcher reads follows the store.
-    /// On the bus the wiring pushes the change into the KV mirror bucket;
-    /// in local mode it applies to this process's own mirror.
+    /// On the bus the wiring pushes the change into the KV mirror bucket
+    /// and answers a receiver that fires once the bucket holds it; in local
+    /// mode it applies to this process's own mirror and answers `None`.
     #[allow(clippy::type_complexity)] // a boxed callback, named where it is installed
     pub sub_sync: Option<
         Arc<
-            dyn Fn(&antares_model::TenantId, antares_store::Kind, &str, Option<&serde_json::Value>)
+            dyn Fn(
+                    &antares_model::TenantId,
+                    antares_store::Kind,
+                    &str,
+                    Option<&serde_json::Value>,
+                ) -> Option<tokio::sync::oneshot::Receiver<()>>
                 + Send
                 + Sync,
         >,
@@ -1063,16 +1069,27 @@ impl AppState {
     /// what the mirror does with it: a Subscription is indexed as a document,
     /// a Context Source Registration Subscription only wakes the interval
     /// sweep (5.11.7) — it is matched against registrations, not entities.
-    pub(crate) fn sub_changed(
+    ///
+    /// On the bus the write waits, up to [`SUB_SYNC_WAIT`], for the mirror
+    /// bucket to hold the row: answered first, a Subscription could reach
+    /// the matcher pods after a change the client wrote right after the 201,
+    /// and that change then notified nobody. A bus that does not answer in
+    /// time leaves the sync to its own retries, as before.
+    pub(crate) async fn sub_changed(
         &self,
         tenant: &antares_model::TenantId,
         kind: antares_store::Kind,
         id: &str,
         doc: Option<&serde_json::Value>,
     ) {
-        if let Some(h) = &self.sub_sync {
-            h(tenant, kind, id, doc);
+        let Some(h) = &self.sub_sync else { return };
+        let synced = h(tenant, kind, id, doc);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(synced) = synced {
+            let _ = tokio::time::timeout(SUB_SYNC_WAIT, synced).await;
         }
+        #[cfg(target_arch = "wasm32")]
+        drop(synced);
     }
 
     /// 5.2.34: stamp the per-registration cooldown locally AND on the other
@@ -1620,5 +1637,53 @@ mod clone_cost {
         let mut c = a.clone();
         c.max_limit = 1;
         assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+/// How long a Subscription write waits for the bus mirror to hold it
+/// ([`AppState::sub_changed`]). A put answers in milliseconds; the bound only
+/// matters while the bus is unreachable.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const SUB_SYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sub_sync_wait {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A Subscription write returns once the bus mirror holds the row, so a
+    /// change the client writes after the 201 cannot reach a matcher pod
+    /// ahead of the Subscription; a sync that gave up ends the wait at once.
+    #[tokio::test]
+    async fn a_subscription_write_waits_for_the_mirror_to_hold_it() {
+        let tenant = antares_model::TenantId::default();
+        let mut st = AppState::new("antares".into());
+        st.sub_sync = Some(Arc::new(|_, _, _, _| {
+            let (landed, synced) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = landed.send(());
+            });
+            Some(synced)
+        }));
+        let t = Instant::now();
+        st.sub_changed(&tenant, antares_store::Kind::Subscription, "urn:x:1", None)
+            .await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(300),
+            "answered before the mirror held the row"
+        );
+
+        st.sub_sync = Some(Arc::new(|_, _, _, _| {
+            let (_gave_up, synced) = tokio::sync::oneshot::channel::<()>();
+            Some(synced)
+        }));
+        let t = Instant::now();
+        st.sub_changed(&tenant, antares_store::Kind::Subscription, "urn:x:1", None)
+            .await;
+        assert!(
+            t.elapsed() < SUB_SYNC_WAIT,
+            "a sync that gave up held the write for the whole bound"
+        );
     }
 }

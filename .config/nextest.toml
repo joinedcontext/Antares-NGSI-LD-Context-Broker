@@ -28,13 +28,17 @@ store-failure-output = true
 # restores the sequencing `cargo test`'s one-binary-at-a-time execution used
 # to provide. pg_explain and pg_retention join it because they create and
 # drop attr_instances partitions: that ACCESS EXCLUSIVE lock queues every
-# parallel reader behind it into the session's lock_timeout. Defined on the
-# default profile; ci inherits.
+# parallel reader behind it into the session's lock_timeout. The bus's own
+# NATS suite (binary_id antares-bus::nats) joins it as well: one of its tests
+# deletes the shared `matcher` durable and acks what it pulls from the new
+# one, so beside nats_e2e it swallowed, or let the Interest stream discard,
+# the change a broker pair was waiting to notify. Defined on the default
+# profile; ci inherits.
 [test-groups]
 db-exclusive = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg) or binary(pg_explain) or binary(pg_retention) or binary(pg_seal)'
+filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg) or binary(pg_explain) or binary(pg_retention) or binary(pg_seal) or binary_id(antares-bus::nats)'
 test-group = 'db-exclusive'
 
 # The restart gap is a wall-clock gate (2 s at 10 000 entities): beside the

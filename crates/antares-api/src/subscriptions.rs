@@ -1122,7 +1122,7 @@ pub async fn create(
     if !st.store.create(&tenant, kind, &id, doc.clone()).await? {
         return Err(NgsiError::AlreadyExists(format!("subscription {id} already exists")).into());
     }
-    st.sub_changed(&tenant, kind, &id, Some(&doc));
+    st.sub_changed(&tenant, kind, &id, Some(&doc)).await;
     if kind == Kind::Subscription {
         // 5.8.1.4: a distributed Subscription creates its internal Context
         // Source Registration Subscription (consumer half)
@@ -1339,7 +1339,7 @@ pub async fn update(
             }
             if st.sub_sync.is_some() {
                 let doc = st.store.get(&tenant, kind, id).await?;
-                st.sub_changed(&tenant, kind, id, doc.as_ref());
+                st.sub_changed(&tenant, kind, id, doc.as_ref()).await;
             }
             if kind == Kind::Subscription {
                 // 5.8.2.4: the CSR subscription and the mapped remote
@@ -1367,7 +1367,7 @@ pub async fn delete(
     let clause = clause_on(st, &tenant, kind, id, "5.8.5", "5.11.6").await?;
     gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     if st.store.delete(&tenant, kind, id).await? {
-        st.sub_changed(&tenant, kind, id, None);
+        st.sub_changed(&tenant, kind, id, None).await;
         if kind == Kind::Subscription {
             // 5.8.5.4: forward the delete to every mapped Context Source
             // and drop the internal CSR subscription (5.11.6)
@@ -1494,7 +1494,7 @@ pub(crate) async fn sweep_expired_socket_subscriptions(st: &AppState, tenant: &T
             .await
             .unwrap_or(false)
         {
-            st.sub_changed(tenant, Kind::Subscription, &id, None);
+            st.sub_changed(tenant, Kind::Subscription, &id, None).await;
             crate::distsub::on_subscription_deleted(st, tenant, &id).await;
             n = n.saturating_add(1);
         }

@@ -439,22 +439,34 @@ pub fn balanced_config(durable: &str) -> consumer::pull::Config {
 /// it and everything queued behind it, so each was matched and notified
 /// twice. Now only a pod that stops working lets `ack_wait` pass.
 ///
+/// Once `stop` is set (the broker is draining) no further message is worked
+/// on: the one in `work` finishes and is acked, every message held behind it
+/// is handed back with a NAK, which the server redelivers to another pod at
+/// once, and the call returns `Ok`. A pod that exited with a message worked
+/// on but unacked had its change redelivered after `ack_wait` and notified a
+/// second time by the next pod (#64, a notifier pod rolling).
+///
 /// Returns on a pull that fails (a deleted consumer, a lost connection); the
 /// caller re-opens.
 pub async fn run_balanced<F, Fut>(
     consumer: &consumer::PullConsumer,
+    stop: &std::sync::atomic::AtomicBool,
     mut work: F,
 ) -> Result<(), BusError>
 where
     F: FnMut(&async_nats::jetstream::Message) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    use std::sync::atomic::Ordering::SeqCst;
     let ack_wait = match consumer.cached_info().config.ack_wait {
         w if w.is_zero() => ACK_WAIT,
         w => w,
     };
     let every = ack_wait / 3;
     loop {
+        if stop.load(SeqCst) {
+            return Ok(());
+        }
         let mut batch = consumer
             .batch()
             .max_messages(PULL_BATCH)
@@ -483,6 +495,14 @@ where
                 },
                 None => break,
             };
+            if stop.load(SeqCst) {
+                for m in std::iter::once(&msg).chain(held.iter()) {
+                    if let Err(e) = m.ack_with(jetstream::AckKind::Nak(None)).await {
+                        tracing::warn!("nak on stop failed: {e}");
+                    }
+                }
+                return Ok(());
+            }
             let job = work(&msg);
             tokio::pin!(job);
             loop {
