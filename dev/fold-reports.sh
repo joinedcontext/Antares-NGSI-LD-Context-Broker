@@ -21,7 +21,7 @@ if [ -n "$id" ] && [ "$id" != "null" ]; then
   mkdir -p cells && unzip -q matrix.zip -d cells
   python3 dev/etsi-report-site.py cells site/reports/latest
 else
-  echo '<!doctype html><title>ETSI report</title><p>No ETSI-matrix-results bundle in the retention window — dispatch the etsi-matrix workflow.' \
+  echo '<!doctype html><title>ETSI report</title><p>No ETSI-matrix-results bundle from dev in the retention window — dispatch the full workflow on dev (Actions → full → Run workflow, release empty).' \
     > site/reports/latest/index.html
   echo '{"schemaVersion":1,"label":"ETSI CIM 009","message":"no recent run","color":"lightgrey"}' \
     > site/reports/badge.json
