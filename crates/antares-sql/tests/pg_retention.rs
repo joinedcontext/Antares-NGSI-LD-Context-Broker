@@ -579,6 +579,13 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
     // Hold the maintenance claim while the weeks are made and one is filled,
     // so a parallel test's run cannot drop the held week while it is empty.
     let mut claim = pool.begin().await.expect("claim");
+    // CREATE ... PARTITION OF locks the parent, and every reader of
+    // attr_instances in the other test binaries queues ahead of it: under
+    // the pool's 5 s lock_timeout that measured the host, not this test.
+    sqlx::query("SET LOCAL lock_timeout = 0")
+        .execute(&mut *claim)
+        .await
+        .expect("no lock timeout");
     sqlx::query("SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions' FOR UPDATE")
         .fetch_optional(&mut *claim)
         .await
@@ -661,6 +668,13 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
     // Hold the maintenance claim while the weeks are made and filled, so a
     // parallel test's drop of emptied weeks cannot take one while it is empty.
     let mut claim = pool.begin().await.expect("claim");
+    // CREATE ... PARTITION OF locks the parent, and every reader of
+    // attr_instances in the other test binaries queues ahead of it: under
+    // the pool's 5 s lock_timeout that measured the host, not this test.
+    sqlx::query("SET LOCAL lock_timeout = 0")
+        .execute(&mut *claim)
+        .await
+        .expect("no lock timeout");
     sqlx::query("SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions' FOR UPDATE")
         .fetch_optional(&mut *claim)
         .await
@@ -790,6 +804,8 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
     // every table fails with "tuple concurrently updated".
     let mut tx = pool.begin().await.expect("cleanup");
     for stmt in [
+        // the DROP takes the parent's ACCESS EXCLUSIVE lock (see the claim)
+        "SET LOCAL lock_timeout = 0",
         "SELECT pg_advisory_xact_lock(4334)",
         "DROP TABLE IF EXISTS attr_instances_2002w12",
     ] {

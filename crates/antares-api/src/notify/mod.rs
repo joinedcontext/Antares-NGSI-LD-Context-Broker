@@ -196,9 +196,12 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     }
     let m = mirror.clone();
     state.sub_sync = Some(Arc::new(
-        move |tenant: &TenantId, kind: Kind, id: &str, doc: Option<&Value>| match kind {
-            Kind::CSourceSubscription => m.csub_written(),
-            _ => m.apply(tenant.as_str(), id, doc.cloned()),
+        move |tenant: &TenantId, kind: Kind, id: &str, doc: Option<&Value>| {
+            match kind {
+                Kind::CSourceSubscription => m.csub_written(),
+                _ => m.apply(tenant.as_str(), id, doc.cloned()),
+            }
+            None
         },
     ));
 

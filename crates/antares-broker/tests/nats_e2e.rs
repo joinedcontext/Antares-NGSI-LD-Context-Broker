@@ -87,6 +87,12 @@ fn http(port: u16, method: &str, path: &str, tenant: Option<&str>, body: Option<
 
 /// Notification receiver: records every POSTed body, answers 200.
 fn receiver() -> (u16, Arc<Mutex<Vec<String>>>) {
+    receiver_answering_after(Duration::ZERO)
+}
+
+/// [`receiver`] that records a request when it has read it and answers it
+/// only `delay` later: a delivery that is still running.
+fn receiver_answering_after(delay: Duration) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind receiver");
     let port = listener.local_addr().expect("addr").port();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -131,6 +137,7 @@ fn receiver() -> (u16, Arc<Mutex<Vec<String>>>) {
                 // can assert WHICH endpoint/path was dialed, not only payloads
                 let body = String::from_utf8_lossy(&buf[..]).to_string();
                 sink.lock().expect("sink").push(body);
+                std::thread::sleep(delay);
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
@@ -702,6 +709,119 @@ fn response_json(raw: &str) -> Option<serde_json::Value> {
         body.to_string()
     };
     serde_json::from_str(&body).ok()
+}
+
+/// #64: a notifier pod that is stopped (SIGTERM, a rolling update) while it
+/// delivers a change finishes that delivery and acks the change before it
+/// exits. It used to close its pools and exit with the change booked and
+/// sent but unacked; `ack_wait` later the server handed the change to the
+/// pod that took over, which booked and sent it again (`timesSent` 2 for one
+/// change, TP 586_01 in the rolling cells). The wait below outlasts
+/// `ack_wait`, so an unacked change has had its redelivery by then.
+#[test]
+fn a_notifier_stopped_mid_delivery_books_the_change_once() {
+    let _serial = serial();
+    let (Ok(db), Ok(nats)) = (
+        std::env::var("ANTARES_TEST_DATABASE_URL"),
+        std::env::var("ANTARES_TEST_NATS_URL"),
+    ) else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL / ANTARES_TEST_NATS_URL not set");
+        return;
+    };
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let tenant = format!("roll{run}");
+
+    let api_port = free_port();
+    let w1_port = free_port();
+    let _api = start(api_port, "api", &db, &nats);
+    // no notice window: nothing routes to a worker, and the drain must not
+    // get its time from a delay
+    let mut w1 = start_env(
+        w1_port,
+        "matcher,notifier",
+        &db,
+        &nats,
+        &[("ANTARES_DRAIN_DELAY_MS", "0")],
+    );
+    wait_healthy(api_port);
+    wait_healthy(w1_port);
+
+    let (rx_port, seen) = receiver_answering_after(Duration::from_secs(3));
+    let sid = format!("urn:ngsi-ld:Subscription:roll:{run}");
+    let sub = format!(
+        r#"{{"id":"{sid}","type":"Subscription",
+            "entities":[{{"type":"RollProbe"}}],
+            "notification":{{"endpoint":{{"uri":"http://127.0.0.1:{rx_port}/notify"}}}}}}"#
+    );
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(&tenant),
+        Some(&sub),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "sub: {resp}");
+    let eid = format!("urn:ngsi-ld:RollProbe:{run}");
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(&tenant),
+        Some(&format!(
+            r#"{{"id":"{eid}","type":"RollProbe","temperature":{{"type":"Property","value":21}}}}"#
+        )),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "entity: {resp}");
+    let delivered = || {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .filter(|b| b.contains(&eid))
+            .count()
+    };
+    wait_for("the delivery to start", 30, || delivered() > 0);
+
+    // stopped while the receiver still holds the delivery open
+    let killed = Command::new("sh")
+        .args(["-c", &format!("kill -TERM {}", w1.0.id())])
+        .status()
+        .expect("kill -TERM");
+    assert!(killed.success(), "SIGTERM not delivered");
+    let w2_port = free_port();
+    let _w2 = start(w2_port, "matcher,notifier", &db, &nats);
+    wait_healthy(w2_port);
+    let deadline = Instant::now() + stretch(30);
+    while !matches!(w1.0.try_wait(), Ok(Some(_))) {
+        assert!(
+            Instant::now() < deadline,
+            "the stopped notifier never exited"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    std::thread::sleep(stretch(nats_ack_wait_secs() + 5));
+    assert_eq!(delivered(), 1, "one change, one notification");
+    let got = http(
+        api_port,
+        "GET",
+        &format!("/ngsi-ld/v1/subscriptions/{sid}"),
+        Some(&tenant),
+        None,
+    );
+    let doc = response_json(&got).unwrap_or_else(|| panic!("subscription: {got}"));
+    assert_eq!(
+        doc.pointer("/notification/timesSent"),
+        Some(&serde_json::json!(1)),
+        "one change books one notification: {doc}"
+    );
+}
+
+/// The matcher durable's `ack_wait`, in whole seconds.
+fn nats_ack_wait_secs() -> u64 {
+    antares_bus::nats::ACK_WAIT.as_secs()
 }
 
 /// The 5-role × 2-replica fleet (docker-compose-roles.yml shape): every

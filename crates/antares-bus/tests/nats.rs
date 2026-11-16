@@ -29,6 +29,21 @@ fn nonce() -> u128 {
         .as_nanos()
 }
 
+/// Delete a throwaway durable on `ANTARES_CHANGES` once its test is done.
+/// The stream keeps a change while any durable has not acked it (Interest
+/// retention), so every left-behind durable kept every later change on the
+/// server for good, and a re-created `matcher` (which starts at the first
+/// message kept) replayed that whole history ahead of the next broker test's
+/// own change.
+async fn forget_durable(url: &str, durable: &str) {
+    let js = async_nats::jetstream::new(async_nats::connect(url).await.expect("raw connect"));
+    let s = js
+        .get_stream(antares_bus::nats::CHANGES_STREAM)
+        .await
+        .expect("changes stream");
+    s.delete_consumer(durable).await.expect("delete durable");
+}
+
 fn event(tenant: &TenantId, id: &str, seq: i64) -> ChangeEvent {
     ChangeEvent {
         tenant: tenant.clone(),
@@ -102,6 +117,8 @@ async fn balanced_splits_and_broadcast_duplicates() {
         }
     }
     assert_eq!(total, N, "balanced durable must deliver every message once");
+    drop((s1, s2, c1, c2));
+    forget_durable(&url, &durable).await;
 
     // broadcast: two EPHEMERAL registry consumers each see the same delta
     let b1 = bus.consume_registry_broadcast().await.expect("bc 1");
@@ -172,6 +189,8 @@ async fn claim_check_strips_oversized_payloads_on_the_wire() {
     let r = got.payload_ref.expect("reference set");
     assert_eq!(r.entity_id.as_str(), format!("urn:cc:{n}"));
     assert_eq!(r.version, 1);
+    drop((s, c));
+    forget_durable(&url, &durable).await;
 }
 
 /// A drain retry republishing the same outbox seq is absorbed by the
@@ -211,6 +230,8 @@ async fn msg_id_dedup_absorbs_republish() {
         count, 1,
         "duplicate-window dedup must swallow the republish"
     );
+    drop((s, c));
+    forget_durable(&url, &durable).await;
 }
 
 /// The recovery contract the registry mirror depends on.
@@ -516,16 +537,20 @@ async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let log = seen.clone();
     let runner = tokio::spawn(async move {
-        let _ = antares_bus::nats::run_balanced(&consumer, |msg| {
-            let body = String::from_utf8_lossy(&msg.payload).into_owned();
-            log.lock().expect("lock").push(body.clone());
-            async move {
-                if body == "0" {
-                    // 3.5 ack_waits on the first message
-                    tokio::time::sleep(Duration::from_millis(3_500)).await;
+        let _ = antares_bus::nats::run_balanced(
+            &consumer,
+            &std::sync::atomic::AtomicBool::new(false),
+            |msg| {
+                let body = String::from_utf8_lossy(&msg.payload).into_owned();
+                log.lock().expect("lock").push(body.clone());
+                async move {
+                    if body == "0" {
+                        // 3.5 ack_waits on the first message
+                        tokio::time::sleep(Duration::from_millis(3_500)).await;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
     });
     tokio::time::sleep(Duration::from_millis(6_000)).await;
@@ -536,6 +561,84 @@ async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
     assert_eq!(seen, ["0", "1", "2"], "worked on more than once");
     assert_eq!(info.num_redelivered, 0, "the server redelivered");
     assert_eq!(info.num_ack_pending, 0, "a message was left unacked");
+}
+
+/// A draining pod (#64): once `stop` is set, the message being worked on
+/// finishes and is acked, and the ones of the same pull still queued behind
+/// it go back to the server at once instead of waiting out `ack_wait` on a
+/// pod that is leaving. The acked one is never handed out again, so the pod
+/// that takes over cannot notify it a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
+    use async_nats::jetstream::{self, stream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let url = require_nats!();
+    let js = jetstream::new(async_nats::connect(&url).await.expect("connect"));
+    let n = nonce();
+    let name = format!("ANTARES_TEST_STOP_{n}");
+    let subject = format!("stopwork{n}");
+    let s = js
+        .create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{subject}.>")],
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    // the production ack_wait (30 s): a message left unacked would come back
+    // only after it, far past every wait below
+    let consumer: antares_bus::nats::PullConsumer = s
+        .create_consumer(antares_bus::nats::balanced_config("worker"))
+        .await
+        .expect("consumer");
+    for i in 0..3 {
+        js.publish(format!("{subject}.m"), i.to_string().into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (flag, log) = (stop.clone(), seen.clone());
+    let ran = tokio::time::timeout(
+        Duration::from_secs(10),
+        antares_bus::nats::run_balanced(&consumer, &stop, |msg| {
+            let body = String::from_utf8_lossy(&msg.payload).into_owned();
+            log.lock().expect("lock").push(body);
+            let flag = flag.clone();
+            async move {
+                // the SIGTERM lands while the first change is being delivered
+                flag.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }),
+    )
+    .await;
+    assert!(
+        matches!(ran, Ok(Ok(()))),
+        "a stopped consumer returns Ok: {ran:?}"
+    );
+    assert_eq!(
+        *seen.lock().expect("lock"),
+        ["0"],
+        "worked on past the stop"
+    );
+    // the pod taking over gets the two handed back, and only those
+    let mut next = consumer
+        .batch()
+        .max_messages(3)
+        .expires(Duration::from_secs(3))
+        .messages()
+        .await
+        .expect("pull");
+    let mut again = Vec::new();
+    while let Some(Ok(m)) = next.next().await {
+        again.push(String::from_utf8_lossy(&m.payload).into_owned());
+        m.ack().await.expect("ack");
+    }
+    let _ = js.delete_stream(&name).await;
+    assert_eq!(again, ["1", "2"], "the handed-back messages, at once");
 }
 
 /// The heartbeat runs across the whole pull, not per message: a batch of
@@ -573,12 +676,16 @@ async fn a_batch_of_short_messages_longer_than_ack_wait_is_not_redelivered() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let log = seen.clone();
     let runner = tokio::spawn(async move {
-        let _ = antares_bus::nats::run_balanced(&consumer, |msg| {
-            log.lock()
-                .expect("lock")
-                .push(String::from_utf8_lossy(&msg.payload).into_owned());
-            tokio::time::sleep(Duration::from_millis(220))
-        })
+        let _ = antares_bus::nats::run_balanced(
+            &consumer,
+            &std::sync::atomic::AtomicBool::new(false),
+            |msg| {
+                log.lock()
+                    .expect("lock")
+                    .push(String::from_utf8_lossy(&msg.payload).into_owned());
+                tokio::time::sleep(Duration::from_millis(220))
+            },
+        )
         .await;
     });
     tokio::time::sleep(Duration::from_millis(3_000)).await;

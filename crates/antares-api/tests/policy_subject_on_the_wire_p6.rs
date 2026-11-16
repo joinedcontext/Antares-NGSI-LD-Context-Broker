@@ -375,6 +375,7 @@ async fn the_broker_s_own_subscription_mirror_keeps_the_subject() {
         if let Ok(mut v) = recorder.lock() {
             v.push(json!({"tenant": tenant.as_str(), "id": id, "doc": doc}));
         }
+        None
     }));
 
     let (code, body) = call(
