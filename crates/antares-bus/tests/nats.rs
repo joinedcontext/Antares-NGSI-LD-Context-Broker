@@ -565,9 +565,11 @@ async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
 
 /// A draining pod (#64): once `stop` is set, the message being worked on
 /// finishes and is acked, and the ones of the same pull still queued behind
-/// it go back to the server at once instead of waiting out `ack_wait` on a
-/// pod that is leaving. The acked one is never handed out again, so the pod
-/// that takes over cannot notify it a second time.
+/// it go back to the server, for another pod well inside `ack_wait`, instead
+/// of waiting it out on a pod that is leaving. The acked one is never handed
+/// out again, so the pod that takes over cannot notify it a second time.
+/// NAKed for at once they went back into the leaving pod's own open pull,
+/// which nobody read any more, and waited out `ack_wait` there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
     use async_nats::jetstream::{self, stream};
@@ -624,21 +626,34 @@ async fn a_stopped_consumer_acks_what_it_worked_on_and_hands_back_the_rest() {
         ["0"],
         "worked on past the stop"
     );
-    // the pod taking over gets the two handed back, and only those
-    let mut next = consumer
-        .batch()
-        .max_messages(3)
-        .expires(Duration::from_secs(3))
-        .messages()
-        .await
-        .expect("pull");
+    // the pod taking over gets the two handed back, and only those, long
+    // before `ack_wait` would have released them
+    let handed_back = std::time::Instant::now();
     let mut again = Vec::new();
-    while let Some(Ok(m)) = next.next().await {
-        again.push(String::from_utf8_lossy(&m.payload).into_owned());
-        m.ack().await.expect("ack");
+    while again.len() < 2 && handed_back.elapsed() < Duration::from_secs(15) {
+        let mut next = consumer
+            .batch()
+            .max_messages(3)
+            .expires(Duration::from_secs(2))
+            .messages()
+            .await
+            .expect("pull");
+        while let Some(Ok(m)) = next.next().await {
+            again.push(String::from_utf8_lossy(&m.payload).into_owned());
+            m.ack().await.expect("ack");
+        }
     }
+    let waited = handed_back.elapsed();
     let _ = js.delete_stream(&name).await;
-    assert_eq!(again, ["1", "2"], "the handed-back messages, at once");
+    assert_eq!(
+        again,
+        ["1", "2"],
+        "the handed-back messages, and only those"
+    );
+    assert!(
+        waited < antares_bus::nats::ACK_WAIT / 2,
+        "handed back only after {waited:?}"
+    );
 }
 
 /// The heartbeat runs across the whole pull, not per message: a batch of

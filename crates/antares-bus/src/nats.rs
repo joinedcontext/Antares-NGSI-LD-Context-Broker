@@ -440,9 +440,10 @@ pub fn balanced_config(durable: &str) -> consumer::pull::Config {
 /// twice. Now only a pod that stops working lets `ack_wait` pass.
 ///
 /// Once `stop` is set (the broker is draining) no further message is worked
-/// on: the one in `work` finishes and is acked, every message held behind it
-/// is handed back with a NAK, which the server redelivers to another pod at
-/// once, and the call returns `Ok`. A pod that exited with a message worked
+/// on: the one in `work` finishes and is acked, every message held behind it,
+/// and every one the open pull still delivers, is handed back with a NAK the
+/// server redelivers to another pod once that pull has expired
+/// ([`PULL_EXPIRES`], far inside `ack_wait`), and the call returns `Ok`. A pod that exited with a message worked
 /// on but unacked had its change redelivered after `ack_wait` and notified a
 /// second time by the next pod (#64, a notifier pod rolling).
 ///
@@ -496,9 +497,26 @@ where
                 None => break,
             };
             if stop.load(SeqCst) {
+                // This pull stays open on the server until it expires, and a
+                // message NAKed for at once went straight back into it, to a
+                // pod no longer reading: it waited out `ack_wait`. Delayed
+                // past the pull's life it goes to another pod's pull. What
+                // the pull still hands this pod until then goes back the
+                // same way, so nothing this pod was given is left unacked.
+                let back = jetstream::AckKind::Nak(Some(PULL_EXPIRES));
                 for m in std::iter::once(&msg).chain(held.iter()) {
-                    if let Err(e) = m.ack_with(jetstream::AckKind::Nak(None)).await {
+                    if let Err(e) = m.ack_with(back).await {
                         tracing::warn!("nak on stop failed: {e}");
+                    }
+                }
+                while open {
+                    match batch.next().await {
+                        Some(Ok(m)) => {
+                            if let Err(e) = m.ack_with(back).await {
+                                tracing::warn!("nak on stop failed: {e}");
+                            }
+                        }
+                        _ => open = false,
                     }
                 }
                 return Ok(());
