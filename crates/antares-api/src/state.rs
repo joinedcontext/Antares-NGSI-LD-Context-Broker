@@ -733,12 +733,13 @@ impl AppState {
         // 5.8.1.4: this URL is handed to peer brokers as the notification
         // endpoint for distributed subscriptions — the default must carry
         // the HTTP port or peers dial port 80 (ETSI-matrix ADV_02 shape).
-        let public_url =
-            std::env::var("ANTARES_PUBLIC_URL").unwrap_or_else(|_| {
-                match std::env::var("ANTARES_HTTP_PORT") {
-                    Ok(p) if p != "80" => format!("http://{host_alias}:{p}"),
-                    _ => format!("http://{host_alias}"),
-                }
+        // An empty setting is no setting.
+        let public_url = std::env::var("ANTARES_PUBLIC_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| match std::env::var("ANTARES_HTTP_PORT") {
+                Ok(p) if p != "80" => format!("http://{host_alias}:{p}"),
+                _ => format!("http://{host_alias}"),
             });
         let temporal_name = temporal.supported().then(|| store_name.to_owned());
         // 6.3.8 is the mandatory binding; clause 7's MQTT one is optional and

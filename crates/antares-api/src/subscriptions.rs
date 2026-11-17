@@ -1132,14 +1132,9 @@ pub async fn create(
             // hosted as a read hosts one: one content-addressed row per
             // distinct @context of the Tenant, under the Tenant's cap, so a
             // refused or repeated create adds no row
-            let hosted = crate::contexts::linkable(
-                st,
-                &tenant,
-                headers,
-                &parsed.ctx,
-                crate::negotiate::Accept::Json,
-            )
-            .await?;
+            let hosted =
+                crate::contexts::linkable(st, &tenant, &parsed.ctx, crate::negotiate::Accept::Json)
+                    .await?;
             let Some(url) = hosted.source.as_str() else {
                 return Err(NgsiError::TooManyResults(
                     "the Tenant holds the most ImplicitlyCreated @contexts it may; \

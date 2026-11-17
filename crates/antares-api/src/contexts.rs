@@ -23,46 +23,22 @@ use crate::negotiate::CleanParams;
 
 /// Base URL under which this broker publishes its own @context entries
 /// (5.13.2.4 locally unique URI, 5.13.3.5 `URL`). The address is the
-/// broker's, so it comes from ITS configuration — ANTARES_PUBLIC_URL, the
-/// same value peers are handed as the 5.8.1.4 notification endpoint. The
-/// request's `Host` header is client input and only the fallback for a
-/// deployment that configures nothing.
-pub(crate) fn base_url(headers: &HeaderMap) -> String {
-    context_base(std::env::var("ANTARES_PUBLIC_URL").ok().as_deref(), headers)
+/// broker's, so it comes from ITS configuration — `AppState::public_url`,
+/// the same value peers are handed as the 5.8.1.4 notification endpoint
+/// (`ANTARES_PUBLIC_URL`, else `http://{host_alias}:{port}`). The request's
+/// `Host` header is client input and never names a stored URL.
+pub(crate) fn base_url(st: &AppState) -> String {
+    format!("{}/ngsi-ld/v1/jsonldContexts", public_base(st))
 }
 
 /// The URL this broker is reached at, with no trailing slash, for a
 /// document that names the broker's own resources by absolute URL (an
-/// context URL): `ANTARES_PUBLIC_URL`, else `http://{Host}` of the
-/// request, the same fallback as the JSON-LD context URL.
+/// context URL): the state's `public_url`, the same base as the JSON-LD
+/// context URL.
 ///
-/// ```
-/// let headers = axum::http::HeaderMap::new();
-/// assert!(antares_api::public_base(&headers).starts_with("http"));
-/// ```
 #[must_use]
-pub fn public_base(headers: &HeaderMap) -> String {
-    broker_base(std::env::var("ANTARES_PUBLIC_URL").ok().as_deref(), headers)
-}
-
-fn broker_base(configured: Option<&str>, headers: &HeaderMap) -> String {
-    match configured.map(str::trim).filter(|u| !u.is_empty()) {
-        Some(url) => url.trim_end_matches('/').to_owned(),
-        None => {
-            let host = headers
-                .get(header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("localhost:9090");
-            format!("http://{host}")
-        }
-    }
-}
-
-fn context_base(configured: Option<&str>, headers: &HeaderMap) -> String {
-    format!(
-        "{}/ngsi-ld/v1/jsonldContexts",
-        broker_base(configured, headers)
-    )
+pub fn public_base(st: &AppState) -> String {
+    st.public_url.trim_end_matches('/').to_owned()
 }
 
 /// Validate a boolean query param (`details`, `reload`): absent | true |
@@ -191,7 +167,6 @@ const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
 pub(crate) async fn linkable(
     st: &AppState,
     tenant: &TenantId,
-    headers: &HeaderMap,
     ctx: &Arc<Context>,
     accept: Accept,
 ) -> ApiResult<Arc<Context>> {
@@ -205,11 +180,9 @@ pub(crate) async fn linkable(
     }
     let body = serde_json::to_vec(&ctx.source)
         .map_err(|e| NgsiError::InternalError(format!("@context not serializable: {e}")))?;
-    // The base is part of the address: without ANTARES_PUBLIC_URL it comes
-    // from the request's Host, and the row is shared by every request of the
-    // Tenant sending the same @context, so one keyed by content alone would
-    // hand later callers the URL the first caller's Host named.
-    let base = base_url(headers);
+    // The base is part of the address, so a row written under another
+    // configured base is never handed out under this one.
+    let base = base_url(st);
     let mut h = Sha256::new();
     h.update(tenant.as_str().as_bytes());
     h.update([0]);
@@ -370,7 +343,7 @@ pub async fn add_context(
         }
         // 5.13.2.4: "a locally unique identifier (URI)"
         let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-        let url = format!("{}/{local_id}", base_url(&headers));
+        let url = format!("{}/{local_id}", base_url(&st));
         let doc = json!({
             "url": url,
             "localId": local_id,
@@ -719,37 +692,61 @@ mod tests {
         h
     }
 
-    /// 6.3.6: the ImplicitlyCreated @context one request's Host named is not
-    /// the URL another request of the Tenant is answered with: each Link
-    /// names the base the request itself reached.
+    /// 6.3.6 / 5.13.1: the URL of an ImplicitlyCreated @context names the
+    /// broker's configured base whatever Host the request carried, so a
+    /// forged Host never reaches a stored URL or another caller's Link.
     #[tokio::test]
-    async fn an_implicit_context_url_never_carries_another_requests_host() {
-        let st = AppState::new("me".into());
+    async fn an_implicit_context_url_never_carries_the_requests_host() {
+        let mut st = AppState::new("me".into());
+        st.public_url = "https://broker.example/".into();
         let tenant = TenantId::new("alpha").expect("tenant");
         let mut inline = Context::clone(&st.loader.core());
         inline.source =
             json!([{"speed": "https://example.org/speed"}, antares_jsonld::CORE_CONTEXT]);
         let inline = Arc::new(inline);
-        let first = linkable(&st, &tenant, &forged_host(), &inline, Accept::Json)
+        let first = linkable(&st, &tenant, &inline, Accept::Json)
             .await
             .expect("first");
-        let mut honest = HeaderMap::new();
-        honest.insert(header::HOST, "broker.local:9090".parse().expect("host"));
-        let second = linkable(&st, &tenant, &honest, &inline, Accept::Json)
-            .await
-            .expect("second");
-        let url = second.source.as_str().expect("a URL");
-        assert!(url.starts_with("http://broker.local:9090/"), "{url}");
-        assert!(!url.contains("attacker.example"), "{url}");
-        assert!(first
-            .source
-            .as_str()
-            .is_some_and(|u| u.starts_with("http://attacker.example/")));
-        // the same request again is the same row behind the same URL
-        let again = linkable(&st, &tenant, &honest, &inline, Accept::Json)
+        let url = first.source.as_str().expect("a URL");
+        assert!(
+            url.starts_with("https://broker.example/ngsi-ld/v1/jsonldContexts/"),
+            "{url}"
+        );
+        let again = linkable(&st, &tenant, &inline, Accept::Json)
             .await
             .expect("again");
-        assert_eq!(again.source, second.source);
+        assert_eq!(again.source, first.source, "one row behind one URL");
+        // a Hosted @context added under a forged Host is stored under the
+        // configured base as well
+        let mut headers = forged_host();
+        headers.insert("NGSILD-Tenant", "alpha".parse().expect("tenant header"));
+        let resp = add_context(
+            State(st.clone()),
+            CleanParams(HashMap::new()),
+            headers,
+            Bytes::from(r#"{"@context":{"speed":"https://example.org/speed"}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .expect("Location")
+            .to_owned();
+        let local_id = location.rsplit('/').next().expect("id");
+        let row = st
+            .store
+            .context_get(Some(&tenant), local_id)
+            .await
+            .expect("store")
+            .expect("row");
+        let url = row["url"].as_str().expect("url");
+        assert!(
+            url.starts_with("https://broker.example/ngsi-ld/v1/jsonldContexts/"),
+            "{url}"
+        );
+        assert!(!url.contains("attacker.example"), "{url}");
     }
 
     fn hosted_row(url: &str, local_id: &str, owner: &TenantId) -> Value {
@@ -936,7 +933,7 @@ mod tests {
             antares_model::EntityId::new(&local_id).is_ok(),
             "{local_id} is a URI"
         );
-        let url = Value::String(format!("{}/{local_id}", base_url(&headers)));
+        let url = Value::String(format!("{}/{local_id}", base_url(&st)));
 
         let ctx = st
             .loader
@@ -1077,24 +1074,17 @@ mod tests {
     /// TLS deployment is not stuck advertising `http`.
     #[test]
     fn published_context_url_comes_from_configuration_not_the_host_header() {
+        let mut st = AppState::new("antares-ctx-base".into());
+        st.public_url = "https://broker.example/".into();
         assert_eq!(
-            context_base(Some("https://broker.example"), &forged_host()),
-            "https://broker.example/ngsi-ld/v1/jsonldContexts"
+            base_url(&st),
+            "https://broker.example/ngsi-ld/v1/jsonldContexts",
+            "a configured value with a trailing slash must not double it"
         );
-        // a configured value with a trailing slash must not double it
+        st.public_url = "http://antares-ctx-base:9090".into();
         assert_eq!(
-            context_base(Some("https://broker.example/"), &forged_host()),
-            "https://broker.example/ngsi-ld/v1/jsonldContexts"
-        );
-        // nothing configured: today's Host-derived URL stays the fallback
-        assert_eq!(
-            context_base(None, &forged_host()),
-            "http://attacker.example/ngsi-ld/v1/jsonldContexts"
-        );
-        assert_eq!(
-            context_base(Some(""), &forged_host()),
-            "http://attacker.example/ngsi-ld/v1/jsonldContexts",
-            "an empty setting is no setting"
+            base_url(&st),
+            "http://antares-ctx-base:9090/ngsi-ld/v1/jsonldContexts"
         );
     }
 }

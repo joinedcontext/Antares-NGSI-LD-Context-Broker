@@ -201,7 +201,7 @@ async fn create_map(
             crate::entities::build_query_map(&st, &tenant, &headers, &ctx, &vp, &filter).await?
         };
         // 6.3.6: the json answer's Link names the @context it was compacted in
-        let served = crate::contexts::linkable(&st, &tenant, &headers, &ctx, accept).await?;
+        let served = crate::contexts::linkable(&st, &tenant, &ctx, accept).await?;
         let mut resp = created_response(doc, &served, accept, &tenant);
         filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
