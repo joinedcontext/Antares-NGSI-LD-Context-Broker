@@ -466,12 +466,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    // The values `run` needs, each parsed and fatal here, before a store
+    // connection or a migration runs.
+    let roles = wiring::Roles::parse(&roles).map_err(|e| format!("ANTARES_ROLES: {e}"))?;
+    check_bus(&bus_mode, roles, &store_name)?;
+    let history = temporal_choice(
+        &store_name,
+        std::env::var("ANTARES_TEMPORAL").ok().as_deref(),
+    )?;
+    let temporal_record: antares_api::TemporalRecord = std::env::var("ANTARES_TEMPORAL_RECORD")
+        .as_deref()
+        .unwrap_or("all")
+        .parse()?;
+    let retention = parse_retention_days(
+        std::env::var("ANTARES_TEMPORAL_RETENTION_DAYS")
+            .ok()
+            .as_deref(),
+    )?;
+    let header_read_timeout = parse_header_read_timeout(
+        std::env::var("ANTARES_HEADER_READ_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )?;
+    let max_connections = max_connections()?;
+
     runtime()?.block_on(async {
-        let drivers = build_drivers(&store_name).await?;
+        let drivers = build_drivers(&store_name, history).await?;
         run(
             port,
             host_alias,
             roles,
+            bus_mode,
+            temporal_record,
+            retention,
+            header_read_timeout,
+            max_connections,
             drivers.store,
             drivers.temporal,
             store_name,
@@ -733,13 +762,15 @@ fn policy_engine(raw: Option<&str>) -> Result<(&'static str, PolicyCtor), String
 /// OperationNotSupported 422, Table 6.3.2-1; the recorder produces
 /// nothing), and a different backend name builds a second store used only
 /// through its temporal half.
-async fn build_drivers(store_name: &str) -> Result<Drivers, Box<dyn std::error::Error>> {
+async fn build_drivers(
+    store_name: &str,
+    choice: TemporalChoice,
+) -> Result<Drivers, Box<dyn std::error::Error>> {
     let built = build_store(store_name, false).await?;
     // Every pg half gets the maintenance job: partitions, retention and the
     // 4.22 reap belong to whichever database holds the history.
     let mut maintenance = Vec::from_iter(built.maintenance);
-    let raw = std::env::var("ANTARES_TEMPORAL").ok();
-    let (temporal, temporal_name) = match temporal_choice(store_name, raw.as_deref())? {
+    let (temporal, temporal_name) = match choice {
         TemporalChoice::SameAsStore => {
             let name = built.temporal.supported().then(|| store_name.to_owned());
             (built.temporal.clone(), name)
@@ -1072,7 +1103,12 @@ fn warn_if_not_mount_point(_dir: &std::path::Path) {}
 async fn run(
     port: u16,
     host_alias: String,
-    roles: String,
+    roles: wiring::Roles,
+    bus_mode: String,
+    temporal_record: antares_api::TemporalRecord,
+    retention: Option<i64>,
+    header_read_timeout: std::time::Duration,
+    max_connections: usize,
     store: std::sync::Arc<dyn antares_store::CurrentStateDriver>,
     temporal: std::sync::Arc<dyn antares_store::TemporalDriver>,
     store_name: String,
@@ -1087,32 +1123,6 @@ async fn run(
     drain_delay: std::time::Duration,
     drain_deadline: std::time::Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let roles = wiring::Roles::parse(&roles).map_err(|e| format!("ANTARES_ROLES: {e}"))?;
-    // Bus seam: local (default) or nats. An unknown value is fatal.
-    let bus_mode = std::env::var("ANTARES_BUS").unwrap_or_else(|_| "local".into());
-    match bus_mode.as_str() {
-        "local" => {
-            // bus=local means ONE process running every role — a role
-            // split without a shared bus would silently drop whole concerns.
-            if !roles.all() {
-                return Err(
-                    "ANTARES_BUS=local requires all roles in one process (ANTARES_ROLES=all); \
-                     role splits need ANTARES_BUS=nats"
-                        .into(),
-                );
-            }
-        }
-        "nats" => {
-            if !shared_state(&store_name) {
-                return Err(format!(
-                    "ANTARES_BUS=nats requires a shared store (ANTARES_STORE=postgres|timescale); \
-                     {store_name} state is per-process and cannot back multiple instances"
-                )
-                .into());
-            }
-        }
-        other => return Err(format!("unknown ANTARES_BUS={other} (local|nats)").into()),
-    }
     tracing::info!(port, store = %store_name, %bus_mode, ?roles, "starting antares");
 
     // Trailing-slash tolerance: Table 6.2-1 spells collection resources with a
@@ -1120,10 +1130,7 @@ async fn run(
     let mut state = AppState::with_drivers(host_alias, store, temporal, &store_name);
     state.temporal_name = temporal_name;
     state.delivery = antares_api::DeliveryPolicy::from_env().unwrap_or_default();
-    state.temporal_record = std::env::var("ANTARES_TEMPORAL_RECORD")
-        .as_deref()
-        .unwrap_or("all")
-        .parse()?;
+    state.temporal_record = temporal_record;
     state.profile = antares_api::Profile::from_env()?;
     // The surfaces mounted beside the NGSI-LD API root, from configuration
     // rather than from a hard-wired list: the selection replaces what the
@@ -1273,22 +1280,6 @@ async fn run(
     // One job per pg half (current state and/or history), PINNED to the
     // backend detected at startup; memory and file halves get none.
     if !maintenance.is_empty() {
-        let retention: Option<i64> = std::env::var("ANTARES_TEMPORAL_RETENTION_DAYS")
-            .ok()
-            .map(|v| {
-                v.parse::<i64>()
-                    .map_err(|_| "ANTARES_TEMPORAL_RETENTION_DAYS must be an integer")
-                    // A zero/negative horizon inverts `now() - make_interval(days)`
-                    // and would reap all current + future history — a data-loss
-                    // footgun. Retention is opt-in; a bad value must not silently
-                    // delete. Cap at i32 too (bound as $1::int downstream).
-                    .and_then(|d| {
-                        (d > 0 && d <= i64::from(i32::MAX)).then_some(d).ok_or(
-                            "ANTARES_TEMPORAL_RETENTION_DAYS must be between 1 and 2147483647",
-                        )
-                    })
-            })
-            .transpose()?;
         for (pool, backend) in maintenance {
             tokio::spawn(async move {
                 // Same ANTARES_SWEEP_SECS cadence as the Mem arm — the job's 4.22
@@ -1341,22 +1332,9 @@ async fn run(
     .layer(antares_api::compression());
     let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
-    // A connection that never finishes its request headers must not hold a
-    // slot forever; hyper closes it after this timeout.
-    let header_read_timeout = std::env::var("ANTARES_HEADER_READ_TIMEOUT_MS")
-        .ok()
-        .map(|v| {
-            v.parse::<u64>().map_err(|_| {
-                format!("ANTARES_HEADER_READ_TIMEOUT_MS must be an integer (got {v:?})")
-            })
-        })
-        .transpose()?
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(10));
     // Ceiling on concurrently served connections: accepted streams beyond
     // it are dropped at once — refusing cheaply beats queueing work the box
     // cannot serve (each served connection is a spawned task).
-    let max_connections = max_connections()?;
     let conn_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
@@ -1445,6 +1423,70 @@ async fn run(
             header_read_timeout,
         );
     }
+}
+
+/// The bus seam: local (default) or nats, checked against the roles and
+/// the store. An unknown value is fatal.
+fn check_bus(bus_mode: &str, roles: wiring::Roles, store_name: &str) -> Result<(), String> {
+    match bus_mode {
+        "local" => {
+            // bus=local means ONE process running every role — a role
+            // split without a shared bus would silently drop whole concerns.
+            if !roles.all() {
+                return Err(
+                    "ANTARES_BUS=local requires all roles in one process (ANTARES_ROLES=all); \
+                     role splits need ANTARES_BUS=nats"
+                        .into(),
+                );
+            }
+        }
+        "nats" => {
+            if !shared_state(store_name) {
+                return Err(format!(
+                    "ANTARES_BUS=nats requires a shared store (ANTARES_STORE=postgres|timescale); \
+                     {store_name} state is per-process and cannot back multiple instances"
+                ));
+            }
+        }
+        other => return Err(format!("unknown ANTARES_BUS={other} (local|nats)")),
+    }
+    Ok(())
+}
+
+/// ANTARES_TEMPORAL_RETENTION_DAYS: unset is no horizon; a value is 1 to
+/// i32::MAX days. A zero/negative horizon inverts `now() -
+/// make_interval(days)` and would reap all current + future history — a
+/// data-loss footgun. Retention is opt-in; a bad value must not silently
+/// delete. Capped at i32 (bound as $1::int downstream).
+fn parse_retention_days(raw: Option<&str>) -> Result<Option<i64>, String> {
+    raw.map(|v| {
+        v.parse::<i64>()
+            .map_err(|_| "ANTARES_TEMPORAL_RETENTION_DAYS must be an integer".to_owned())
+            .and_then(|d| {
+                (d > 0 && d <= i64::from(i32::MAX))
+                    .then_some(d)
+                    .ok_or_else(|| {
+                        "ANTARES_TEMPORAL_RETENTION_DAYS must be between 1 and 2147483647"
+                            .to_owned()
+                    })
+            })
+    })
+    .transpose()
+}
+
+/// ANTARES_HEADER_READ_TIMEOUT_MS: a connection that never finishes its
+/// request headers must not hold a slot forever; hyper closes it after this
+/// timeout (default 10 s).
+fn parse_header_read_timeout(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    Ok(raw
+        .map(|v| {
+            v.parse::<u64>().map_err(|_| {
+                format!("ANTARES_HEADER_READ_TIMEOUT_MS must be an integer (got {v:?})")
+            })
+        })
+        .transpose()?
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(10)))
 }
 
 /// ANTARES_MAX_CONNECTIONS: the ceiling on concurrently served connections
@@ -1834,6 +1876,34 @@ mod metrics_port_tests {
 #[cfg(test)]
 mod driver_registry_tests {
     use super::{built_with, shared_state, store_shelf, temporal_choice, TemporalChoice};
+
+    /// The values `run` used to parse after the store connected are refused
+    /// by functions `main` calls before the runtime starts.
+    #[test]
+    fn run_values_are_refused_before_any_store_connects() {
+        use super::{check_bus, parse_header_read_timeout, parse_retention_days};
+        let all = crate::wiring::Roles::parse("all").expect("all");
+        let api = crate::wiring::Roles::parse("api").expect("api");
+        assert!(check_bus("local", all, "memory").is_ok());
+        assert!(check_bus("nats", api, "postgres").is_ok());
+        assert!(check_bus("kafka", all, "memory").is_err());
+        assert!(check_bus("local", api, "memory").is_err());
+        assert!(check_bus("nats", api, "file").is_err());
+        assert_eq!(parse_retention_days(None), Ok(None));
+        assert_eq!(parse_retention_days(Some("30")), Ok(Some(30)));
+        for bad in ["0", "-1", "x", "2147483648"] {
+            assert!(parse_retention_days(Some(bad)).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_header_read_timeout(None),
+            Ok(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            parse_header_read_timeout(Some("250")),
+            Ok(std::time::Duration::from_millis(250))
+        );
+        assert!(parse_header_read_timeout(Some("10s")).is_err());
+    }
     use antares_sql::StoreMode;
 
     /// The shelf in the message is rendered from the backend list, so a
