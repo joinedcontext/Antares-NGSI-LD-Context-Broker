@@ -109,7 +109,7 @@ pub use antares_notifier::DeliveryPolicy;
 // The sink contract, so a surface reaches it through this crate and names no
 // antares-notifier (rule M2).
 pub use antares_notifier::{
-    build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
+    build_message, redact_userinfo, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
 pub use antares_store::{HistoryScope, ShortHistory, HISTORY_RETENTION, SHORT_HISTORY};
 pub use contexts::public_base;

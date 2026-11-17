@@ -35,22 +35,10 @@ pub fn enabled() -> bool {
     std::env::var("ANTARES_TELEMETRY").is_ok_and(|v| !crate::is_off(&v))
 }
 
-/// Strip `user:password@` userinfo (RFC 3986 clause 3.2.1) out of a URL before
-/// it is logged. A string without an authority component — no scheme, or an
-/// `@` that belongs to the path — comes back byte-identical.
-fn redact_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_owned();
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => rest.split_at(i),
-        None => (rest, ""),
-    };
-    match authority.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}://{host}{path}"),
-        None => url.to_owned(),
-    }
-}
+// Strip `user:password@` userinfo (RFC 3986 clause 3.2.1) out of a URL before
+// it is logged: the one redactor the notification and federation paths use
+// too. A string without userinfo comes back byte-identical.
+use antares_api::redact_userinfo as redact_url;
 
 /// An exporter that refuses its endpoint prints the endpoint back verbatim
 /// (`invalid URI {0}`), so a rejected URL carrying `user:password@` userinfo
@@ -391,6 +379,8 @@ mod tests {
         for plain in [
             "http://collector:4318/v1/traces",
             "https://collector:4318/v1/@traces",
+            // the authority ends at '?' too: this '@' is the query's
+            "http://collector:4318?tag=a@b/c",
             "collector:4318",
             "",
         ] {
