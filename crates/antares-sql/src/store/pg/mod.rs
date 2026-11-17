@@ -139,9 +139,23 @@ async fn migrate(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     lenient.run(conn).await.map_err(Into::into)
 }
 
-/// The `ANTARES_MIGRATE` switch: off only for an explicit `0`/`false`.
-fn migrate_enabled(v: Option<&str>) -> bool {
-    !matches!(v, Some("0" | "false"))
+/// An on/off setting of the environment: unset is `default`, `on`/`true`/`1`
+/// and `off`/`false`/`0` are read, anything else is a configuration error
+/// that names the variable (an unknown spelling must not pick a side).
+pub fn env_switch(name: &str, raw: Option<&str>, default: bool) -> Result<bool, sqlx::Error> {
+    match raw.map(str::trim) {
+        None => Ok(default),
+        Some("on" | "true" | "1") => Ok(true),
+        Some("off" | "false" | "0") => Ok(false),
+        Some(_) => Err(sqlx::Error::Configuration(
+            format!("{name} must be on or off (also true/false, 1/0)").into(),
+        )),
+    }
+}
+
+/// The `ANTARES_MIGRATE` switch: on unless set off.
+fn migrate_enabled(v: Option<&str>) -> Result<bool, sqlx::Error> {
+    env_switch("ANTARES_MIGRATE", v, true)
 }
 
 /// One shared pool for all tenants — never per-tenant pools.
@@ -180,7 +194,10 @@ pub async fn connect_with(
     // request is ever served by a connection with the runaway-query wall
     // switched off. The pool opens a fresh one (running `after_connect`) on
     // demand.
-    if migrate_enabled(std::env::var("ANTARES_MIGRATE").ok().as_deref()) {
+    // both settings are read here, at boot, so a bad spelling stops it
+    let run_migrations = migrate_enabled(std::env::var("ANTARES_MIGRATE").ok().as_deref())?;
+    temporal::temporal_dedup_setting(std::env::var("ANTARES_TEMPORAL_DEDUP").ok().as_deref())?;
+    if run_migrations {
         use sqlx::{Connection, Executor};
         let mut migrate_conn = pool.acquire().await?.detach();
         migrate_conn
@@ -517,10 +534,24 @@ mod tests {
     /// Migrations stay on unless a deployment explicitly turns them off.
     #[test]
     fn migrate_switch_defaults_on() {
-        assert!(migrate_enabled(None));
-        assert!(migrate_enabled(Some("1")));
-        assert!(migrate_enabled(Some("true")));
-        assert!(!migrate_enabled(Some("0")));
-        assert!(!migrate_enabled(Some("false")));
+        let on = |v| migrate_enabled(v).expect("a known spelling");
+        assert!(on(None));
+        assert!(on(Some("1")));
+        assert!(on(Some("true")));
+        assert!(!on(Some("0")));
+        assert!(!on(Some("false")));
+    }
+
+    /// An on/off setting refuses a spelling it does not know instead of
+    /// silently taking one side (ANTARES_TEMPORAL_DEDUP=OFF kept dedup on).
+    #[test]
+    fn an_unknown_switch_spelling_is_refused() {
+        for bad in ["OFF", "no", "disabled", ""] {
+            let e = super::temporal::temporal_dedup_setting(Some(bad)).expect_err(bad);
+            assert!(e.to_string().contains("ANTARES_TEMPORAL_DEDUP"), "{e}");
+            assert!(migrate_enabled(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(!super::temporal::temporal_dedup_setting(Some("off")).expect("off"));
+        assert!(super::temporal::temporal_dedup_setting(None).expect("unset"));
     }
 }

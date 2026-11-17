@@ -394,11 +394,19 @@ fn unpack(doc: &mut Value) {
     }
 }
 
-/// `ANTARES_TEMPORAL_DEDUP=off` records a row per write again; anything else,
-/// or unset, records a new instance only (see [`unseen`]).
+/// `ANTARES_TEMPORAL_DEDUP=off` records a row per write again; on, or unset,
+/// records a new instance only (see [`unseen`]). Another spelling is refused
+/// when the pool connects ([`super::connect_with`]), before any write.
+pub(crate) fn temporal_dedup_setting(raw: Option<&str>) -> Result<bool, sqlx::Error> {
+    super::env_switch("ANTARES_TEMPORAL_DEDUP", raw, true)
+}
+
 fn temporal_dedup() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("ANTARES_TEMPORAL_DEDUP").as_deref() != Ok("off"))
+    *ON.get_or_init(|| {
+        temporal_dedup_setting(std::env::var("ANTARES_TEMPORAL_DEDUP").ok().as_deref())
+            .unwrap_or(true)
+    })
 }
 
 /// An instance's stamps: two instances that differ only in these are the same
