@@ -331,10 +331,14 @@ impl Drop for Conn {
     }
 }
 
-/// MQTT delivery with a bounded per-endpoint connection pool (bounded
-/// WITH eviction; timeouts fixed at construction).
+/// MQTT delivery with a bounded connection pool (bounded WITH eviction;
+/// timeouts fixed at construction). A connection serves one publish at a
+/// time, so an endpoint keeps as many idle connections as it had publishes
+/// in flight, and `cap` bounds them all together: concurrent deliveries to
+/// one broker reuse their connections instead of each checkin replacing
+/// (and closing) the one before it.
 pub struct MqttSink {
-    pool: Mutex<HashMap<String, Conn>>,
+    pool: Mutex<HashMap<String, Vec<Conn>>>,
     cap: usize,
     timeout: Duration,
 }
@@ -435,11 +439,19 @@ impl MqttSink {
         }
     }
 
+    /// An idle live connection for `key`, the most recently used first.
     fn checkout(&self, key: &str) -> Option<Conn> {
-        self.pool
+        let mut pool = self
+            .pool
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(key)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idle = pool.get_mut(key)?;
+        idle.retain(|c| !c.pump.is_finished());
+        let conn = idle.pop();
+        if idle.is_empty() {
+            pool.remove(key);
+        }
+        conn
     }
 
     fn checkin(&self, key: String, mut conn: Conn) {
@@ -448,16 +460,27 @@ impl MqttSink {
             .pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pool.retain(|_, c| !c.pump.is_finished());
-        pool.insert(key, conn);
-        // bounded with eviction: drop the least-recently-used overflow.
-        while pool.len() > self.cap {
-            if let Some(oldest) = pool
+        for idle in pool.values_mut() {
+            idle.retain(|c| !c.pump.is_finished());
+        }
+        pool.retain(|_, idle| !idle.is_empty());
+        pool.entry(key).or_default().push(conn);
+        // bounded with eviction: drop the least-recently-used overflow
+        // (each Vec is in checkin order, so its front is its oldest).
+        while pool.values().map(Vec::len).sum::<usize>() > self.cap {
+            let Some(oldest) = pool
                 .iter()
-                .min_by_key(|(_, c)| c.last_used)
+                .filter_map(|(k, idle)| idle.first().map(|c| (k, c.last_used)))
+                .min_by_key(|(_, at)| *at)
                 .map(|(k, _)| k.clone())
-            {
-                pool.remove(&oldest);
+            else {
+                break;
+            };
+            if let Some(idle) = pool.get_mut(&oldest) {
+                idle.remove(0);
+                if idle.is_empty() {
+                    pool.remove(&oldest);
+                }
             }
         }
     }
@@ -958,6 +981,45 @@ mod tests {
         sink.publish_message(&acking, params, b"{}")
             .await
             .expect("the PUBACK delivers");
+    }
+
+    /// Publishes in flight together to one broker each hold a connection;
+    /// back in the pool, all of them stay for the next round instead of
+    /// each checkin closing the one before it, and `cap` still bounds them.
+    #[tokio::test]
+    async fn concurrent_publishes_keep_their_connections() {
+        let params = MqttParams { qos: 1, v5: false };
+        let sink = std::sync::Arc::new(MqttSink::new(4, Duration::from_secs(2)));
+        let port = stub_broker(true).await;
+        let ep = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{port}/t")).expect("parse");
+        let key = pool_key(&ep, params);
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(sink.connect(&ep, params).await.expect("connect"));
+        }
+        for c in held {
+            sink.checkin(key.clone(), c);
+        }
+        let idle = |s: &MqttSink| s.pool.lock().expect("pool").get(&key).map_or(0, Vec::len);
+        assert_eq!(idle(&sink), 3, "a checkin closed the connection before it");
+        // a round of three publishes connects nothing new
+        let a = sink.checkout(&key).expect("idle");
+        let b = sink.checkout(&key).expect("idle");
+        let c = sink.checkout(&key).expect("idle");
+        assert!(sink.checkout(&key).is_none());
+        for conn in [a, b, c] {
+            sink.checkin(key.clone(), conn);
+        }
+        assert_eq!(idle(&sink), 3);
+        // the cap bounds every endpoint's idle connections together
+        for _ in 0..3 {
+            let conn = sink.connect(&ep, params).await.expect("connect");
+            sink.checkin(key.clone(), conn);
+        }
+        assert_eq!(idle(&sink), 4, "cap");
+        sink.publish_message(&ep, params, b"{}")
+            .await
+            .expect("delivered over a pooled connection");
     }
 
     /// The MQTT destination is client-supplied (`notification.endpoint.uri`,
