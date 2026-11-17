@@ -897,6 +897,12 @@ impl PgDocStore {
         );
         let count_sql = format!("SELECT count(*) FROM {} WHERE tenant_id = $1", kind.table());
         let mut tx = super::begin(&self.pool).await?;
+        // one snapshot for both statements, as the entity list_slice: under
+        // READ COMMITTED each would take its own and a concurrent write
+        // would make the count and the page disagree
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
             .bind(tenant.as_str())
