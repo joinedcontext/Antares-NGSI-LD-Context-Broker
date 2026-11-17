@@ -27,7 +27,11 @@ pub(super) async fn retry_and_settle(
     first_err: String,
 ) {
     let policy = st.delivery;
+    // Clock rule: std Instant panics on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
     let started = std::time::Instant::now();
+    #[cfg(target_arch = "wasm32")]
+    let started = web_time::Instant::now();
     let first_at = now_iso();
     let mut made = 1u32;
     let mut last_err = first_err.clone();
