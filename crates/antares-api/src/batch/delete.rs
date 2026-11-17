@@ -286,8 +286,18 @@ async fn forward_deletes(
                 &mut remote.err,
             );
         } else if reg.supports("deleteEntity") {
-            for id in &sent_ids {
-                let status = forward_delete(st, tenant, headers, reg, &ctx_url, id).await;
+            // one request per Entity, run concurrently under the fan-out
+            // bound, so the batch holds its admission slot for about one
+            // round trip rather than one per Entity
+            let mut statuses: Vec<u16> = Vec::with_capacity(sent_ids.len());
+            for chunk in sent_ids.chunks((*crate::bounds::MAX_FED_FANOUT).max(1)) {
+                let mut calls = Vec::with_capacity(chunk.len());
+                for id in chunk {
+                    calls.push(forward_delete(st, tenant, headers, reg, &ctx_url, id));
+                }
+                statuses.extend(futures_util::future::join_all(calls).await);
+            }
+            for (id, status) in sent_ids.iter().zip(statuses) {
                 if (200..300).contains(&status) && status != 207 {
                     remote.ok.push((id.clone(), false));
                 } else {
