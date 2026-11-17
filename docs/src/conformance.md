@@ -161,6 +161,92 @@ cd ngsi-ld-test-suite && robot --variable url:http://localhost:9377/ngsi-ld/v1 \
   --outputdir /tmp/robot-566 TP/NGSI-LD/ContextInformation/Provision/Entities/DeleteEntity/566_01.robot
 ```
 
+## Two suites
+
+Every cell runs the ETSI test suite twice, from two copies:
+
+| copy | where | what it is | gate |
+|---|---|---|---|
+| ours | `ngsi-ld-test-suite/` | ETSI-derived and maintained here: TPs proven wrong against the clause text are fixed (`ngsi-ld-test-suite/testsuite-doubts.md`, [the defect list](#suite-and-spec-defects)), additions cover what the official set leaves untested, plus the IOP tree and `AntaresSpecificTests/` | every case green |
+| official | not in this repository | ETSI's suite as published, `https://forge.etsi.org/rep/data/ngsi-ld-test-suite.git`, branch `develop` | a baseline of known failures |
+
+The official copy is never stored here. Each run clones `develop` (or
+`ETSI_REF`, a branch, tag or commit) into a temporary directory with
+`dev/etsi-upstream.sh`, builds a venv there from that copy's own
+`requirements.txt` (pip with a seven-day release cooldown,
+`--uploaded-prior-to P7D`), runs it and deletes both. Nothing in the clone
+is edited: the broker URL, the callback host the mocks bind and the five
+IOP broker URLs reach it as `robot --variable`, the values our copy gets
+by rewriting its `variables.py`. Its `@context` is the one it names on
+forge, and its MQTT cases start their own mosquitto on a published port.
+The robot directories come from the clone itself (every
+`TP/NGSI-LD/*/*`, every `*_TP` tree), so an upstream reorganisation needs
+no runner change. The results record what ran in `etsi-upstream.txt`
+(url, ref, commit, commit date), and the summary and the report page say
+"ETSI suite develop @ <commit>, <date>".
+
+The clone is code this repository does not control, so CI runs it in its
+own job beside each cell (`etsi-upstream-cell` in `etsi-matrix.yml`): the
+same image artifact and store, a read-only token, no secrets in its
+environment and a checkout without persisted credentials. Locally the
+clone is data until the runner starts it; fetching executes nothing.
+
+### The baseline
+
+The official copy does not pass completely on Antares, and `develop` moves
+under it, so its gate is relative. `conformance/etsi-baseline/<cell>.txt`
+names the upstream commit it was made at and every TP that failed there,
+one per line with a reason:
+
+| reason | meaning |
+|---|---|
+| `our-bug` | a broker defect, kept until it is fixed |
+| `suite-bug` | the ETSI test is wrong; the note links the `testsuite-doubts.md` entry or the upstream issue |
+| `newer-spec` | the TP tests a feature beyond CIM 009 V1.9.1 |
+| `env` | a limitation of this harness, not of the broker or the test |
+
+`dev/etsi-baseline.py check` judges a run against it, using the list of
+files changed upstream between the baseline commit and the run's commit
+(`upstream-changed.txt`, from the same blob-less clone):
+
+- red: a TP that fails now, is not in the baseline and whose `.robot` file
+  is unchanged upstream. It passed at the baseline commit, so the broker
+  broke it.
+- red: a baseline TP that passes now. The baseline only shrinks; delete
+  the line.
+- red: a robot run that left no `output.xml`.
+- reported, not gated: a failing TP whose file is new or changed upstream
+  ("upstream change, review and baseline"), and a baseline TP the run did
+  not execute.
+
+The status lands in `baseline-status.txt`: `PASS`, `FAIL`, `SKIPPED`
+(forge unreachable: the official copy did not run, our copy still gates),
+`NOBASELINE` (no file for the cell yet: failures reported, nothing gated)
+or `STALE` (the baseline commit is gone upstream: re-baseline). To take a
+new baseline, or to move one to a newer commit after reviewing what
+changed:
+
+```bash
+dev/etsi-baseline.py write results/postgres-etsi conformance/etsi-baseline/postgres.txt
+```
+
+It keeps the reason and note of every TP already listed and writes
+`our-bug  unclassified` for a new one, which is then classified by hand.
+
+### Running both locally
+
+```bash
+TESTSUITE=both STORE=postgres dev/etsi-local.sh          # workspace tests, then both copies
+TESTSUITE=etsi STORE=postgres SKIP_BUILD=1 STOP_ON_ERROR=0 dev/etsi-pipeline.sh
+TESTSUITE=etsi ETSI_REF=f818272e STORE=file SKIP_BUILD=1 dev/etsi-pipeline.sh   # an older upstream commit
+```
+
+`TESTSUITE` is `ours` when unset, so every existing command runs our copy
+alone, as before. The official copy writes to `ETSI_RESULTS_DIR` (default
+`results/<store>-etsi`, `results/cells/ETSI-upstream-cell-<store>` under
+`dev/etsi-local.sh`), runs through even when `STOP_ON_ERROR=1` stops ours
+(`ETSI_STOP_ON_ERROR`), and `SUITES` filters it by the same substrings.
+
 ## Suite and spec defects
 
 A red TP is proven against the clause text before any broker change. When
