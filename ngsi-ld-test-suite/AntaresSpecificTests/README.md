@@ -8,9 +8,12 @@ during interoperability campaigns. A test asserting behaviour no clause
 mandates does not belong in it — it would fail every other conformant broker
 and read as a conformance claim it is not.
 
-That behaviour lives here instead. The runners walk `TP/NGSI-LD/...`
-(`dev/etsi-run.sh`, `dev/etsi-suites.sh`), so nothing in this folder is picked
-up by a conformance run; it is invoked explicitly.
+That behaviour lives here instead. Every ETSI cell runs this folder as its
+own suite entry, `AntaresSpecificTests` in `dev/etsi-suites.sh`, reported on
+its own row apart from the `TP/` suites. A file that needs a specially built
+broker is listed in `ANTARES_SPECIFIC_ELSEWHERE` with the workflow that runs
+it instead (`policy_engine.robot`: the examples workflow, on the reference
+policy engine).
 
 Every test here states in its documentation that it is an Antares decision
 rather than a CIM 009 requirement, and why the behaviour exists.

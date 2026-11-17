@@ -75,7 +75,19 @@ in `TP/` — that directory is run against other brokers in interoperability
 campaigns, so every file in it has to assert a SHALL the spec text carries.
 Those tests live in `ngsi-ld-test-suite/AntaresSpecificTests/` instead, and
 each says in its own documentation that it is an Antares decision rather
-than a CIM 009 requirement, with the reason the behaviour exists.
+than a CIM 009 requirement, with the reason the behaviour exists. Every
+cell runs them as an eleventh suite, on their own row and outside the
+ETSI totals above:
+
+| suite | test cases |
+|---|---|
+| AntaresSpecific | 14 |
+
+`policy_engine.robot` is the exception: it needs a broker built with the
+reference policy engine, so the examples workflow runs it and the cells do
+not (`ANTARES_SPECIFIC_ELSEWHERE` in `dev/etsi-suites.sh`). Every other
+`.robot` file in the folder runs in every cell; the runners refuse a
+subfolder or a stray `.robot` directory no step runs.
 
 ## The matrix
 

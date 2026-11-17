@@ -105,12 +105,18 @@ for s in $SUITES; do
   # written before the reset so the reset's own churn is attributed too.
   [ -n "${PHASE_FILE:-}" ] && echo "$name" > "$PHASE_FILE"
   bash dev/reset-broker.sh "$BROKER_URL"   # state reset between suites
+  # TP/NGSI-LD/<entry>, or the files of AntaresSpecificTests/ (suite_paths)
+  mapfile -t paths < <(suite_paths "$s" "$SUITE")
+  [ "${#paths[@]}" -gt 0 ] || { echo "$SUITE holds no $s — skipped"; continue; }
+  # several files: name the combined top suite, not "A & B & C"
+  named=()
+  [ "${#paths[@]}" -le 1 ] || named=(--name "$name")
   # Console tee'd next to output.xml: when robot dies before writing it,
   # the CI artifact must still say why (see the IOP step's twin note).
   (cd "$SUITE" && "$VENV/bin/robot" \
       --outputdir "$OLDPWD/$RESULTS_DIR/$name" \
-      "${EXTRA[@]}" \
-      "TP/NGSI-LD/$s") 2>&1 | tee "$RESULTS_DIR/$name-console.log" \
+      "${named[@]}" "${EXTRA[@]}" \
+      "${paths[@]}") 2>&1 | tee "$RESULTS_DIR/$name-console.log" \
     || { status=$?; [ "$STOP_ON_ERROR" = 1 ] && break; }
 done
 if [ "$own_context" = 1 ]; then

@@ -289,8 +289,21 @@ SUITE_DIRS = [
     ("jsonldContext", "TP/NGSI-LD/jsonldContext"),
 ]
 
+# Run by every cell too, on its own row, and never part of the ETSI totals:
+# behaviour Antares defines where CIM 009 is silent. Files that need a
+# specially built broker run in another workflow (ANTARES_SPECIFIC_ELSEWHERE
+# in dev/etsi-suites.sh) and are not counted as a cell's.
+ANTARES_SPECIFIC = ("AntaresSpecific", "AntaresSpecificTests")
 
-def robot_cases(subtree):
+
+def antares_specific_elsewhere():
+    runner = ROOT / "dev/etsi-suites.sh"
+    hit = re.search(r'^ANTARES_SPECIFIC_ELSEWHERE="([^"]*)"',
+                    runner.read_text(encoding="utf-8"), re.M) if runner.exists() else None
+    return {e.split(":", 1)[0] for e in hit.group(1).split()} if hit else set()
+
+
+def robot_cases(subtree, skip=()):
     """(cases, of which MQTT) under a suite directory, counted the way a cell
     counts them: a test case is a line at column 0 inside a `*** Test Cases ***`
     section, and `dev/etsi-run.sh` passes `--exclude config_no_temporal`, so a
@@ -299,6 +312,8 @@ def robot_cases(subtree):
     root = ROOT / "ngsi-ld-test-suite" / subtree
     total = mqtt = 0
     for f in sorted(root.rglob("*.robot")):
+        if f.name in skip:
+            continue
         insec = False
         pending = None  # None = not in a case; 0/1 = in one, is it MQTT
 
@@ -368,7 +383,10 @@ def chapter_violations():
     per_suite = {name: robot_cases(d) for name, d in SUITE_DIRS}
     native = sum(c for c, _ in per_suite.values())
     wasm = native - sum(m for _, m in per_suite.values())
-    for name, (cases, _) in per_suite.items():
+    # the Antares-specific row is checked like the others, outside the totals
+    rows = dict(per_suite)
+    rows[ANTARES_SPECIFIC[0]] = robot_cases(ANTARES_SPECIFIC[1], antares_specific_elsewhere())
+    for name, (cases, _) in rows.items():
         row = re.search(rf"^\| {re.escape(name)} \| (\d+) \|", text, re.M)
         if not row:
             out.append(f"{book}: the suite table has no {name} row")
@@ -656,6 +674,7 @@ def suite_count_violations():
         return [f"{runner}: no SERIAL_ALL to read the suite list from"]
     serial, out = hit.group(1).split(), []
     listed = {d.removeprefix("TP/NGSI-LD/") for _, d in SUITE_DIRS if d != "IOP_TP"}
+    listed.add(ANTARES_SPECIFIC[1])
     for name in sorted(set(serial) - listed):
         out.append(f"dev/spec.py: SUITE_DIRS has no entry for the suite {name}")
     for name in sorted(listed - set(serial)):

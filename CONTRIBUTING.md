@@ -139,7 +139,7 @@ Integration tests that need services are env-gated and skip loudly:
 
 - **ETSI validation.** `STORE=<mode> dev/etsi-local.sh` runs the suite for
   ONE store mode locally (the one you touched); the CI cell matrix is the
-  authority — the quick preset (file, postgres, timescale) runs all ten
+  authority — the quick preset (file, postgres, timescale) runs all eleven
   suites per cell on every push to `dev`, the full seven-cell preset
   twice a week and in every release run.
 - `cargo fmt` on touched crates; clippy is a CI wall
