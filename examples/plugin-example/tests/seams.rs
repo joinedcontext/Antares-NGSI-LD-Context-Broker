@@ -61,6 +61,58 @@ async fn the_plugin_driver_backs_a_live_state() {
     );
 }
 
+/// The count reads the store beside the API, outside the policy layer its
+/// routes pass: it asks the engine itself, and answers only an Allow. A
+/// denied caller, or one whose view is narrowed, learns nothing of the
+/// tenant's size.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_count_answers_only_what_the_policy_allows() {
+    use antares_api::policy::{
+        Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
+    };
+    struct Fixed(fn() -> Decision);
+    impl PolicyEngine for Fixed {
+        fn name(&self) -> &str {
+            "seams-fixed"
+        }
+        fn decide<'a>(&'a self, _s: &'a Subject, _op: &'a Operation<'a>) -> DecisionFuture<'a> {
+            Box::pin(std::future::ready((self.0)()))
+        }
+        fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+            NotifyDecision::Drop
+        }
+    }
+    let tenant = TenantId::new("plugincountpolicy").expect("tenant");
+    for (decision, code) in [
+        ((|| Decision::Allow) as fn() -> Decision, StatusCode::OK),
+        (|| Decision::Deny("no".into()), StatusCode::FORBIDDEN),
+        (
+            || Decision::Filter(Filter::default()),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (st, store) = state();
+        store
+            .create(
+                &tenant,
+                Kind::Entity,
+                "urn:ngsi-ld:Seam:p0",
+                json!({"id": "urn:ngsi-ld:Seam:p0"}),
+            )
+            .await
+            .expect("create");
+        let st = st.with_policy(Arc::new(Fixed(decision)));
+        let (got, body) = get_as(&st, "/x/example/entities/count", Some(tenant.as_str())).await;
+        assert_eq!(got, code, "{body}");
+        if code != StatusCode::OK {
+            assert!(
+                !body.contains("\"entities\""),
+                "a refusal carried the count: {body}"
+            );
+        }
+    }
+}
+
 /// 6.3.14: the surface answers for the tenant that asked, and for no other.
 /// A surface reading a default tenant instead of the request's would report
 /// one deployment's data to another.

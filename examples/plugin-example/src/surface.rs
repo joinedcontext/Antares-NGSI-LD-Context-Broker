@@ -57,21 +57,49 @@ fn query_encoded(s: &str) -> String {
 
 /// Entities the plugin's store holds for the requesting tenant.
 ///
-/// Two rules a surface does not get to opt out of. The tenant comes from
+/// Three rules a surface does not get to opt out of. The tenant comes from
 /// the validated `NGSILD-Tenant` header (6.3.14) and is passed to the store
 /// on the call — never a default standing in for whoever asked, which is
-/// how one deployment's numbers end up in another's answer. And a store
-/// error is returned, not defaulted: a swallowed failure here reports zero
-/// entities, which reads as an empty tenant rather than a broken store.
+/// how one deployment's numbers end up in another's answer. The policy
+/// engine is asked before the store is read: a surface is mounted beside
+/// the NGSI-LD API, outside the policy layer its routes pass, so a route
+/// that reads the store directly asks for itself. And a store error is
+/// returned, not defaulted: a swallowed failure here reports zero entities,
+/// which reads as an empty tenant rather than a broken store.
 async fn count(
     axum::extract::State(st): axum::extract::State<AppState>,
     headers: HeaderMap,
-) -> Result<axum::Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let tenant = tenant_from(&headers)?;
+    if let Some(engine) = st.policy.as_deref() {
+        // asked as a Query Entities over the whole tenant (5.7.2); only a
+        // plain Allow is answered: a bare number cannot apply a narrowed
+        // view, and counted unnarrowed it tells the caller what the view
+        // hides
+        let subject = antares_api::policy::subject_of(&tenant, &headers);
+        let op = antares_api::policy::Operation {
+            clause: "5.7.2",
+            ids: &[],
+            types: &[],
+            attrs: &[],
+            q: None,
+            scope_q: None,
+            geo: None,
+            body: None,
+            stored: None,
+        };
+        if !matches!(
+            antares_api::policy::decide(engine, &subject, &op).await,
+            antares_api::policy::Decision::Allow
+        ) {
+            return Ok(error(
+                StatusCode::FORBIDDEN,
+                "the policy does not allow counting this tenant's entities",
+            ));
+        }
+    }
     let rows = st.store.list(&tenant, antares_store::Kind::Entity).await?;
-    Ok(axum::Json(
-        json!({"tenant": tenant.as_str(), "entities": rows.len()}),
-    ))
+    Ok(axum::Json(json!({"tenant": tenant.as_str(), "entities": rows.len()})).into_response())
 }
 
 /// A façade in one route: `GET /x/example/things?kind=<type>` answers the
