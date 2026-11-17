@@ -782,30 +782,7 @@ async fn query_entities_inner(
         .map(|q| antares_ql::parse_narrowed_q(q))
         .transpose()?;
     // 5.7.2.4 validation bullets (p.201), in the spec's own order.
-    star_type_local(params)?;
-    if params.contains_key("geometryProperty") && accept != Accept::GeoJson {
-        return Err(NgsiError::BadRequestData(
-            "geometryProperty requires Accept: application/geo+json (5.7.2.4)".into(),
-        )
-        .into());
-    }
-    // "If the ordering parameter is present and the execution of the operation
-    // is not limited to the local scope then BadRequestData" — reinforced by
-    // 4.23.1: "Sort ordering is never applied to distributed operations."
-    // The subject is the EXECUTION: a query nothing federates to runs locally
-    // regardless of `local=true`, which is why this asks would_federate rather
-    // than active (ETSI 019_19 orders without local).
-    crate::paging::check_collation(params)?;
-    if params.contains_key("orderBy")
-        && crate::federation::would_federate(st, &tenant, &ctx, params, headers).await?
-    {
-        return Err(NgsiError::BadRequestData(
-            "orderBy requires local scope — ordering is never applied to \
-             distributed operations (5.7.2.4, 4.23.1)"
-                .into(),
-        )
-        .into());
-    }
+    check_query_params(st, &tenant, headers, &ctx, params, accept).await?;
     if !has_filter {
         return Err(NgsiError::BadRequestData(
             "query needs at least one of type, attrs, q, georel (5.7.2)".into(),
@@ -816,39 +793,8 @@ async fn query_entities_inner(
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, filter);
     crate::repr::note_reads(&mut repr, client_params, &ctx)?;
-    let join = parse_join(params)?;
+    let join = check_query_join(params, q_ast.as_ref())?;
     check_linked_projection(&repr, &join)?;
-    // 5.7.2.4: filter conditions using Linked Entity attributes need join,
-    // and their hop depth may not exceed joinLevel ("too deep query")
-    let link_depth = q_ast
-        .as_ref()
-        .map(antares_ql::QNode::max_link_depth)
-        .unwrap_or(0);
-    if link_depth > 0 {
-        match &join {
-            Some((mode, level)) if mode != "@none" => {
-                if link_depth > *level {
-                    return Err(NgsiError::BadRequestData(format!(
-                        "linked attribute query depth {link_depth} exceeds joinLevel {level} \
-                         (5.7.2.4 — too deep query)"
-                    ))
-                    .into());
-                }
-            }
-            _ => {
-                return Err(NgsiError::BadRequestData(
-                    "q references Linked Entity attributes but join is not specified \
-                     (5.7.2.4 — too deep query)"
-                        .into(),
-                )
-                .into());
-            }
-        }
-    }
-    // 5.7.2.4: a syntactically invalid context source filter is 400.
-    if let Some(csf) = params.get("csf") {
-        parse_q(csf)?;
-    }
     // 6.3.17: abnormal distributed-GET outcomes surface as NGSILD-Warning
     let mut warnings: Vec<String> = Vec::new();
     let looped = crate::federation::via_loop(
@@ -1044,6 +990,83 @@ async fn query_entities_inner(
     }
     filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
+}
+
+/// 5.7.2.4: the validation bullets of Query Entities that read the request
+/// parameters alone, in the spec's order — shared by GET /entities and
+/// POST /entityOperations/query, so the two bindings refuse alike.
+pub(crate) async fn check_query_params(
+    st: &AppState,
+    tenant: &TenantId,
+    headers: &HeaderMap,
+    ctx: &antares_jsonld::Context,
+    params: &HashMap<String, String>,
+    accept: Accept,
+) -> ApiResult<()> {
+    star_type_local(params)?;
+    if params.contains_key("geometryProperty") && accept != Accept::GeoJson {
+        return Err(NgsiError::BadRequestData(
+            "geometryProperty requires Accept: application/geo+json (5.7.2.4)".into(),
+        )
+        .into());
+    }
+    // "If the ordering parameter is present and the execution of the operation
+    // is not limited to the local scope then BadRequestData" — reinforced by
+    // 4.23.1: "Sort ordering is never applied to distributed operations."
+    // The subject is the EXECUTION: a query nothing federates to runs locally
+    // regardless of `local=true`, which is why this asks would_federate rather
+    // than active (ETSI 019_19 orders without local).
+    crate::paging::check_collation(params)?;
+    if params.contains_key("orderBy")
+        && crate::federation::would_federate(st, tenant, ctx, params, headers).await?
+    {
+        return Err(NgsiError::BadRequestData(
+            "orderBy requires local scope — ordering is never applied to \
+             distributed operations (5.7.2.4, 4.23.1)"
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// 5.7.2.4: the join a query asks for, refused when a `q` term reads
+/// Linked Entity attributes deeper than it (or without one); and a
+/// syntactically invalid context source filter.
+pub(crate) fn check_query_join(
+    params: &HashMap<String, String>,
+    q_ast: Option<&antares_ql::QNode>,
+) -> ApiResult<Option<(String, usize)>> {
+    let join = parse_join(params)?;
+    // 5.7.2.4: filter conditions using Linked Entity attributes need join,
+    // and their hop depth may not exceed joinLevel ("too deep query")
+    let link_depth = q_ast.map(antares_ql::QNode::max_link_depth).unwrap_or(0);
+    if link_depth > 0 {
+        match &join {
+            Some((mode, level)) if mode != "@none" => {
+                if link_depth > *level {
+                    return Err(NgsiError::BadRequestData(format!(
+                        "linked attribute query depth {link_depth} exceeds joinLevel {level} \
+                         (5.7.2.4 — too deep query)"
+                    ))
+                    .into());
+                }
+            }
+            _ => {
+                return Err(NgsiError::BadRequestData(
+                    "q references Linked Entity attributes but join is not specified \
+                     (5.7.2.4 — too deep query)"
+                        .into(),
+                )
+                .into());
+            }
+        }
+    }
+    // 5.7.2.4: a syntactically invalid context source filter is 400.
+    if let Some(csf) = params.get("csf") {
+        parse_q(csf)?;
+    }
+    Ok(join)
 }
 
 /// Table 6.4.3.2-1: `type=*` implies local scope and shall not be combined
@@ -1287,7 +1310,7 @@ async fn whole_page(
 /// mandatory — IS pushed: the store returns no rows and counts the match set,
 /// which is the same count the scan derives from a materialized one, without
 /// materializing 100 million documents to throw them away.
-fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -> bool {
+pub(crate) fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -> bool {
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
 

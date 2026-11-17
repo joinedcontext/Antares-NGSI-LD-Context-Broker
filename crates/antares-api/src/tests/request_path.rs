@@ -292,3 +292,99 @@ async fn a_temporal_post_query_links_its_inline_context() {
         "{ctx_link}"
     );
 }
+
+async fn post_query(st: &AppState, uri: &str, body: &str) -> Response<Body> {
+    send(st, with_body("POST", uri, "application/json", body)).await
+}
+
+fn ids_of(body: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = body
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// 6.3.10: the POST query serializes its next/prev pointers like its GET
+/// twin, on its own resource and with its own URI parameters.
+#[tokio::test]
+async fn a_post_query_answers_its_page_links() {
+    let st = state();
+    for i in 0..3 {
+        create(&st, &format!(r#"{{"id":"urn:ngsi-ld:T:q{i}","type":"T"}}"#)).await;
+    }
+    let resp = post_query(
+        &st,
+        "/ngsi-ld/v1/entityOperations/query?limit=1&offset=1",
+        r#"{"type":"Query","entities":[{"type":"T"}]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let l = links(&resp);
+    let next = l.iter().find(|l| l.contains("rel=\"next\"")).cloned();
+    let next = next.unwrap_or_else(|| panic!("no next Link: {l:?}"));
+    assert!(
+        next.starts_with("</ngsi-ld/v1/entityOperations/query?limit=1&offset=2>"),
+        "{next}"
+    );
+    assert!(next.contains("type=\"application/json\""), "{next}");
+    assert!(l.iter().any(|l| l.contains("rel=\"prev\"")), "{l:?}");
+}
+
+/// 5.7.2.4: the POST query runs the validation its GET twin runs.
+#[tokio::test]
+async fn a_post_query_is_validated_as_its_get_twin() {
+    let st = state();
+    for (uri, body) in [
+        (
+            "/ngsi-ld/v1/entityOperations/query",
+            r#"{"type":"Query","entities":[{"type":"T"}],"ordering":{"collation":"x-not-a-tag-!"}}"#,
+        ),
+        (
+            "/ngsi-ld/v1/entityOperations/query?local=false",
+            r#"{"type":"Query","entities":[{"type":"*"}]}"#,
+        ),
+    ] {
+        let resp = post_query(&st, uri, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri} {body}");
+    }
+}
+
+/// 5.2.33: the EntitySelectors of a Query are a union; one selector's id
+/// does not widen to the other selector's type.
+#[tokio::test]
+async fn a_post_query_matches_the_union_of_its_selectors() {
+    let st = state();
+    for doc in [
+        r#"{"id":"urn:ngsi-ld:A:x","type":"A"}"#,
+        r#"{"id":"urn:ngsi-ld:A:y","type":"A"}"#,
+        r#"{"id":"urn:ngsi-ld:B:z","type":"B"}"#,
+    ] {
+        create(&st, doc).await;
+    }
+    for (selectors, want) in [
+        (
+            r#"[{"type":"A","id":"urn:ngsi-ld:A:x"},{"type":"B"}]"#,
+            vec!["urn:ngsi-ld:A:x", "urn:ngsi-ld:B:z"],
+        ),
+        (
+            r#"[{"type":"A","id":"urn:ngsi-ld:A:x"},{"type":"B","id":"urn:ngsi-ld:A:y"}]"#,
+            vec!["urn:ngsi-ld:A:x"],
+        ),
+    ] {
+        let resp = post_query(
+            &st,
+            "/ngsi-ld/v1/entityOperations/query",
+            &format!(r#"{{"type":"Query","entities":{selectors}}}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_of(resp).await;
+        assert_eq!(ids_of(&body), want, "{selectors}");
+    }
+}

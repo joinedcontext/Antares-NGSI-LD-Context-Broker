@@ -64,30 +64,64 @@ async fn batch_query_inner(
     //
     let narrow = crate::repr::narrowing_reading(&filter, &vp, &parsed.ctx)?;
     let vp = filter.narrow_params(&vp, &parsed.ctx)?;
-    let fed = fed_matches(st, &tenant, headers, &parsed.ctx, &vp).await?;
-    let mut matches =
-        crate::entities::filter_entities_fed(st, &tenant, &vp, &parsed.ctx, fed, Some(&narrow))
-            .await?;
     let mut page_params = params.clone();
     page_params.extend(vp.clone());
+    // 5.7.2.4: the validation its GET twin runs, on the same parameters
+    crate::entities::check_query_params(st, &tenant, headers, &parsed.ctx, &page_params, accept)
+        .await?;
+    let q_ast = vp
+        .get("q")
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?;
+    let join = crate::entities::check_query_join(&vp, q_ast.as_ref())?;
+    // 5.2.33: several EntitySelectors are a union no single flat filter
+    // states; their candidates are matched against it here
+    let selectors = Selectors::of(q)?;
+    let fed = fed_matches(st, &tenant, headers, &parsed.ctx, &vp).await?;
+    // the page is read from the store, as the GET twin reads it, whenever
+    // the flat filter is the whole Query
+    let (offset, limit, _) = crate::paging::page_params(st, &page_params)?;
+    let push =
+        selectors.is_none() && crate::entities::page_pushdown_allowed(fed.is_empty(), &page_params);
+    let filtered = crate::entities::filter_entities_paged(
+        st,
+        &tenant,
+        &page_params,
+        &parsed.ctx,
+        fed,
+        crate::entities::Pushdown {
+            page: push.then_some((offset, limit)),
+            proj: None,
+            order_keys: None,
+        },
+        Some(&narrow),
+    )
+    .await?;
+    let paged = filtered.paged.then_some(filtered.total);
+    let mut matches = filtered.docs;
+    if let Some(sel) = &selectors {
+        matches.retain(|d| sel.matches(d, &parsed.ctx));
+    }
     // 5.2.43 ordering: same 4.23 keys as the GET twin, applied pre-pagination
     if let Some(spec) = page_params.get("orderBy") {
         crate::repr::order_as_shown(&mut matches, Some(&narrow), |m| {
             crate::paging::order_entities(m, spec, &page_params, &parsed.ctx)
         })?;
     }
-    let (page, count_hdr, _links) = paginate(
-        st,
-        &page_params,
-        matches,
-        "/ngsi-ld/v1/entityOperations/query",
-        accept,
-    )?;
+    // 6.3.10: the Links name this resource and its own URI parameters; the
+    // Query itself travels in the body the client sends again
+    let path = "/ngsi-ld/v1/entityOperations/query";
+    let (page, count_hdr, links) = match paged {
+        Some(total) => {
+            let total = total.unwrap_or(matches.len());
+            crate::paging::paginate_pre(st, params, matches, path, accept, total)?
+        }
+        None => paginate(st, params, matches, path, accept)?,
+    };
     // body members (pick/omit/attrs/lang/datasetId) shape the representation
     // exactly like their 6.3.7 query-parameter twins
     let mut repr = parse_repr(&page_params, &parsed.ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
-    let join = crate::entities::parse_join(&vp)?;
     crate::entities::check_linked_projection(&repr, &join)?;
     let (rendered_from, mut payload): (Vec<&Value>, Vec<Value>) =
         shaped_page(&page, &repr, &parsed.ctx).into_iter().unzip();
@@ -122,9 +156,101 @@ async fn batch_query_inner(
     // 6.3.6: the json answer's Link names the @context it was compacted in
     let served = crate::contexts::linkable(st, &tenant, headers, &parsed.ctx, accept).await?;
     let mut resp = respond_prefer(StatusCode::OK, out, &served, accept, &tenant, headers);
-    attach_paging(&mut resp, count_hdr, &[]);
+    attach_paging(&mut resp, count_hdr, &links);
+    // 6.4.3.2: entityMap=true — the EntityMap for this Query is created, as
+    // on the GET twin, and named in NGSILD-EntityMap with 201 Created
+    if page_params.get("entityMap").map(String::as_str) == Some("true") {
+        let map = crate::entities::build_query_map(
+            st,
+            &tenant,
+            headers,
+            &parsed.ctx,
+            &page_params,
+            &filter,
+        )
+        .await?;
+        *resp.status_mut() = StatusCode::CREATED;
+        if let Some(id) = map.get("id").and_then(Value::as_str) {
+            if let Ok(v) = format!("/ngsi-ld/v1/entityMaps/{id}").parse() {
+                resp.headers_mut().insert("NGSILD-EntityMap", v);
+            }
+        }
+    }
     filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
+}
+
+/// 5.2.33: the EntitySelectors of a Query, each a (type, id, idPattern)
+/// triple, `id` taking precedence over `idPattern` within its selector.
+/// [`query_doc_params`] states one selector exactly as flat parameters;
+/// several are only a superset there, so their candidates are matched here.
+struct Selectors(Vec<Selector>);
+
+struct Selector {
+    types: String,
+    ids: Vec<String>,
+    pattern: Option<String>,
+}
+
+impl Selectors {
+    /// None for a Query with at most one selector (already exact); the
+    /// members were validated by `query_doc_params`.
+    fn of(q: &serde_json::Map<String, Value>) -> ApiResult<Option<Self>> {
+        let Some(Value::Array(es)) = q.get("entities") else {
+            return Ok(None);
+        };
+        if es.len() < 2 {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(es.len());
+        for e in es {
+            let types = e.get("type").and_then(Value::as_str).unwrap_or_default();
+            let ids = match e.get("id") {
+                Some(Value::String(s)) => vec![s.clone()],
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let pattern = e
+                .get("idPattern")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(p) = &pattern {
+                antares_ql::regex::compile(p)
+                    .map_err(|_| NgsiError::BadRequestData(format!("invalid idPattern {p:?}")))?;
+            }
+            out.push(Selector {
+                types: types.to_owned(),
+                ids,
+                pattern,
+            });
+        }
+        Ok(Some(Self(out)))
+    }
+
+    /// Whether `doc` is selected by any selector.
+    fn matches(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        let id = doc.get("id").and_then(Value::as_str).unwrap_or_default();
+        let types: Vec<&str> = match doc.get("type") {
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            Some(Value::String(t)) => vec![t.as_str()],
+            _ => Vec::new(),
+        };
+        self.0.iter().any(|s| {
+            let typed = s.types == "*" || antares_ql::type_selection_matches(&s.types, &types, ctx);
+            let named = if !s.ids.is_empty() {
+                s.ids.iter().any(|i| i == id)
+            } else if let Some(p) = &s.pattern {
+                antares_ql::regex::compile(p).is_ok_and(|r| r.is_match(id))
+            } else {
+                true
+            };
+            typed && named
+        })
+    }
 }
 
 /// Each page Entity in the requested representation, beside the Entity it
