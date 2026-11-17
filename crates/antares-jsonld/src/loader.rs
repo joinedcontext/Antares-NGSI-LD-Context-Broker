@@ -1237,7 +1237,7 @@ impl Loader {
         // reaches this line, so a broken pin is a 500, never a panic.
         let core = pinned(CORE_CONTEXT)
             .ok_or_else(|| NgsiError::InternalError("the core @context is not pinned".into()))?;
-        merge_context_value(&mut ctx, &core);
+        merge_context_value(&mut ctx, &core)?;
         ctx.freeze();
         ctx.source = user.clone();
         let arc = Arc::new(ctx);
