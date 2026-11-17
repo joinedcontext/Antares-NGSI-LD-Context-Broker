@@ -1242,8 +1242,10 @@ pub async fn batch_temporal_query(
 /// temporal query pipeline itself (5.7.4.4) run unpaged — the ids of its
 /// result set form the EntityMap; the createEntityMapQueryTemporal
 /// registrations are then merged like 5.14.4.
-/// Known ceiling: candidate ids are read from the internal 5.7.4 response capped
-/// at max_limit; raise the cap if temporal sets outgrow it.
+/// The candidate ids are read from the internal 5.7.4 response, one page of
+/// max_limit Entities: a match set past it is refused (TooManyResults), since
+/// the map fixes every later page to the ids it holds and a cut map would
+/// leave the rest unreachable without a word.
 pub(crate) async fn build_temporal_map(
     st: &AppState,
     tenant: &TenantId,
@@ -1295,6 +1297,14 @@ pub(crate) async fn build_temporal_map(
     // Box::pin: build_temporal_map is reachable from query_temporal_inner
     // (entityMap=true), so this recursive edge needs indirection.
     let resp = Box::pin(query_temporal_inner(st, &eff, &ids_shown(headers), filter)).await?;
+    let more = resp
+        .headers()
+        .get_all(axum::http::header::LINK)
+        .iter()
+        .any(|l| l.to_str().is_ok_and(|l| l.contains("rel=\"next\"")));
+    if more {
+        return Err(crate::entity_map::map_too_wide(st.max_limit).into());
+    }
     let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
         .await
         .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;

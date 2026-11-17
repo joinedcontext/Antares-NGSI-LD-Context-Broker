@@ -211,6 +211,15 @@ async fn evict_one_map(st: &AppState, tenant: &TenantId, new: &Value) -> Result<
     Ok(())
 }
 
+/// 5.5.6 TooManyResults for a query whose candidate set is larger than one
+/// EntityMap holds: the map fixes every later page to its ids (5.5.14), so a
+/// map cut at the cap would leave the rest unreachable without a word.
+pub(crate) fn map_too_wide(cap: usize) -> NgsiError {
+    NgsiError::TooManyResults(format!(
+        "the query matches more than the {cap} Entities one EntityMap holds; narrow it"
+    ))
+}
+
 /// 6.4.3.2-1: "the actual expiresAt time of the EntityMap shall be set by
 /// the Context Broker or Context Source, possibly overriding the requested
 /// duration": every writer of a map's expiresAt goes through this. An

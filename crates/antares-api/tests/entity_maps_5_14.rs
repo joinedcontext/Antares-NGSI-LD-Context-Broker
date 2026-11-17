@@ -697,3 +697,26 @@ async fn clause_6_3_5_post_query_form_reads_the_body_context() {
     let (status, _, _) = send(&st, post("text/plain", &body)).await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
+
+/// 5.14.4.4 / 5.14.5.4 with 5.5.14: a map fixes every later page to its ids,
+/// so a match set larger than one map holds is refused (TooManyResults)
+/// instead of being stored cut at the ceiling.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_5_14_a_map_past_the_ceiling_is_refused() {
+    let mut st = state().await;
+    st.max_limit = 2;
+    for i in 0..3 {
+        create_vehicle(&st, &format!("urn:ngsi-ld:Vehicle:w{i}"), 10).await;
+    }
+    for uri in [
+        "/ngsi-ld/v1/entityMaps?type=Vehicle",
+        "/ngsi-ld/v1/temporal/entityMaps?type=Vehicle&timerel=before&timeAt=2999-01-01T00:00:00Z&timeproperty=createdAt",
+    ] {
+        let (status, _, body) = get(&st, uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        assert_eq!(
+            body["type"], "https://uri.etsi.org/ngsi-ld/errors/TooManyResults",
+            "{body}"
+        );
+    }
+}

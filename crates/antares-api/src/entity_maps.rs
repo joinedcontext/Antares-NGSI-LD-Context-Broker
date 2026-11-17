@@ -287,8 +287,9 @@ mod tests {
 
     /// 5.14.4.4 + 5.5.9.3: the EntityMap holds the CANDIDATE identifiers a
     /// later paginated request re-checks, so building one must not depend on
-    /// materializing the tenant's whole match set. The candidate set is
-    /// bounded by the broker ceiling, exactly as the temporal twin is.
+    /// materializing the tenant's whole match set, and a map cut at the
+    /// ceiling would fix later pages to part of the answer (5.5.14): a match
+    /// set past it is refused, one within it is mapped whole.
     #[tokio::test]
     async fn clause_5_14_4_query_map_candidate_set_is_bounded() {
         let mut st = AppState::new("antares-em-bound".into());
@@ -296,6 +297,7 @@ mod tests {
         let t = TenantId::default();
         for i in 0..40 {
             let id = format!("urn:ngsi-ld:Vehicle:{i:03}");
+            let ty = if i < 8 { "Vehicle" } else { "Truck" };
             st.store
                 .create(
                     &t,
@@ -303,41 +305,34 @@ mod tests {
                     &id,
                     json!({
                         "id": id,
-                        "type": ["https://uri.etsi.org/ngsi-ld/default-context/Vehicle"],
+                        "type": [format!("https://uri.etsi.org/ngsi-ld/default-context/{ty}")],
                     }),
                 )
                 .await
                 .expect("seed");
         }
-        let doc = build_query_map(
-            &st,
-            &t,
-            &HeaderMap::new(),
-            &antares_jsonld::Context::default(),
-            &params(&[("type", "Vehicle"), ("local", "true")]),
-            &crate::policy::Filter::default(),
-        )
-        .await
-        .expect("EntityMap");
+        let map = |ty: &'static str| {
+            let st = st.clone();
+            let t = t.clone();
+            async move {
+                build_query_map(
+                    &st,
+                    &t,
+                    &HeaderMap::new(),
+                    &antares_jsonld::Context::default(),
+                    &params(&[("type", ty), ("local", "true")]),
+                    &crate::policy::Filter::default(),
+                )
+                .await
+            }
+        };
+        let doc = map("Vehicle").await.expect("EntityMap");
         let emap = doc["entityMap"].as_object().expect("entityMap object");
-        assert!(!emap.is_empty(), "the matching entities are candidates");
-        assert!(
-            emap.len() <= st.max_limit,
-            "the candidate set is unbounded: {} entries for a ceiling of {}",
-            emap.len(),
-            st.max_limit
-        );
+        assert_eq!(emap.len(), 8, "a match set at the ceiling is mapped whole");
+        let too_wide = map("Truck").await.expect_err("refused past the ceiling");
+        assert_eq!(too_wide.into_response().status(), StatusCode::FORBIDDEN);
         // a query that matches nothing must not pick up unrelated entities
-        let none = build_query_map(
-            &st,
-            &t,
-            &HeaderMap::new(),
-            &antares_jsonld::Context::default(),
-            &params(&[("type", "Ship"), ("local", "true")]),
-            &crate::policy::Filter::default(),
-        )
-        .await
-        .expect("EntityMap");
+        let none = map("Ship").await.expect("EntityMap");
         assert_eq!(none["entityMap"], json!({}));
     }
 
