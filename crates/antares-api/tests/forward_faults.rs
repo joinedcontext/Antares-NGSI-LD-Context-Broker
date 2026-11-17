@@ -160,3 +160,38 @@ async fn a_local_error_in_a_distributed_merge_keeps_its_type() {
     assert!(body.contains("BadRequestData"), "{status} {body}");
     assert!(!body.contains("not found locally"), "{status} {body}");
 }
+
+/// 4.5.23: a linked Entity the store fails to read is a truncated join
+/// (NGSILD-Warning), never a dangling link served as complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_failure_during_a_join_is_a_truncation() {
+    let mut st = state();
+    create(
+        &st,
+        serde_json::json!({"id": "urn:ngsi-ld:Vehicle:jb", "type": "Vehicle"}),
+    )
+    .await;
+    create(
+        &st,
+        serde_json::json!({"id": "urn:ngsi-ld:Vehicle:ja", "type": "Vehicle",
+            "rel": {"type": "Relationship", "object": "urn:ngsi-ld:Vehicle:jb"}}),
+    )
+    .await;
+    st.store = Arc::new(crate::common::Double::refusing_doc(
+        st.store.clone(),
+        antares_store::Kind::Entity,
+        "urn:ngsi-ld:Vehicle:jb",
+    ));
+    for join in ["inline", "flat"] {
+        let (status, warnings, body) = send(
+            &st,
+            "GET",
+            &format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:ja?join={join}&joinLevel=1"),
+            "",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{join}: {body}");
+        assert!(!warnings.is_empty(), "{join}: no warning, {body}");
+    }
+}
