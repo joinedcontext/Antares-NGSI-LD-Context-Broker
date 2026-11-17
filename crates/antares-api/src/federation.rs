@@ -1447,15 +1447,12 @@ async fn build_forward<'a>(
             && csi_get("jsonldContext").is_none();
         if let Some(ic) = &inline_ctx {
             // inline request @context: the only lossless carrier is the
-            // body itself, as application/ld+json (5.5.7/6.3.5).
-            if let Some(o) = b.as_object_mut() {
-                o.insert("@context".into(), ic.clone());
-            }
+            // body itself, as application/ld+json (5.5.7/6.3.5) — in every
+            // entry of a batch array, each of which is read on its own
+            set_body_context(&mut b, ic);
             sent.push(("Content-Type".into(), "application/ld+json".into()));
         } else if want_ld {
-            if let Some(o) = b.as_object_mut() {
-                o.insert("@context".into(), Value::String(link_ctx.clone()));
-            }
+            set_body_context(&mut b, &Value::String(link_ctx.clone()));
             sent.push(("Content-Type".into(), "application/ld+json".into()));
         } else {
             sent.push(("Content-Type".into(), "application/json".into()));
@@ -2805,6 +2802,22 @@ pub fn merge_candidates(local: Vec<Value>, fed: Vec<(bool, Value)>) -> Vec<Value
 }
 
 // ---------- distributed writes ----------
+
+/// The `@context` member of an ld+json body: on the object, or on every
+/// object of a batch array (each entry carries its own, 6.3.5).
+fn set_body_context(body: &mut Value, ctx: &Value) {
+    match body {
+        Value::Object(o) => {
+            o.insert("@context".into(), ctx.clone());
+        }
+        Value::Array(items) => {
+            for o in items.iter_mut().filter_map(Value::as_object_mut) {
+                o.insert("@context".into(), ctx.clone());
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Outcome of one part of a distributed write.
 #[derive(Clone, Debug, Default)]

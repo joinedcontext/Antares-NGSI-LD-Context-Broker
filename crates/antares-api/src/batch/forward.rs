@@ -199,23 +199,43 @@ pub(super) async fn forward_batch(
     fed_regs: &[crate::federation::FedReg],
     fwd_items: &[FwdItem],
 ) -> Remote {
-    let src = fwd_items
-        .first()
-        .map(|(_, c)| c.source.clone())
-        .unwrap_or(Value::Null);
-    let fwd = Fwd {
-        st,
-        headers,
-        tenant,
-        ctx_url: crate::federation::ctx_link_url(headers, &src),
-    };
     let mut query: Vec<(String, String)> = Vec::new();
     if let Some(o) = params.get("options") {
         query.push(("options".into(), o.clone()));
     }
     let mut remote = Remote::default();
+    // 5.5.7: each item is read under its own @context, so items are forwarded
+    // in one request per @context, in the order the array first names them
+    let mut groups: Vec<(&Value, Vec<&FwdItem>)> = Vec::new();
+    for item in fwd_items {
+        match groups.iter_mut().find(|(src, _)| **src == item.1.source) {
+            Some((_, members)) => members.push(item),
+            None => groups.push((&item.1.source, vec![item])),
+        }
+    }
+    for (src, members) in &groups {
+        let fwd = Fwd {
+            st,
+            headers,
+            tenant,
+            ctx_url: crate::federation::ctx_link_url(headers, src),
+        };
+        forward_group(&fwd, opts, fed_regs, &query, members, &mut remote).await;
+    }
+    remote
+}
+
+/// The items of one @context, forwarded to every matching registration.
+async fn forward_group(
+    fwd: &Fwd<'_>,
+    opts: WriteOpts,
+    fed_regs: &[crate::federation::FedReg],
+    query: &[(String, String)],
+    members: &[&FwdItem],
+    remote: &mut Remote,
+) {
     for reg in fed_regs {
-        let arr: Vec<Value> = fwd_items
+        let arr: Vec<Value> = members
             .iter()
             .filter_map(|(o, c)| crate::federation::reduce_to_scope(o, reg, c))
             .collect();
@@ -228,9 +248,9 @@ pub(super) async fn forward_batch(
             .collect();
         let op = opts.mode.batch_op();
         if reg.supports(op) {
-            fwd.batch(reg, opts.mode, &query, arr, &sent_ids, &mut remote)
+            fwd.batch(reg, opts.mode, query, arr, &sent_ids, remote)
                 .await;
-        } else if !fwd.singly(reg, opts, arr, &mut remote).await && reg.is_proxy() {
+        } else if !fwd.singly(reg, opts, arr, remote).await && reg.is_proxy() {
             // 5.6.7.4/5.6.8.4/5.6.9.4/5.6.20.4 last rung: "In case CSR is
             // an exclusive or redirect Context Source Registration, add an
             // Error of type Conflict for each Entity in IN to E."
@@ -244,7 +264,6 @@ pub(super) async fn forward_batch(
             }
         }
     }
-    remote
 }
 
 /// The request context every forward of one batch shares.
