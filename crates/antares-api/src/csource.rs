@@ -884,40 +884,42 @@ pub async fn check_proxied_overlap(
                 .into_iter()
                 .map(str::to_owned)
                 .collect();
-            let empty = Vec::new();
-            let entities = info
-                .get("entities")
-                .and_then(Value::as_array)
-                .unwrap_or(&empty);
-            let ids: Vec<String> = entities
-                .iter()
-                .filter_map(|e| e.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect();
-            let types: Vec<String> = entities
-                .iter()
-                .flat_map(ei_types)
-                .map(str::to_owned)
-                .collect();
-            let spec = CsrSpec {
-                types: (!types.is_empty()).then_some(types),
-                ids: (!ids.is_empty()).then_some(ids),
-                id_pattern: entities
-                    .iter()
-                    .find_map(|e| e.get("idPattern").and_then(Value::as_str))
-                    .map(str::to_owned),
-                attrs: (!attrs.is_empty()).then_some(attrs),
-                dataset_ids: None,
-                csf: None,
-                geo: None,
-                temporal: None,
+            // each EntityInfo is its own selector: folded into one spec,
+            // the id of one would narrow the types of another
+            let entities: Vec<Option<&Value>> = match info.get("entities").and_then(Value::as_array)
+            {
+                Some(es) if !es.is_empty() => es.iter().map(Some).collect(),
+                _ => vec![None],
             };
-            if csr_matches(&spec, other, ctx) {
-                let oid = other.get("id").and_then(Value::as_str).unwrap_or("?");
-                return Err(NgsiError::Conflict(format!(
-                    "proxied registration overlaps {oid} for the same combination of \
-                     Entity ID and Attributes (4.3.6.3)"
-                )));
+            for e in entities {
+                let ids: Vec<String> = e
+                    .and_then(|e| e.get("id"))
+                    .and_then(Value::as_str)
+                    .map(|i| vec![i.to_owned()])
+                    .unwrap_or_default();
+                let types: Vec<String> = e
+                    .map(|e| ei_types(e).into_iter().map(str::to_owned).collect())
+                    .unwrap_or_default();
+                let spec = CsrSpec {
+                    types: (!types.is_empty()).then_some(types),
+                    ids: (!ids.is_empty()).then_some(ids),
+                    id_pattern: e
+                        .and_then(|e| e.get("idPattern"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    attrs: (!attrs.is_empty()).then(|| attrs.clone()),
+                    dataset_ids: None,
+                    csf: None,
+                    geo: None,
+                    temporal: None,
+                };
+                if csr_matches(&spec, other, ctx) {
+                    let oid = other.get("id").and_then(Value::as_str).unwrap_or("?");
+                    return Err(NgsiError::Conflict(format!(
+                        "proxied registration overlaps {oid} for the same combination of \
+                         Entity ID and Attributes (4.3.6.3)"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1646,6 +1648,59 @@ mod csi_tests {
             norm("sideways", full).is_err(),
             "mode outside the 5.2.9 enum"
         );
+    }
+
+    /// 4.3.6.3: each EntityInfo of a new proxied registration is checked
+    /// on its own: the id one of them names does not narrow another's type.
+    #[tokio::test]
+    async fn every_entity_info_of_a_proxied_registration_is_checked_on_its_own() {
+        let st = crate::state::AppState::new("me".into());
+        let tenant = antares_model::TenantId::new("default").expect("tenant");
+        let ctx = st.loader.core();
+        let mk = |id: &str, mode: &str, entities: Value| {
+            let doc = json!({
+                "id": id,
+                "type": "ContextSourceRegistration",
+                "endpoint": "http://peer:9090",
+                "mode": mode,
+                "information": [{"entities": entities, "propertyNames": ["speed"]}]
+            });
+            normalize_registration(doc.as_object().unwrap(), &ctx, false).expect("valid reg")
+        };
+        let seeded = mk(
+            "urn:ngsi-ld:ContextSourceRegistration:b-y",
+            "exclusive",
+            json!([{"type": "Bike", "id": "urn:ngsi-ld:Bike:y"}]),
+        );
+        st.store
+            .create(
+                &tenant,
+                Kind::Registration,
+                "urn:ngsi-ld:ContextSourceRegistration:b-y",
+                Value::Object(seeded),
+            )
+            .await
+            .expect("seed");
+        let both = mk(
+            "urn:ngsi-ld:ContextSourceRegistration:a-x-b",
+            "redirect",
+            json!([{"type": "Car", "id": "urn:ngsi-ld:Car:x"}, {"type": "Bike"}]),
+        );
+        assert!(
+            matches!(
+                check_proxied_overlap(&st, &tenant, &both, None, &ctx).await,
+                Err(NgsiError::Conflict(_))
+            ),
+            "every Bike, Bike y among them, overlaps the exclusive registration"
+        );
+        let cars = mk(
+            "urn:ngsi-ld:ContextSourceRegistration:a-x",
+            "redirect",
+            json!([{"type": "Car", "id": "urn:ngsi-ld:Car:x"}]),
+        );
+        assert!(check_proxied_overlap(&st, &tenant, &cars, None, &ctx)
+            .await
+            .is_ok());
     }
 
     /// 4.3.6.3: "Once an exclusive Context Source Registration has been
