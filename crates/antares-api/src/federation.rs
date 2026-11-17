@@ -552,26 +552,8 @@ pub async fn matching_regs(
         .iter()
         .filter_map(|doc| {
             let infos = reg_candidate(doc, spec, ctx, &seen)?;
-            let alias = doc
-                .get("contextSourceAlias")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let endpoint = endpoint_base(doc.get("endpoint").and_then(Value::as_str)?);
-            let mode = doc
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or("inclusive")
-                .to_owned();
-            let ops = doc
-                .get("operations")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![DEFAULT_OPERATION_GROUP.into()]);
+            // a registration without an endpoint names no source to ask
+            doc.get("endpoint").and_then(Value::as_str)?;
             let mut attrs: Option<Vec<String>> = Some(Vec::new());
             let mut ent_ids = Vec::new();
             let mut ent_types = Vec::new();
@@ -620,28 +602,17 @@ pub async fn matching_regs(
             if any_type {
                 ent_types.clear();
             }
-            let tenant = doc.get("tenant").and_then(Value::as_str).map(str::to_owned);
-            let csi = csi_of(doc);
+            // the source itself (endpoint, mode, operations, tenant, alias,
+            // csi, localOnly, management) is read where every caller reads
+            // it; only the scope comes from the infos that matched
+            let id = doc.get("id").and_then(Value::as_str).unwrap_or_default();
             Some(FedReg {
-                reg_id: doc
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                endpoint,
-                mode,
-                ops,
                 attrs,
                 ent_ids,
                 ent_types,
                 ent_patterns,
                 ent_unrestricted,
-                tenant,
-                alias,
-                csi,
-                local_only: local_only_of(doc),
-                timeout_ms: management_ms(doc, "timeout"),
-                cooldown_ms: management_ms(doc, "cooldown"),
+                ..fed_reg_of(id, doc)
             })
         })
         .collect();
