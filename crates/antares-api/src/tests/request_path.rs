@@ -431,3 +431,20 @@ async fn replace_attribute_stamps_its_sub_attributes() {
     assert!(doc["speed"]["accuracy"]["createdAt"].is_string(), "{doc}");
     assert!(doc["speed"]["accuracy"]["modifiedAt"].is_string(), "{doc}");
 }
+
+/// 6.3.2 / RFC 9110 15.5.6: the 405 for a path with an empty segment carries
+/// an Allow header (empty: no method applies).
+#[tokio::test]
+async fn an_empty_segment_405_carries_allow() {
+    let st = state();
+    for method in ["GET", "PATCH", "DELETE"] {
+        let req = Request::builder()
+            .method(method)
+            .uri("/ngsi-ld/v1/entities/urn:ngsi-ld:T:1/attrs//speed")
+            .body(Body::empty())
+            .expect("req");
+        let resp = send(&st, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert!(resp.headers().contains_key("allow"), "{method}");
+    }
+}

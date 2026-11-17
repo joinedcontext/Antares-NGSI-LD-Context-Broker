@@ -637,9 +637,15 @@ pub(super) async fn not_found(headers: HeaderMap, uri: axum::http::Uri) -> Respo
     let path = uri.path().to_owned();
     let tenant = tenant_from(&headers).unwrap_or_default();
     // A path with an empty segment (…/attrs//{x}) names a resource whose
-    // methods don't apply — 405 per the suite (016_02_04/06).
+    // methods don't apply — 405 per the suite (016_02_04/06). RFC 9110
+    // 15.5.6 makes Allow mandatory on a 405; an empty one says the resource
+    // allows no method.
     if path.starts_with(API_ROOT) && path.contains("//") {
-        let mut resp = axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response();
+        let mut resp = (
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+            [(axum::http::header::ALLOW, "")],
+        )
+            .into_response();
         echo_tenant(&tenant, &mut resp);
         return resp;
     }
