@@ -2347,7 +2347,7 @@ pub(super) async fn prune_expired_current(
             let id: String = r.get(0);
             let mut doc: Value = r.get(1);
             let now: String = r.get(2);
-            crate::store::mem::prune_expired_instances(&mut doc, &now);
+            antares_store::filter::strip_expired_instances(&mut doc, &now);
             let e = extract(&doc);
             let rewritten = sqlx::query(
                 "UPDATE entities SET entity = $3,

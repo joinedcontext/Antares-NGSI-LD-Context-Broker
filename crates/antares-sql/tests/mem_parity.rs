@@ -182,3 +182,26 @@ async fn temporal_create_and_upsert_keep_no_provenance() {
         );
     }
 }
+
+/// 4.22 names sub-attributes too: the sweep removes an expired
+/// sub-attribute instance from the stored document, as the read boundary
+/// already hides it, with the one pruner both use.
+#[tokio::test]
+async fn the_sweep_removes_expired_sub_attribute_instances() {
+    let store = Store::default();
+    let t = TenantId::default();
+    let id = "urn:x:sub";
+    let doc = json!({"id": id, "type": ["T"],
+        "https://e.org/a": [{"type": "Property", "value": 1,
+            "https://e.org/acc": [{"type": "Property", "value": 0.1,
+                                   "expiresAt": "2020-01-01T00:00:00Z"}]}]});
+    assert!(store.create(&t, Kind::Entity, id, doc).await);
+    assert_eq!(store.sweep_expired("2026-01-01T00:00:00.000Z"), 1);
+    let stored = store.get(&t, Kind::Entity, id).expect("stored");
+    assert!(
+        stored["https://e.org/a"][0]
+            .get("https://e.org/acc")
+            .is_none(),
+        "{stored}"
+    );
+}
