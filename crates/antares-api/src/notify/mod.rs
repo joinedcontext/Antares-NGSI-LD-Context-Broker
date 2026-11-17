@@ -26,7 +26,9 @@ mod retry;
 mod tests;
 mod throttle;
 
-use crate::mirror::{index_keys, Change, Keys, Mirror, SubMirror, CSUB_SWEEP_BACKSTOP_MS};
+use crate::mirror::{
+    index_keys, Change, Keys, Mirror, SubMirror, VersionedChange, CSUB_SWEEP_BACKSTOP_MS,
+};
 use crate::negotiate::{inject_context, link_header_value};
 use crate::state::{now_iso, AppState};
 use antares_jsonld::Context;
@@ -82,6 +84,40 @@ fn queue_for_matching(
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     } else {
         note_drop();
+    }
+}
+
+/// Hand changes to the matcher in commit order. Two writers of one Entity
+/// may run their hooks in either order on the Postgres arm (S3-18), and a
+/// change committed inside a request reaches this point only when the
+/// request ends, after changes committed later. A change older than one of
+/// the same Entity already taken is dropped here, so no subscriber is handed
+/// the older image last; the gate makes taking and queueing one step, so the
+/// queue holds the changes in the order they were taken.
+fn admit_for_matching(
+    newest: &antares_store::NewestSeen,
+    gate: &std::sync::Mutex<()>,
+    tx: &tokio::sync::mpsc::Sender<(u64, Vec<Change>)>,
+    pending: &std::sync::atomic::AtomicUsize,
+    changes: Vec<VersionedChange>,
+) {
+    let _taking = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let kept: Vec<Change> = changes
+        .into_iter()
+        .filter(|((tenant, before, after), version)| {
+            after
+                .as_ref()
+                .or(before.as_ref())
+                .and_then(|d| d.get("id"))
+                .and_then(Value::as_str)
+                .is_none_or(|id| newest.admit(tenant, id, version))
+        })
+        .map(|(change, _)| change)
+        .collect();
+    if !kept.is_empty() {
+        queue_for_matching(tx, pending, kept);
     }
 }
 
@@ -229,22 +265,27 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     // queue grows until the process dies. Bounded instead: a full queue drops
     // the change and counts it.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Vec<Change>)>(CHANGE_QUEUE);
-    let flush_tx = tx.clone();
+    let newest = Arc::new(antares_store::NewestSeen::new(CHANGE_ORDER_KEYS));
+    let gate = Arc::new(std::sync::Mutex::new(()));
+    let (flush_tx, flush_newest, flush_gate) = (tx.clone(), newest.clone(), gate.clone());
     let flush_pending = state.pending_changes.clone();
-    state.change_flush = Some(Arc::new(move |changes: Vec<Change>| {
-        queue_for_matching(&flush_tx, &flush_pending, changes)
+    state.change_flush = Some(Arc::new(move |changes: Vec<VersionedChange>| {
+        admit_for_matching(
+            &flush_newest,
+            &flush_gate,
+            &flush_tx,
+            &flush_pending,
+            changes,
+        )
     }));
     // Temporal auto-recording runs SYNCHRONOUSLY on the hook (read-your-writes:
     // the ETSI suite queries history immediately after a write); the matcher
     // work is handed to the async task below. One choke point for every write.
     let st_rec = state.clone();
     let hook_pending = state.pending_changes.clone();
-    // Two writers of one Entity may run their hooks in either order on the
-    // Postgres arm (S3-18): the matcher drops a change older than one of the
-    // same Entity it has taken, so no subscriber is handed the older image
-    // last. Recording keeps every change, late or not: each carries the
+    // The matcher takes changes in commit order (`admit_for_matching`).
+    // Recording keeps every change, late or not: each carries the
     // instances only it wrote, and history is ordered by their instants.
-    let newest = Arc::new(antares_store::NewestSeen::new(CHANGE_ORDER_KEYS));
     state.store.set_change_hook(Arc::new(
         move |tenant: &TenantId,
               before: Option<Value>,
@@ -254,25 +295,18 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
             let st_rec = st_rec.clone();
             let tx = tx.clone();
             let hook_pending = hook_pending.clone();
-            let newest = newest.clone();
+            let (newest, gate) = (newest.clone(), gate.clone());
             Box::pin(async move {
                 record_temporal_change(&st_rec, tenant, before.as_ref(), after.as_ref()).await;
-                let id = after
-                    .as_ref()
-                    .or(before.as_ref())
-                    .and_then(|d| d.get("id"))
-                    .and_then(Value::as_str);
-                if id.is_some_and(|id| !newest.admit(tenant.as_str(), id, &version)) {
-                    return;
-                }
                 // inside a request the change rides the request's buffer and
                 // reaches the matcher with the rest of that request's changes
-                let Some(change) =
-                    crate::history::buffer_change((tenant.as_str().to_owned(), before, after))
-                else {
+                let Some(change) = crate::history::buffer_change((
+                    (tenant.as_str().to_owned(), before, after),
+                    version,
+                )) else {
                     return;
                 };
-                queue_for_matching(&tx, &hook_pending, vec![change]);
+                admit_for_matching(&newest, &gate, &tx, &hook_pending, vec![change]);
             })
         },
     ));

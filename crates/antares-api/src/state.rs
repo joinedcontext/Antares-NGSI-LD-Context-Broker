@@ -424,7 +424,7 @@ pub struct Shared {
     /// bus=local: takes the entity changes one request buffered (the history
     /// layer hands them over after the handler) so the matcher sees a batch
     /// request as one unit. `None` until the local pipeline is wired.
-    pub change_flush: Option<Arc<dyn Fn(Vec<crate::mirror::Change>) + Send + Sync>>,
+    pub change_flush: Option<Arc<dyn Fn(Vec<crate::mirror::VersionedChange>) + Send + Sync>>,
     /// Called after every Registration CUD: bus=nats publishes the delta on
     /// `ANTARES_REGISTRY`, bus=local applies it to `reg_mirror` in process.
     /// `None` while no mirror is wired.
