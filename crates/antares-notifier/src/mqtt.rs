@@ -189,6 +189,27 @@ macro_rules! options {
     }};
 }
 
+/// An MQTT ClientID unique across every process that talks to one server.
+/// A server disconnects the older session when a second one claims its
+/// ClientID (MQTT 3.1.1 3.1.4, MQTT 5 3.1.4), and in a container every
+/// replica is PID 1 with its counter at 0, so the process id cannot tell
+/// two replicas apart: a random per-process part does, and the counter
+/// tells the connections of one process apart.
+fn client_id(kind: &str, seq: &std::sync::atomic::AtomicU64) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static NONCE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // RandomState is keyed from the OS random source: no new dependency
+    let nonce = *NONCE.get_or_init(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.finish()
+    });
+    format!(
+        "{kind}-{nonce:016x}-{}",
+        seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// The mqtts trust store, built ONCE per process. Loading the platform
 /// certificate store on every connect is wasted work, and rumqttc's
 /// `TlsConfiguration::default()` panics when the store is unreadable — a
@@ -425,15 +446,8 @@ impl MqttSink {
     /// Connect and wait for ConnAck (a dead broker must fail delivery, not
     /// queue forever), then hand the event loop to a pump task.
     async fn connect(&self, ep: &MqttEndpoint, params: MqttParams) -> Result<Conn, NgsiError> {
-        // A monotonic counter, not a timestamp: `Instant::now().elapsed()` is
-        // ~0 for every caller, so two connects in one process would claim the
-        // same client id and the broker would kick the older session.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = format!(
-            "antares-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
+        let id = client_id("antares", &SEQ);
         let refused = |e: String| {
             NgsiError::InternalError(format!("mqtt connect {}:{}: {e}", ep.host, ep.port))
         };
@@ -549,11 +563,7 @@ pub async fn listen(
     use rumqttc::v5::mqttbytes::QoS;
     use rumqttc::v5::Event;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let id = format!(
-        "antares-in-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
+    let id = client_id("antares-in", &SEQ);
     let addr = checked_addr(&ep.host, ep.port, egress_policy(), timeout).await?;
     let opts = options!(
         rumqttc::v5::MqttOptions,
@@ -671,6 +681,24 @@ impl crate::NotificationSink for MqttSink {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Two replicas are both PID 1 with their counters at 0: the ClientID
+    /// carries a random per-process part, not the process id, so they do not
+    /// claim the same session; one process still numbers its connections.
+    #[test]
+    fn client_ids_do_not_collide_across_replicas() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let a = client_id("antares", &SEQ);
+        let b = client_id("antares", &SEQ);
+        assert_ne!(a, b, "one process numbers its connections");
+        let pid = format!("-{}-", std::process::id());
+        assert!(!a.contains(&pid), "the process id names no replica: {a}");
+        let nonce = a.split('-').nth(1).unwrap_or_default();
+        assert_eq!(nonce.len(), 16, "{a}");
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert!(b.starts_with(&format!("antares-{nonce}-")), "{b}");
+        assert!(client_id("antares-in", &SEQ).contains(nonce));
+    }
 
     #[test]
     fn debug_never_prints_the_password() {
