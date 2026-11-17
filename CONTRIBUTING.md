@@ -82,20 +82,73 @@ lives on a topic branch and comes in by pull request like a fork's.
 
 **Dependency updates.** Dependabot (`.github/dependabot.yml`) opens
 pull requests into `dev` every Monday: one grouped pull request of minor
-and patch bumps per ecosystem (cargo, GitHub Actions, Docker base
+and patch bumps per ecosystem (cargo, GitHub Actions, Docker and compose
 images, the playground's npm packages), a separate one per major bump,
-and a security update the day its advisory lands. `ci` runs on each like
-on any pull request, and a maintainer merges it by squash after reading
-the changelog of anything that parses input or touches the network.
-Nothing merges itself: a green matrix proves the broker still conforms,
-not that a new upstream release is trustworthy. A cargo bump that moves
-a `[workspace.dependencies]` version without its `wasm32` twin fails
-`dev/check-wasm-pins.py`; push the matching pin to the same branch. The
-weekly `advisories` sweep (`cargo deny`) files an issue for an advisory
-no update resolves yet. Updates ship with the next release.
+and a security update the day its advisory lands. `ci` and `deps-vet`
+run on each like on any pull request, and a maintainer merges it by
+squash after reading the vet table (see
+[Dependency updates](#dependency-updates)) and the changelog of anything
+that parses input or touches the network. Nothing merges itself: a green
+matrix proves the broker still conforms, not that a new upstream release
+is trustworthy. A cargo bump that moves a `[workspace.dependencies]`
+version without its `wasm32` twin fails `dev/check-wasm-pins.py`; push
+the matching pin to the same branch. The weekly `advisories` sweep
+(`cargo deny`) files an issue for an advisory no update resolves yet.
+Updates ship with the next release.
 
 **Urgent fixes** take the same road: a commit on `dev`, then a release.
 There is no hotfix branch, so a release never holds a change `dev` lacks.
+
+## Dependency updates
+
+**Cooldown.** Dependabot proposes a version only once it has been
+published for 7 days, in every ecosystem and directory it watches
+(`cooldown` in `.github/dependabot.yml`). A hijacked or broken release
+is usually yanked within that week. Security updates skip the cooldown.
+
+**The vet.** `deps-vet` (`.github/workflows/deps-vet.yml`, logic in
+`dev/deps-vet.py`) runs on every pull request into `dev` that touches a
+lockfile, a manifest, a workflow, a Dockerfile, a compose file or a k8s
+manifest, Dependabot's and anyone else's. It compares the merge base
+with the head and writes one table, in the job summary and as one
+comment on the pull request, with a row for every version that moved,
+new transitive packages included:
+
+| Column | What it says |
+|---|---|
+| From -> To | the version change; `(new)` for a package the lockfile did not have |
+| Published, Age | registry date (crates.io, npm, the action's release, the Docker Hub tag that points at the pinned digest); a date that cannot be fetched is `unknown` |
+| Advisories | OSV for the new version, plus `cargo deny check advisories` and `npm audit` on the head lockfiles; IDs the base branch's `deny.toml` ignores are listed, not counted |
+| Supply-chain signals | a crate that gains a `build.rs` or becomes a proc-macro, is yanked, or whose lockfile checksum is not crates.io's; an npm version from another publisher than the previous one, a new install script, provenance dropped, a new dependency; the commit an action tag names; the image digest change |
+| Verdict | `pass`, or `FAIL:` and every reason |
+
+A row fails when the version is under 7 days old or its date is
+unknown, when any advisory names it, or when a supply-chain signal is
+unexplained. Two signals are explained by the table itself: a new
+dependency whose own row passes (or that was already in the tree), and
+a move to npm trusted publishing whose provenance names the repository
+the previous version declared and the tarball the lockfile pins.
+
+**Reading it.** Green, and the first line reads `Safe to approve: N
+packages, all >= 7 days, no advisories, no supply-chain signals`:
+approve after the usual changelog read. Red means do not approve until
+every `FAIL` is explained:
+
+- under 7 days: wait and re-run the job; the age only grows.
+- date unknown: the registry was not reachable or is not queried
+  (`gcr.io`, `ghcr.io`); check the date by hand and write it in the
+  pull request.
+- an advisory: do not merge; move to a fixed version, or record why it
+  does not apply in `deny.toml` on `dev` first.
+- another publisher, a new install or build script, a new proc-macro:
+  find out who released it and why (release notes, the upstream
+  repository) and write the answer in the pull request before approving.
+
+The rules come from the base branch's copy of the script, so a change
+to them takes effect once it is on `dev`. Locally:
+`dev/deps-vet.py check --base origin/dev --head HEAD` (add
+`--cargo-deny "$(command -v cargo-deny)" --npm npm` for the two tools),
+and `dev/deps-vet.py selftest` for the rules themselves.
 
 ## Build
 
