@@ -1427,20 +1427,18 @@ impl Store {
             let doc = Self::map_mut(&mut inner, kind)
                 .get_mut(tenant.as_str())
                 .and_then(|m| m.get_mut(id))?;
-            let before = doc.clone();
+            // one copy for the closure; the stored one is the before-image
             let mut candidate = doc.clone();
             Some(match f(&mut candidate) {
+                Ok(t) if candidate == *doc => (Ok(t), None),
                 Ok(t) => {
-                    if candidate != before {
-                        self.persist(
-                            table_for(kind),
-                            &key_bytes(tenant.as_str(), id),
-                            Some(&candidate),
-                        );
-                    }
-                    let change = (kind == Kind::Entity && candidate != before)
-                        .then(|| (before, candidate.clone()));
-                    *doc = candidate;
+                    self.persist(
+                        table_for(kind),
+                        &key_bytes(tenant.as_str(), id),
+                        Some(&candidate),
+                    );
+                    let before = std::mem::replace(doc, candidate);
+                    let change = (kind == Kind::Entity).then(|| (before, doc.clone()));
                     (Ok(t), change)
                 }
                 Err(e) => (Err(e), None),
