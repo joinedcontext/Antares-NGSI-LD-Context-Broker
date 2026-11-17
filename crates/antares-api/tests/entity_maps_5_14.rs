@@ -661,3 +661,39 @@ async fn table_6_4_3_2_1_a_star_type_map_asks_no_source() {
     );
     assert_eq!(all["linkedMaps"], json!({}), "{all}");
 }
+
+/// 6.3.5: the POST form with an ld+json body takes the @context of the body
+/// for term expansion, and any other media type is 415.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_6_3_5_post_query_form_reads_the_body_context() {
+    let st = state().await;
+    create_vehicle(&st, "urn:ngsi-ld:Vehicle:c1", 10).await;
+    let body = json!({
+        "type": "Query",
+        "entities": [{"type": "Car"}],
+        "@context": [
+            {"Car": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"},
+            "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+        ]
+    })
+    .to_string();
+    let post = |ct: &str, body: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/ngsi-ld/v1/entityMaps")
+            .header("Content-Type", ct)
+            .header("Content-Length", body.len())
+            .body(Body::from(body.to_owned()))
+            .expect("request")
+    };
+    let (status, _, map) = send(&st, post("application/ld+json", &body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{map}");
+    assert!(
+        map["entityMap"]
+            .as_object()
+            .is_some_and(|o| o.contains_key("urn:ngsi-ld:Vehicle:c1")),
+        "the body @context expands Car to the Vehicle type: {map}"
+    );
+    let (status, _, _) = send(&st, post("text/plain", &body)).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
