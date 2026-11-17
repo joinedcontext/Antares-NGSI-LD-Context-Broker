@@ -216,8 +216,15 @@ pub(crate) async fn linkable(
     }
     let body = serde_json::to_vec(&ctx.source)
         .map_err(|e| NgsiError::InternalError(format!("@context not serializable: {e}")))?;
+    // The base is part of the address: without ANTARES_PUBLIC_URL it comes
+    // from the request's Host, and the row is shared by every request of the
+    // Tenant sending the same @context, so one keyed by content alone would
+    // hand later callers the URL the first caller's Host named.
+    let base = base_url(headers);
     let mut h = Sha256::new();
     h.update(tenant.as_str().as_bytes());
+    h.update([0]);
+    h.update(base.as_bytes());
     h.update([0]);
     h.update(&body);
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
@@ -245,7 +252,7 @@ pub(crate) async fn linkable(
                 );
                 None
             } else {
-                let url = format!("{}/{local_id}", base_url(headers));
+                let url = format!("{base}/{local_id}");
                 st.store
                     .context_put(
                         Some(tenant),
@@ -722,6 +729,39 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::HOST, "attacker.example".parse().expect("host"));
         h
+    }
+
+    /// 6.3.6: the ImplicitlyCreated @context one request's Host named is not
+    /// the URL another request of the Tenant is answered with: each Link
+    /// names the base the request itself reached.
+    #[tokio::test]
+    async fn an_implicit_context_url_never_carries_another_requests_host() {
+        let st = AppState::new("me".into());
+        let tenant = TenantId::new("alpha").expect("tenant");
+        let mut inline = Context::clone(&st.loader.core());
+        inline.source =
+            json!([{"speed": "https://example.org/speed"}, antares_jsonld::CORE_CONTEXT]);
+        let inline = Arc::new(inline);
+        let first = linkable(&st, &tenant, &forged_host(), &inline, Accept::Json)
+            .await
+            .expect("first");
+        let mut honest = HeaderMap::new();
+        honest.insert(header::HOST, "broker.local:9090".parse().expect("host"));
+        let second = linkable(&st, &tenant, &honest, &inline, Accept::Json)
+            .await
+            .expect("second");
+        let url = second.source.as_str().expect("a URL");
+        assert!(url.starts_with("http://broker.local:9090/"), "{url}");
+        assert!(!url.contains("attacker.example"), "{url}");
+        assert!(first
+            .source
+            .as_str()
+            .is_some_and(|u| u.starts_with("http://attacker.example/")));
+        // the same request again is the same row behind the same URL
+        let again = linkable(&st, &tenant, &honest, &inline, Accept::Json)
+            .await
+            .expect("again");
+        assert_eq!(again.source, second.source);
     }
 
     fn hosted_row(url: &str, local_id: &str, owner: &TenantId) -> Value {
