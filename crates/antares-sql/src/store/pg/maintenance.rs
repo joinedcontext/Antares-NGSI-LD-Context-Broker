@@ -414,21 +414,45 @@ async fn default_partition_load(pool: &PgPool) -> Result<Option<String>, sqlx::E
     Ok(Some(format!("default partition ~{est} rows")))
 }
 
-/// The 4.22 expired-entity DELETE, isolated so a reap that outruns
-/// `statement_timeout` costs only itself. Served by the partial index on
-/// `expires_at` (0001_init.sql) — without it this is a sequential scan of
-/// every entity in the deployment. Service role: the reap is cross-tenant work
-/// (RLS would hide other tenants' rows). An Entity its `expiresAt` ends takes
-/// its history with it, in the same transaction:
-/// its instances under the service role, its temporal row under its own
-/// Tenant, as `temporal_entities` keeps the plain tenant policy.
+/// Expired Entities one reap transaction deletes at most, with their history.
+const ENTITY_REAP_BATCH: i64 = 1000;
+
+/// The 4.22 expired-entity reap, isolated so a reap that outruns
+/// `statement_timeout` costs only itself: at most [`ENTITY_REAP_BATCH`]
+/// Entities a transaction, earliest expiry first, [`REAP_BATCHES`]
+/// transactions a pass; a backlog past that waits for the next tick instead
+/// of growing one statement until it can never finish.
 async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut n = 0u64;
+    for _ in 0..REAP_BATCHES {
+        let gone = reap_expired_entity_batch(pool, ENTITY_REAP_BATCH).await?;
+        n = n.saturating_add(gone);
+        if gone < ENTITY_REAP_BATCH.unsigned_abs() {
+            break;
+        }
+    }
+    Ok(n)
+}
+
+/// One batch of the 4.22 entity reap: at most `batch` expired Entities,
+/// found through the partial index on `expires_at` (0001_init.sql) and taken
+/// `SKIP LOCKED`, so two instances never wait on each other's rows. Service
+/// role: the reap is cross-tenant work (RLS would hide other tenants' rows).
+/// An Entity its `expiresAt` ends takes its history with it, in the same
+/// transaction: its instances under the service role, its temporal row
+/// under its own Tenant, as `temporal_entities` keeps the plain tenant
+/// policy.
+async fn reap_expired_entity_batch(pool: &PgPool, batch: i64) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
     let gone: Vec<(String, String)> = sqlx::query_as(
-        "DELETE FROM entities WHERE expires_at IS NOT NULL AND expires_at < now()
+        "DELETE FROM entities WHERE (tenant_id, id) IN (
+           SELECT tenant_id, id FROM entities
+            WHERE expires_at IS NOT NULL AND expires_at < now()
+            ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED)
          RETURNING tenant_id, id",
     )
+    .bind(batch)
     .fetch_all(&mut *tx)
     .await?;
     let mut by_tenant: std::collections::BTreeMap<&str, Vec<String>> =
@@ -461,6 +485,12 @@ async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
     }
     tx.commit().await?;
     Ok(u64::try_from(gone.len()).unwrap_or(u64::MAX))
+}
+
+/// One batch of the 4.22 entity reap (test hook: the cap is observable).
+#[cfg(any(test, feature = "test-kit"))]
+pub async fn reap_expired_entities_once(pool: &PgPool, batch: i64) -> Result<u64, sqlx::Error> {
+    reap_expired_entity_batch(pool, batch).await
 }
 
 /// Retention of current state (`/q/retention`): at most `batch`
