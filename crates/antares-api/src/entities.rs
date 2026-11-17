@@ -2902,12 +2902,12 @@ fn merge_with(doc: &mut Value, fragment: &Value, ts: &str, replace: bool) {
                             }
                         }
                         (false, None) => {
-                            let mut ni = fi.clone();
-                            if let Some(o) = ni.as_object_mut() {
-                                o.insert("createdAt".into(), Value::String(ts.to_owned()));
-                                o.insert("modifiedAt".into(), Value::String(ts.to_owned()));
+                            // a new instance, its sub-Attributes stamped too (4.8)
+                            let mut ni = Value::Array(vec![fi]);
+                            crate::stamp::stamp_instances(&mut ni, ts);
+                            if let Value::Array(ni) = ni {
+                                cur.extend(ni);
                             }
-                            cur.push(ni);
                         }
                     }
                 }
@@ -2961,6 +2961,11 @@ fn merge_instance(target: &mut Value, frag: &Value, ts: &str) {
             // 5.5.12: the merge goes "into JSON objects representing a
             // Property value" — RFC 7396 with the NGSI-LD Null as removal.
             merge_value_object(cur, patch);
+        } else if v.is_array() && !antares_jsonld::RESERVED_MEMBERS.contains(&k.as_str()) {
+            // a sub-Attribute the merge brings is stamped like any other (4.8)
+            let mut sub = v.clone();
+            crate::stamp::stamp_instances(&mut sub, ts);
+            t.insert(k.clone(), sub);
         } else {
             t.insert(k.clone(), v.clone());
         }
