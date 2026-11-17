@@ -69,7 +69,8 @@ pub fn core_context() -> Context {
     let mut core = Context::default();
     // PINNED holds CORE_CONTEXT and every entry parses: pinned by
     // `every_pinned_context_parses_and_carries_an_at_context`
-    merge_context_value(&mut core, &pinned(CORE_CONTEXT).expect("pinned core"));
+    merge_context_value(&mut core, &pinned(CORE_CONTEXT).expect("pinned core"))
+        .expect("the core @context alone fits the budget");
     core.freeze();
     core.source = Value::String(CORE_CONTEXT.to_owned());
     core
@@ -100,17 +101,16 @@ pub(crate) fn pinned(url: &str) -> Option<Value> {
 }
 
 /// Merge a pre-parsed Core @context value (4.4: merged last, so it wins).
-pub(crate) fn merge_context_value(ctx: &mut Context, v: &Value) {
+///
+/// # Errors
+/// `BadRequestData` when the user @context merged before it left too little
+/// of the budget for the Core terms: the request is refused rather than
+/// expanded under a Core context merged half way.
+pub(crate) fn merge_context_value(ctx: &mut Context, v: &Value) -> Result<(), NgsiError> {
     match v {
-        Value::Object(o) => {
-            let _ = ctx.merge_core_object(o);
-        }
-        Value::Array(items) => {
-            for i in items {
-                merge_context_value(ctx, i);
-            }
-        }
-        _ => {}
+        Value::Object(o) => ctx.merge_core_object(o),
+        Value::Array(items) => items.iter().try_for_each(|i| merge_context_value(ctx, i)),
+        _ => Ok(()),
     }
 }
 
@@ -145,7 +145,7 @@ pub fn resolve_with(loader: &dyn ContextLoader, user: &Value) -> Result<Context,
     merge_entry(loader, &mut ctx, user, 0, &mut urls, None)?;
     let core = pinned(CORE_CONTEXT)
         .ok_or_else(|| NgsiError::InternalError("the core @context is not pinned".into()))?;
-    merge_context_value(&mut ctx, &core);
+    merge_context_value(&mut ctx, &core)?;
     ctx.freeze();
     ctx.source = user.clone();
     Ok(ctx)
@@ -439,7 +439,29 @@ mod tests {
         merge_context_value(
             &mut ctx,
             &serde_json::json!([{"speed": "https://example.org/speed"}, 5]),
-        );
+        )
+        .expect("merged");
         assert_eq!(ctx.expand_key("speed"), "https://example.org/speed");
+    }
+
+    /// A user @context that leaves too little of the budget for the Core
+    /// terms is refused; it is never expanded under a Core merged half way.
+    #[test]
+    fn core_terms_survive_a_user_context_at_the_byte_budget() {
+        let big = format!("http://x/{}", "a".repeat(MAX_CONTEXT_BYTES - 200));
+        let user = serde_json::json!({"t": big});
+        let r = resolve_with(&PinnedOnly, &user);
+        assert!(
+            matches!(r, Err(NgsiError::BadRequestData(_))),
+            "the Core does not fit beside this user @context: {:?}",
+            r.map(|c| c.expand_key("location"))
+        );
+        // negative: a user @context well inside the budget keeps the Core
+        let ctx = resolve_with(&PinnedOnly, &serde_json::json!({"t": "http://x/t"}))
+            .expect("small @context");
+        assert_eq!(
+            ctx.expand_key("location"),
+            "https://uri.etsi.org/ngsi-ld/location"
+        );
     }
 }
