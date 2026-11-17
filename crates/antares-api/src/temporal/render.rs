@@ -246,9 +246,11 @@ fn carry_held(
     dataset: Option<&Vec<String>>,
     timeprop: &str,
 ) {
-    let Some(start) = tq.and_then(|t| match t.timerel.as_str() {
-        "after" | "between" => Some(dt_key(&t.time_at)),
-        _ => None,
+    let Some(start) = tq.and_then(|t| match t.timerel {
+        crate::temporalq::Timerel::After | crate::temporalq::Timerel::Between => {
+            Some(dt_key(&t.time_at))
+        }
+        crate::temporalq::Timerel::Before | crate::temporalq::Timerel::Any => None,
     }) else {
         return;
     };
@@ -269,9 +271,11 @@ fn carry_held(
 /// before it — carry the latest pre-window instance into the
 /// representation (a temporal scope stays valid until replaced).
 fn carry_scope(instances: &mut Vec<Value>, v: &Value, tq: Option<&TemporalQ>) {
-    let Some(start) = tq.and_then(|t| match t.timerel.as_str() {
-        "after" | "between" => Some(t.time_at.as_str()),
-        _ => None,
+    let Some(start) = tq.and_then(|t| match t.timerel {
+        crate::temporalq::Timerel::After | crate::temporalq::Timerel::Between => {
+            Some(t.time_at.as_str())
+        }
+        crate::temporalq::Timerel::Before | crate::temporalq::Timerel::Any => None,
     }) else {
         return;
     };
@@ -325,18 +329,24 @@ pub(super) fn content_range(
     // The window bound is the query's own when the query names one; matching
     // on the pair keeps the timerel and the query that produced it together,
     // so no arm can reach for a query that is not there.
-    let named = tq.filter(|t| t.timerel != "any");
     let (start, end) = if !page.desc {
-        let start = match named.map(|t| (t.timerel.as_str(), t)) {
-            Some(("after" | "between", t)) => t.time_at.clone(),
-            _ => data_min.to_owned(),
+        let start = match tq.map(|t| (t.timerel, t)) {
+            Some((crate::temporalq::Timerel::After | crate::temporalq::Timerel::Between, t)) => {
+                t.time_at.clone()
+            }
+            Some((crate::temporalq::Timerel::Before | crate::temporalq::Timerel::Any, _))
+            | None => data_min.to_owned(),
         };
         (start, data_max.to_owned())
     } else {
-        let start = match named.map(|t| (t.timerel.as_str(), t)) {
-            Some(("before", t)) => t.time_at.clone(),
-            Some(("between", t)) => t.end_time_at.clone().unwrap_or_else(|| data_max.to_owned()),
-            _ => data_max.to_owned(),
+        let start = match tq.map(|t| (t.timerel, t)) {
+            Some((crate::temporalq::Timerel::Before, t)) => t.time_at.clone(),
+            Some((crate::temporalq::Timerel::Between, t)) => {
+                t.end_time_at.clone().unwrap_or_else(|| data_max.to_owned())
+            }
+            Some((crate::temporalq::Timerel::After | crate::temporalq::Timerel::Any, _)) | None => {
+                data_max.to_owned()
+            }
         };
         (start, data_min.to_owned())
     };

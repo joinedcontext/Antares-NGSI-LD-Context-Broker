@@ -701,7 +701,7 @@ impl<'p> Parsed<'p> {
         self.tq
             .as_ref()
             .map(|t| antares_store::filter::InstanceRange {
-                timerel: &t.timerel,
+                timerel: t.timerel.as_str(),
                 time_at: &t.time_at,
                 end_time_at: t.end_time_at.as_deref(),
                 timeproperty: &t.timeproperty,

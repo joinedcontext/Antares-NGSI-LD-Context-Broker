@@ -1231,7 +1231,7 @@ pub async fn query_registrations(
         let scope_q = params.get("scopeQ").cloned();
         // temporal query: validate + interval presence rules (5.10.2.4)
         let temporal = crate::temporalq::TemporalQ::from_params(&params, false)?
-            .filter(|t| t.timerel != "any");
+            .filter(|t| t.timerel != crate::temporalq::Timerel::Any);
         // 5.10.2.4 fixes the order: run the query returning the
         // registrations that "meet all the applicable conditions", THEN
         // "Pagination logic shall be in place as mandated by clause 5.5.9".

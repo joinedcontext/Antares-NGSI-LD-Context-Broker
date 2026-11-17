@@ -903,11 +903,13 @@ impl Filter {
                 let epoch = "1970-01-01T00:00:00Z".to_owned();
                 (Some(epoch.clone()), Some(epoch))
             }
-            Some(tq) => match tq.timerel.as_str() {
-                "before" => (None, Some(tq.time_at.clone())),
-                "after" => (Some(tq.time_at.clone()), None),
-                "between" => (Some(tq.time_at.clone()), tq.end_time_at.clone()),
-                _ => (None, None),
+            Some(tq) => match tq.timerel {
+                crate::temporalq::Timerel::Before => (None, Some(tq.time_at.clone())),
+                crate::temporalq::Timerel::After => (Some(tq.time_at.clone()), None),
+                crate::temporalq::Timerel::Between => {
+                    (Some(tq.time_at.clone()), tq.end_time_at.clone())
+                }
+                crate::temporalq::Timerel::Any => (None, None),
             },
             None => (None, None),
         };

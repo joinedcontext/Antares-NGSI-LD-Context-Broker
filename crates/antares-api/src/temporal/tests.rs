@@ -817,7 +817,7 @@ mod clause_4_5_19 {
             "2020-03-15T00:00:00Z",
         ]);
         let tq = TemporalQ {
-            timerel: "before".to_owned(),
+            timerel: crate::temporalq::Timerel::Before,
             time_at: "2020-04-01T00:00:00Z".to_owned(),
             end_time_at: None,
             timeproperty: "observedAt".to_owned(),
@@ -873,7 +873,7 @@ mod clause_4_5_19 {
         // data supplies it). The period must not run backwards.
         assert_eq!(
             one(&TemporalQ {
-                timerel: "before".to_owned(),
+                timerel: crate::temporalq::Timerel::Before,
                 time_at: "2030-01-01T00:00:00Z".to_owned(),
                 end_time_at: None,
                 timeproperty: "observedAt".to_owned(),
@@ -885,7 +885,7 @@ mod clause_4_5_19 {
         // not the last instant the data happens to hold.
         assert_eq!(
             one(&TemporalQ {
-                timerel: "between".to_owned(),
+                timerel: crate::temporalq::Timerel::Between,
                 time_at: "2020-09-01T12:00:00Z".to_owned(),
                 end_time_at: Some("2020-09-01T13:00:00Z".to_owned()),
                 timeproperty: "observedAt".to_owned(),
@@ -896,7 +896,7 @@ mod clause_4_5_19 {
         // after: timeAt STARTS the range, the data closes it.
         assert_eq!(
             one(&TemporalQ {
-                timerel: "after".to_owned(),
+                timerel: crate::temporalq::Timerel::After,
                 time_at: "2020-01-01T00:00:00Z".to_owned(),
                 end_time_at: None,
                 timeproperty: "observedAt".to_owned(),
@@ -911,7 +911,7 @@ mod clause_4_5_19 {
     async fn a_mixed_period_steps_by_both_components() {
         let w = windowed(&["2020-01-01T06:00:00Z", "2020-02-02T06:00:00Z"]);
         let tq = TemporalQ {
-            timerel: "after".to_owned(),
+            timerel: crate::temporalq::Timerel::After,
             time_at: "2020-01-01T00:00:00Z".to_owned(),
             end_time_at: None,
             timeproperty: "observedAt".to_owned(),
