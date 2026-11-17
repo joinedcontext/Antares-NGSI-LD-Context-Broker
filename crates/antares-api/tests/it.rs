@@ -28,6 +28,7 @@ mod csource_subscription_ignored_members;
 mod csource_tenant_in_csi_9_5_1;
 mod csource_tenant_stall_5_9_2;
 mod csr_attribute_names_9_4_2;
+mod csr_credentials_masked_5_10;
 mod dataset_none_4_5_5_1;
 mod dead_letters;
 mod discovery;

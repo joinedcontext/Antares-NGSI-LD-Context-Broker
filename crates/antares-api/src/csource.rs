@@ -1103,13 +1103,9 @@ pub async fn retrieve_registration(
             .filter(|d| !reg_expired(d))
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("registration {id} not found")))?;
         let sys = sys_attrs_asked(&params);
-        Ok::<_, ApiError>(respond(
-            StatusCode::OK,
-            present_registration(&doc, &ctx, sys),
-            &ctx,
-            accept,
-            &tenant,
-        ))
+        let mut shown = present_registration(&doc, &ctx, sys);
+        crate::registry::mask_registration(&mut shown);
+        Ok::<_, ApiError>(respond(StatusCode::OK, shown, &ctx, accept, &tenant))
     };
     go.await.unwrap_or_else(|e| e.into_response())
 }
@@ -1296,6 +1292,7 @@ pub async fn query_registrations(
             .iter()
             .map(|d| {
                 let mut r = present_registration(d, &ctx, sys);
+                crate::registry::mask_registration(&mut r);
                 if let Some(o) = r.as_object_mut() {
                     o.retain(|k, _| {
                         pick.as_ref().is_none_or(|p| p.contains(&k.as_str()))
@@ -1426,7 +1423,7 @@ pub async fn update_registration(
             "fragment must be a JSON object".into(),
         ))?;
         gate!(st, &tenant, &headers, "5.9.3", ids: &[&id]).await?;
-        let norm = normalize_registration(obj, &parsed.ctx, true)?;
+        let mut norm = normalize_registration(obj, &parsed.ctx, true)?;
         let ts = now_iso();
         // The 5.9.3.4 re-checks below read the registration set that the
         // mutate then writes — the pair is atomic or a concurrent write can
@@ -1435,6 +1432,7 @@ pub async fn update_registration(
             let _serialized = registration_write_lock(&tenant).await;
             let before = take_live_registration(&st, &tenant, &id).await?;
             if let Some(prev) = before.as_ref().and_then(Value::as_object) {
+                crate::registry::keep_masked_registration(&mut norm, prev)?;
                 // validate the post-merge document (4.3.6.3) BEFORE mutating:
                 // a patch may flip the mode or rewrite information
                 let mut merged = prev.clone();

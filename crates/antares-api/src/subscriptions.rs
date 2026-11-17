@@ -768,7 +768,7 @@ pub(crate) fn mask_receiver_info(notification: &mut Map<String, Value>) {
 
 /// The endpoint URI with its userinfo replaced by [`MASKED`]; `None` when it
 /// carries none.
-fn masked_uri(uri: &str) -> Option<String> {
+pub(crate) fn masked_uri(uri: &str) -> Option<String> {
     let bare = antares_notifier::redact_userinfo(uri);
     if bare == uri {
         return None;
