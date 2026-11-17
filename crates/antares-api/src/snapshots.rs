@@ -1242,7 +1242,7 @@ pub async fn purge_snapshots(
             .list(&tenant, Kind::Snapshot)
             .await?
             .into_iter()
-            .filter(|meta| is_snapshot(meta) && crate::registry::csf_matches(&ast, meta, &ctx))
+            .filter(|meta| is_snapshot(meta) && purge_q_matches(&ast, meta, &ctx))
             .collect();
         for meta in victims {
             if let Some(id) = meta.get("id").and_then(Value::as_str) {
@@ -1634,6 +1634,26 @@ async fn scoped(
 /// full pages per snapshot; beyond it the query reports TooManyResults.
 fn fill_cap(st: &AppState) -> usize {
     st.max_limit.saturating_mul(100)
+}
+
+/// 5.16.7.4: the purge `q` over one Snapshot's members, each a Property of
+/// a pseudo-Entity, the timestamps among them: the registration csf wrapper
+/// drops `createdAt`/`modifiedAt` (a registration filters on its own Context
+/// Source Properties), which left a purge by age matching nothing.
+fn purge_q_matches(q: &antares_ql::QNode, meta: &Value, ctx: &antares_jsonld::Context) -> bool {
+    let Some(obj) = meta.as_object() else {
+        return false;
+    };
+    let mut pseudo = serde_json::Map::new();
+    pseudo.insert("id".into(), obj.get("id").cloned().unwrap_or(Value::Null));
+    pseudo.insert("type".into(), json!(["Snapshot"]));
+    for (k, v) in obj {
+        if k == "id" || k == "type" || k.starts_with("__") {
+            continue;
+        }
+        pseudo.insert(ctx.expand_key(k), json!([{"type": "Property", "value": v}]));
+    }
+    antares_ql::eval::eval_q(q, &Value::Object(pseudo), ctx, &|_| None)
 }
 
 /// 5.16.1.4 + 5.5.15: the copied data is reachable only through its snapshot
