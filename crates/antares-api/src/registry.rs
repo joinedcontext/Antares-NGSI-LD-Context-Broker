@@ -448,7 +448,10 @@ pub fn csr_matches_subscription(sub: &Value, reg: &Value, ctx: &Context) -> bool
 }
 
 /// Build the 5.12 spec for a csource subscription (5.11.2.4): entities
-/// selectors + watchedAttributes ∪ notification.attributes.
+/// selectors + watchedAttributes ∪ notification.attributes. 5.11.7: "If
+/// either the watched Attributes or the Attributes in the notification are
+/// not present or of length 0, all possible Attributes … match", so the
+/// attribute dimension restricts only when both name Attributes.
 pub fn spec_for_subscription(sub: &Value) -> CsrSpec {
     let mut spec = CsrSpec::default();
     if let Some(es) = sub.get("entities").and_then(Value::as_array) {
@@ -485,24 +488,20 @@ pub fn spec_for_subscription(sub: &Value) -> CsrSpec {
             spec.id_pattern = Some(patterns.join("|")).filter(|p| !p.is_empty());
         }
     }
-    let mut attrs: Vec<String> = sub
-        .get("watchedAttributes")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(na) = sub
-        .get("notification")
-        .and_then(|n| n.get("attributes"))
-        .and_then(Value::as_array)
-    {
-        attrs.extend(na.iter().filter_map(Value::as_str).map(str::to_owned));
-    }
-    if !attrs.is_empty() {
+    let names = |v: Option<&Value>| -> Vec<String> {
+        v.and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut attrs = names(sub.get("watchedAttributes"));
+    let notified = names(sub.get("notification").and_then(|n| n.get("attributes")));
+    if !attrs.is_empty() && !notified.is_empty() {
+        attrs.extend(notified);
         spec.attrs = Some(attrs);
     }
     spec
@@ -654,6 +653,38 @@ mod tests {
         assert!(
             !csr_matches_subscription(&sub(Some("operationSpace")), &reg, &ctx),
             "a member the registration lacks matches nothing"
+        );
+    }
+
+    /// 5.11.7: the attributes restrict the match only when both the watched
+    /// Attributes and the notification's name some; otherwise every
+    /// Attribute of a fitting registration matches.
+    #[test]
+    fn watched_attributes_alone_do_not_restrict_the_registration_match() {
+        let ctx = Loader::new().core();
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:color",
+            "type": "ContextSourceRegistration",
+            "information": [{
+                "entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Car"}],
+                "propertyNames": ["https://uri.etsi.org/ngsi-ld/default-context/color"]
+            }],
+            "endpoint": "http://a.example.com"
+        });
+        let watched = json!({"entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Car"}],
+            "watchedAttributes": ["https://uri.etsi.org/ngsi-ld/default-context/speed"]});
+        assert!(spec_for_subscription(&watched).attrs.is_none());
+        assert!(
+            csr_matches_subscription(&watched, &reg, &ctx),
+            "no notification attributes: every Attribute matches"
+        );
+        let both = json!({"entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Car"}],
+            "watchedAttributes": ["https://uri.etsi.org/ngsi-ld/default-context/speed"],
+            "notification": {"attributes": ["https://uri.etsi.org/ngsi-ld/default-context/brand"]}});
+        assert_eq!(spec_for_subscription(&both).attrs.map(|a| a.len()), Some(2));
+        assert!(
+            !csr_matches_subscription(&both, &reg, &ctx),
+            "both name Attributes, none of them the registered one"
         );
     }
 
