@@ -264,3 +264,31 @@ async fn per_entity_delete_forwards_run_concurrently() {
     assert_eq!(seen.lock().unwrap().len(), ids.len());
     assert!(took < delay * 3, "took {took:?} for {} forwards", ids.len());
 }
+
+/// 5.7.2: the POST query reads one page from the store, as its GET twin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_post_query_reads_one_page_from_the_store() {
+    let mut st = state();
+    for i in 0..3 {
+        create(
+            &st,
+            serde_json::json!({"id": format!("urn:ngsi-ld:Vehicle:p{i}"), "type": "Vehicle"}),
+        )
+        .await;
+    }
+    let double = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = double.clone();
+    let (status, body) = json(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query?limit=1",
+        r#"{"type":"Query","entities":[{"type":"Vehicle"}]}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        double.unpaged_queries(),
+        0,
+        "the store was asked for every match"
+    );
+}
