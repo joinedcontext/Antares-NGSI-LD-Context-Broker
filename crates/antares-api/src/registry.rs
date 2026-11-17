@@ -204,16 +204,17 @@ pub(crate) fn temporal_interval_matches(doc: &Value, tq: &crate::temporalq::Temp
     let dt = antares_model::dt_key;
     let start = dt(iv.get("startAt").and_then(Value::as_str).unwrap_or(""));
     let end = iv.get("endAt").and_then(Value::as_str).map(dt); // open-ended when absent
-    match tq.timerel.as_str() {
+    match tq.timerel {
         // interval contains times before/after timeAt (037_09, 047_10/11)
-        "before" => start < dt(&tq.time_at),
-        "after" => end.is_none_or(|e| e > dt(&tq.time_at)),
-        "between" => {
+        crate::temporalq::Timerel::Before => start < dt(&tq.time_at),
+        crate::temporalq::Timerel::After => end.is_none_or(|e| e > dt(&tq.time_at)),
+        crate::temporalq::Timerel::Between => {
             // overlap between [timeAt, endTimeAt] and the interval
             let qe = dt(tq.end_time_at.as_deref().unwrap_or(&tq.time_at));
             dt(&tq.time_at) <= end.unwrap_or_else(|| "9999".into()) && qe >= start
         }
-        _ => true,
+        // a bare timeproperty names no interval to compare
+        crate::temporalq::Timerel::Any => true,
     }
 }
 
@@ -403,7 +404,9 @@ pub fn csr_matches_subscription(sub: &Value, reg: &Value, ctx: &Context) -> bool
                 }
             }
             if let Ok(Some(t)) = crate::temporalq::TemporalQ::from_params(&params, false) {
-                if t.timerel != "any" && !temporal_interval_matches(reg, &t) {
+                if t.timerel != crate::temporalq::Timerel::Any
+                    && !temporal_interval_matches(reg, &t)
+                {
                     return false;
                 }
             }

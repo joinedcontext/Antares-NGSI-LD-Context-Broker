@@ -8,9 +8,45 @@ use antares_model::{dt_key, NgsiError};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// 4.11 `timerel`, and `Any` for a request naming only a `timeproperty`
+/// (every instance carrying it). Matched exhaustively wherever it is read,
+/// so a relation added here cannot silently select nothing elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Timerel {
+    Before,
+    After,
+    Between,
+    Any,
+}
+
+impl Timerel {
+    /// The 4.11 value a client writes; `None` for anything else.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            "between" => Some(Self::Between),
+            _ => None,
+        }
+    }
+
+    /// The parameter value (`"any"` for [`Timerel::Any`]), as the store
+    /// filter and forwarded requests carry it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+            Self::Between => "between",
+            Self::Any => "any",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TemporalQ {
-    pub timerel: String,
+    pub timerel: Timerel,
     pub time_at: String,
     pub end_time_at: Option<String>,
     pub timeproperty: String,
@@ -41,7 +77,7 @@ impl TemporalQ {
                     return Err(bad(format!("invalid timeproperty {tp:?}")));
                 }
                 return Ok(Some(Self {
-                    timerel: "any".into(),
+                    timerel: Timerel::Any,
                     time_at: String::new(),
                     end_time_at: None,
                     timeproperty: tp.clone(),
@@ -49,9 +85,9 @@ impl TemporalQ {
             }
             return Ok(None);
         };
-        if !["before", "after", "between"].contains(&timerel.as_str()) {
+        let Some(timerel) = Timerel::parse(timerel) else {
             return Err(bad(format!("invalid timerel {timerel:?}")));
-        }
+        };
         let time_at = params
             .get("timeAt")
             .filter(|s| parse_datetime(s))
@@ -62,7 +98,7 @@ impl TemporalQ {
             Some(_) => return Err(bad("endTimeAt must be a valid ISO 8601 DateTime".into())),
             None => None,
         };
-        if timerel == "between" && end_time_at.is_none() {
+        if timerel == Timerel::Between && end_time_at.is_none() {
             return Err(bad("timerel=between requires endTimeAt (4.11)".into()));
         }
         let timeproperty = params
@@ -74,7 +110,7 @@ impl TemporalQ {
             return Err(bad(format!("invalid timeproperty {timeproperty:?}")));
         }
         Ok(Some(Self {
-            timerel: timerel.clone(),
+            timerel,
             time_at,
             end_time_at,
             timeproperty,
@@ -90,15 +126,14 @@ impl TemporalQ {
         // equal instants written with different 4.6.3 fraction forms
         // ("…00Z" / "…00.000Z" / "…00,5Z") hit the bounds exactly.
         let t = dt_key(t);
-        match self.timerel.as_str() {
-            "any" => true, // bare timeproperty: presence is the filter
-            "before" => t < dt_key(&self.time_at),
-            "after" => t >= dt_key(&self.time_at),
-            "between" => {
+        match self.timerel {
+            Timerel::Any => true, // bare timeproperty: presence is the filter
+            Timerel::Before => t < dt_key(&self.time_at),
+            Timerel::After => t >= dt_key(&self.time_at),
+            Timerel::Between => {
                 t >= dt_key(&self.time_at)
                     && self.end_time_at.as_deref().is_some_and(|e| t < dt_key(e))
             }
-            _ => false,
         }
     }
 }
@@ -107,6 +142,19 @@ impl TemporalQ {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 4.11: the three relations parse, anything else (and "any", which no
+    /// client may write) does not, and each spells back as written.
+    #[test]
+    fn timerel_parses_only_the_three_relations() {
+        for t in [Timerel::Before, Timerel::After, Timerel::Between] {
+            assert_eq!(Timerel::parse(t.as_str()), Some(t));
+        }
+        for bad in ["any", "during", "Before", ""] {
+            assert_eq!(Timerel::parse(bad), None, "{bad}");
+        }
+        assert_eq!(Timerel::Any.as_str(), "any");
+    }
 
     fn tq(timerel: &str, time_at: &str, end: Option<&str>) -> TemporalQ {
         let mut p = HashMap::new();

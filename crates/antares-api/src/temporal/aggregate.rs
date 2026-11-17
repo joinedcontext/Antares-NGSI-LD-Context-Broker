@@ -291,14 +291,14 @@ fn whole_range(times: &Rows<'_>, tq: Option<&TemporalQ>) -> Option<Bucket> {
     let last = last_at
         .checked_add_signed(chrono::Duration::seconds(1))
         .unwrap_or(last_at);
-    Some(match tq {
-        Some(q) if q.timerel == "before" => (first, at(&q.time_at).unwrap_or(last)),
-        Some(q) if q.timerel == "between" => (
+    Some(match tq.map(|q| (q.timerel, q)) {
+        Some((crate::temporalq::Timerel::Before, q)) => (first, at(&q.time_at).unwrap_or(last)),
+        Some((crate::temporalq::Timerel::Between, q)) => (
             at(&q.time_at).unwrap_or(first),
             q.end_time_at.as_deref().and_then(at).unwrap_or(last),
         ),
-        Some(q) if q.timerel == "after" => (at(&q.time_at).unwrap_or(first), last),
-        _ => (first, last),
+        Some((crate::temporalq::Timerel::After, q)) => (at(&q.time_at).unwrap_or(first), last),
+        Some((crate::temporalq::Timerel::Any, _)) | None => (first, last),
     })
 }
 

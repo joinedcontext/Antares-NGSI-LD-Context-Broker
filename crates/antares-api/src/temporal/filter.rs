@@ -117,8 +117,13 @@ pub(super) fn page_attrs(
 /// The instant a window read oldest first starts at: `timeAt` of `after`
 /// and `between`; `before` and no window start at the beginning of time.
 pub(super) fn range_start(tq: Option<&TemporalQ>) -> Option<&str> {
-    tq.filter(|t| matches!(t.timerel.as_str(), "after" | "between"))
-        .map(|t| t.time_at.as_str())
+    tq.filter(|t| {
+        matches!(
+            t.timerel,
+            crate::temporalq::Timerel::After | crate::temporalq::Timerel::Between
+        )
+    })
+    .map(|t| t.time_at.as_str())
 }
 
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
@@ -349,14 +354,14 @@ pub(super) fn scope_window_retain(
         .map(|(s, e)| (dt_key(&s), e.as_deref().map(dt_key)))
         .collect();
     let (wstart, wend) = match tq {
-        Some(t) => match t.timerel.as_str() {
-            "before" => (None, Some(dt_key(&t.time_at))),
-            "after" => (Some(dt_key(&t.time_at)), None),
-            "between" => (
+        Some(t) => match t.timerel {
+            crate::temporalq::Timerel::Before => (None, Some(dt_key(&t.time_at))),
+            crate::temporalq::Timerel::After => (Some(dt_key(&t.time_at)), None),
+            crate::temporalq::Timerel::Between => (
                 Some(dt_key(&t.time_at)),
                 t.end_time_at.as_deref().map(dt_key),
             ),
-            _ => (None, None),
+            crate::temporalq::Timerel::Any => (None, None),
         },
         None => (None, None),
     };
