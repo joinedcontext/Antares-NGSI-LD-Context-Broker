@@ -1432,7 +1432,16 @@ async fn lookup_joined(
     }
     walk.budget = walk.budget.saturating_sub(1);
     let child = &slot.child;
-    let local = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+    // a store failure truncates the join (4.5.23 warning), never reads as a
+    // dangling link
+    let local = match st.store.get(tenant, Kind::Entity, id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!("join lookup of a linked entity failed: {e}");
+            walk.complete = false;
+            return None;
+        }
+    };
     let target = match local {
         Some(t) => t,
         None => remote_target(st, tenant, ctx, slot, id, walk).await?,
@@ -1629,10 +1638,15 @@ async fn collect_flat_walk(
                             return;
                         }
                         walk.budget = walk.budget.saturating_sub(1);
-                        let Some(target) =
-                            st.store.get(tenant, Kind::Entity, id).await.ok().flatten()
-                        else {
-                            continue;
+                        let target = match st.store.get(tenant, Kind::Entity, id).await {
+                            Ok(Some(target)) => target,
+                            Ok(None) => continue,
+                            // a store failure truncates the join (4.5.23)
+                            Err(e) => {
+                                tracing::warn!("join lookup of a linked entity failed: {e}");
+                                walk.complete = false;
+                                continue;
+                            }
                         };
                         if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target)
                             .await
