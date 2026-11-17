@@ -375,12 +375,15 @@ pub fn ctx_link_url(headers: &HeaderMap, source: &Value) -> String {
         // 5.5.7/6.3.5 fidelity: an inline @context has no dereferenceable
         // URL — serialize it so forward() can embed it in the body as
         // application/ld+json instead of dropping the term mappings.
-        Value::Array(a) if a.iter().any(|e| !e.is_string()) => {
+        // An array of several URLs is inline as well: a Link names ONE
+        // @context (6.3.5), so naming only the first would expand the
+        // remaining terms to other IRIs at the Context Source.
+        Value::Array(a) if a.len() > 1 || a.iter().any(|e| !e.is_string()) => {
             serde_json::to_string(source).unwrap_or_else(|_| antares_jsonld::CORE_CONTEXT.into())
         }
         Value::Array(a) => a
-            .iter()
-            .find_map(|e| e.as_str())
+            .first()
+            .and_then(Value::as_str)
             .unwrap_or(antares_jsonld::CORE_CONTEXT)
             .to_owned(),
         Value::Object(_) => {
@@ -3420,6 +3423,24 @@ pub fn strip_proxied(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 6.3.5: a Link carries one @context, so an array of several URLs
+    /// travels whole (in the body), never as its first URL alone.
+    #[test]
+    fn multi_url_context_is_not_truncated() {
+        let src = json!([
+            "https://a.example/one.jsonld",
+            "https://b.example/two.jsonld"
+        ]);
+        let url = ctx_link_url(&HeaderMap::new(), &src);
+        assert!(url.contains("two.jsonld"), "second @context dropped: {url}");
+        assert!(url.starts_with('['), "not carried inline: {url}");
+        let one = json!(["https://a.example/one.jsonld"]);
+        assert_eq!(
+            ctx_link_url(&HeaderMap::new(), &one),
+            "https://a.example/one.jsonld"
+        );
+    }
 
     fn hdrs(via: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();
