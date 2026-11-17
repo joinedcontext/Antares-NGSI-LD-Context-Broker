@@ -136,9 +136,19 @@ fn norm_notification(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
     ] {
         nn.remove(k);
     }
-    if let Some(f) = n.get("format").and_then(Value::as_str) {
-        if !["normalized", "keyValues", "simplified", "concise"].contains(&f) {
-            return Err(bad(format!("invalid notification format {f:?}")));
+    if let Some(f) = n.get("format") {
+        if !f
+            .as_str()
+            .is_some_and(|f| ["normalized", "keyValues", "simplified", "concise"].contains(&f))
+        {
+            return Err(bad(format!("invalid notification format {f}")));
+        }
+    }
+    // Table 5.2.14.1-1: attributes, pick and omit are arrays; any other
+    // shape would be read as absent at delivery and notify every Attribute
+    for key in ["attributes", "pick", "omit"] {
+        if n.get(key).is_some_and(|v| !v.is_array()) {
+            return Err(bad(format!("notification.{key} must be an array (5.2.14)")));
         }
     }
     // Table 5.2.14.1-1 p.120: "showChanges cannot be true in case
@@ -564,7 +574,32 @@ fn norm_member(
             }
             out.insert(k.to_owned(), v.clone());
         }
-        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext" | "datasetId" => {
+        // Table 5.2.12-1: Strings. A non-string stored here is read as an
+        // absent member at delivery (lang would filter nothing), so the
+        // Subscription would silently do something other than written.
+        "lang" | "subscriptionName" | "description" => {
+            if !v.is_string() {
+                return Err(bad(format!("{k} must be a string (5.2.12)")));
+            }
+            out.insert(k.to_owned(), v.clone());
+        }
+        // Table 5.2.12-1: String[], valid URIs or "@none" (4.5.5).
+        "datasetId" => {
+            let ok = v.as_array().is_some_and(|a| {
+                a.iter().all(|d| {
+                    d.as_str()
+                        .is_some_and(|d| d == "@none" || antares_model::EntityId::new(d).is_ok())
+                })
+            });
+            if !ok {
+                return Err(bad(
+                    "datasetId must be an array of URIs or \"@none\" (5.2.12)".into(),
+                ));
+            }
+            out.insert(k.to_owned(), v.clone());
+        }
+        // jsonldContext is checked against the loader in check_jsonld_context
+        "name" | "jsonldContext" => {
             out.insert(k.to_owned(), v.clone());
         }
         // tolerant reader: keep unknown members
@@ -1916,6 +1951,45 @@ mod tests {
             }
             let v = json!("category,brandName");
             let out = norm(&sub(json!({member: v.clone()}))).expect("a String is accepted");
+            assert_eq!(out[member], v, "{member} is stored as given");
+        }
+    }
+
+    /// Table 5.2.12-1 / 5.2.14.1-1: a member of the wrong type is refused
+    /// at creation rather than stored and read as absent at delivery.
+    #[test]
+    fn clause_5_2_12_typed_members_refuse_another_type() {
+        let ep = json!({"uri": "http://localhost:1111/notify"});
+        for (member, v) in [
+            ("lang", json!(5)),
+            ("subscriptionName", json!(["x"])),
+            ("description", json!({})),
+            ("datasetId", json!("urn:ngsi-ld:Dataset:a")),
+            ("datasetId", json!(["not a uri"])),
+            ("datasetId", json!([7])),
+            ("notification", json!({"endpoint": ep, "format": 7})),
+            (
+                "notification",
+                json!({"endpoint": ep, "attributes": "speed"}),
+            ),
+            ("notification", json!({"endpoint": ep, "pick": "speed"})),
+            (
+                "notification",
+                json!({"endpoint": ep, "omit": {"speed": 1}}),
+            ),
+        ] {
+            assert!(
+                norm(&sub(json!({member: v.clone()}))).is_err(),
+                "{member}: {v} is refused (5.2.12)"
+            );
+        }
+        for (member, v) in [
+            ("lang", json!("fr")),
+            ("subscriptionName", json!("one")),
+            ("description", json!("two")),
+            ("datasetId", json!(["urn:ngsi-ld:Dataset:a", "@none"])),
+        ] {
+            let out = norm(&sub(json!({member: v.clone()}))).expect("accepted");
             assert_eq!(out[member], v, "{member} is stored as given");
         }
     }
