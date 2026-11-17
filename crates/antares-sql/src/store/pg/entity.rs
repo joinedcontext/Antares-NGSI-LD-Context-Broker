@@ -827,7 +827,7 @@ impl PgEntityStore {
             incarnation: r.get(0),
             version: 1,
         });
-        if created.is_some() && self.outbox_on() {
+        if let (Some(v), true) = (&created, self.outbox_on()) {
             enqueue_change(
                 &mut tx,
                 tenant,
@@ -836,8 +836,8 @@ impl PgEntityStore {
                 &e.types,
                 None,
                 Some(doc),
-                1,
-                &e.created,
+                v.version,
+                &v.incarnation,
             )
             .await?;
         }
@@ -1077,7 +1077,7 @@ impl PgEntityStore {
                     &types,
                     Some(&prev),
                     None,
-                    r.get::<i64, _>(2),
+                    deleted_version(r).version,
                     r.get::<&str, _>(3),
                 )
                 .await?;
@@ -1147,7 +1147,7 @@ impl PgEntityStore {
                 &types,
                 Some(&prev),
                 None,
-                r.get::<i64, _>(2),
+                deleted_version(r).version,
                 r.get::<&str, _>(3),
             )
             .await?;
@@ -1815,7 +1815,10 @@ impl PgEntityStore {
             let mut seen_ev = std::collections::HashSet::new();
             let mut events = Vec::new();
             for (id, doc) in items {
-                if created_now.contains_key(id.as_str()) && seen_ev.insert(id.as_str()) {
+                let Some(incarnation) = created_now.get(id.as_str()) else {
+                    continue;
+                };
+                if seen_ev.insert(id.as_str()) {
                     let e = extract(doc);
                     events.push(change_event(
                         tenant,
@@ -1825,7 +1828,7 @@ impl PgEntityStore {
                         None,
                         Some(doc),
                         1,
-                        &e.created,
+                        incarnation,
                     ));
                 }
             }
@@ -1897,7 +1900,7 @@ impl PgEntityStore {
                         &types,
                         Some(&prev),
                         None,
-                        r.get::<i64, _>(3),
+                        r.get::<i64, _>(3).saturating_add(1),
                         r.get::<&str, _>(4),
                     )
                 })
