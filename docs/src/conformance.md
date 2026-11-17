@@ -241,6 +241,37 @@ dev/etsi-baseline.py write results/postgres-etsi conformance/etsi-baseline/postg
 
 It keeps the reason and note of every TP already listed and writes
 `our-bug  unclassified` for a new one, which is then classified by hand.
+It refuses a run in which a robot invocation left no `output.xml`.
+
+A cell without a baseline reports `NOBASELINE` and gates nothing. Its
+baseline comes from its first full CI run, not from a local one, so it is
+taken on the runner, image and store the gate later judges:
+
+1. Dispatch the full preset on `dev` (Actions, `full`, Run workflow,
+   release empty) and let the matrix finish.
+2. Download the run's bundle, which holds one `ETSI-upstream-cell-<cell>/`
+   per cell with its `tp-status.csv` and `etsi-upstream.txt`:
+
+   ```bash
+   gh run download <run-id> -n ETSI-matrix-results -D /tmp/etsi-full
+   for cell in memory file timescale postgres-nats timescale-nats wasm-file; do
+     dev/etsi-baseline.py write "/tmp/etsi-full/ETSI-upstream-cell-$cell" \
+       "conformance/etsi-baseline/$cell.txt"
+   done
+   ```
+
+   A cell whose `etsi-upstream.txt` says `skipped` (forge was unreachable)
+   has nothing to write; take it from the next run.
+3. Classify every `our-bug  unclassified` line: keep `our-bug` for a
+   broker defect, or give `suite-bug`, `newer-spec` or `env` with the
+   note that justifies it. When unsure, `our-bug` with a one-line note.
+4. Commit each cell's file on its own, naming the upstream commit it was
+   taken at. From the next run on, that cell gates.
+
+`postgres` takes its baseline from a local run (`TESTSUITE=both
+STORE=postgres`) when one is made first, and from the same bundle
+otherwise. Cells differ on purpose (`wasm-file` runs without MQTT, the `-nats` cells
+on a rolling fleet), so one cell's file is never copied to another.
 
 ### Running both locally
 
