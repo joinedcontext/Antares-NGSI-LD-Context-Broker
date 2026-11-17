@@ -784,6 +784,19 @@ async fn build_drivers(
                 as std::sync::Arc<dyn antares_store::TemporalDriver>,
             None,
         ),
+        // Both Postgres modes read ANTARES_DATABASE_URL: the "second" store
+        // is the same database. A second pool doubled the connections, ran
+        // the migrations twice and a second maintenance job on it; the
+        // store's own instance records the history instead, once the
+        // database has the shape the history mode asks for.
+        TemporalChoice::Second(name) if shared_state(store_name) && shared_state(&name) => {
+            if let (Ok(mode), Some((_, backend))) =
+                (name.parse::<antares_sql::StoreMode>(), maintenance.first())
+            {
+                check_temporal_shape(mode, *backend)?;
+            }
+            (built.temporal.clone(), Some(name))
+        }
         TemporalChoice::Second(name) => {
             let second = build_store(&name, true).await?;
             maintenance.extend(second.maintenance);
@@ -800,6 +813,26 @@ async fn build_drivers(
         maintenance,
         temporal_name,
     })
+}
+
+/// Never silently fall back: timescale mode on a database that is not
+/// hypertable-shaped is a config error, not a downgrade (the extension was
+/// missing at first boot, or installed only after the migrations ran).
+fn check_temporal_shape(
+    mode: antares_sql::StoreMode,
+    backend: antares_sql::store::pg::maintenance::TemporalBackend,
+) -> Result<(), String> {
+    use antares_sql::store::pg::maintenance::TemporalBackend;
+    if mode == antares_sql::StoreMode::Timescale && backend != TemporalBackend::Hypertable {
+        return Err(format!(
+            "timescale requested (ANTARES_STORE or ANTARES_TEMPORAL) but \
+             attr_instances is {backend:?} — the timescaledb extension was \
+             not CREATEd when the migrations first ran. Install it in a fresh \
+             database (CREATE EXTENSION timescaledb before first boot) or use \
+             postgres"
+        ));
+    }
+    Ok(())
 }
 
 /// The two storage seams a running broker holds, and what the maintenance
@@ -944,20 +977,7 @@ async fn build_builtin(
                             antares_sql::store::pg::maintenance::detect_temporal_backend(&pool)
                                 .await
                                 .map_err(|e| format!("ANTARES_STORE={mode}: {e}"))?;
-                        // Never silently fall back — timescale mode whose
-                        // database is not hypertable-shaped is a config error,
-                        // not a downgrade (extension missing at first boot, or
-                        // installed only after the migrations ran).
-                        if mode == StoreMode::Timescale && backend != TemporalBackend::Hypertable {
-                            return Err(format!(
-                                "timescale requested (ANTARES_STORE or ANTARES_TEMPORAL) but \
-                                 attr_instances is {backend:?} — the timescaledb extension was \
-                                 not CREATEd when the migrations first ran. Install it in a fresh \
-                                 database (CREATE EXTENSION timescaledb before first boot) or use \
-                                 postgres"
-                            )
-                            .into());
-                        }
+                        check_temporal_shape(mode, backend)?;
                         if mode == StoreMode::Postgres && backend == TemporalBackend::Hypertable {
                             tracing::info!(
                                 "attr_instances is a hypertable (migrations ran with \
@@ -1981,6 +2001,37 @@ mod driver_registry_tests {
             Ok(std::time::Duration::from_millis(250))
         );
         assert!(parse_header_read_timeout(Some("10s")).is_err());
+    }
+
+    /// postgres with timescale history (or the reverse) is one database,
+    /// both modes read ANTARES_DATABASE_URL: one pool and one maintenance
+    /// job serve it, not a second instance with its own.
+    #[tokio::test]
+    async fn two_postgres_modes_on_one_url_share_one_instance() {
+        let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = antares_sql::store::pg::connect(&url, 1)
+            .await
+            .expect("connect");
+        if antares_sql::store::pg::maintenance::detect_temporal_backend(&pool).await
+            != Ok(antares_sql::store::pg::maintenance::TemporalBackend::Hypertable)
+        {
+            eprintln!("SKIP: timescaledb extension not created in the test database");
+            return;
+        }
+        std::env::set_var("ANTARES_DATABASE_URL", &url);
+        let drivers = super::build_drivers("postgres", TemporalChoice::Second("timescale".into()))
+            .await
+            .expect("postgres with timescale history");
+        std::env::remove_var("ANTARES_DATABASE_URL");
+        assert_eq!(
+            drivers.maintenance.len(),
+            1,
+            "a second pool on the one database"
+        );
+        assert_eq!(drivers.temporal_name.as_deref(), Some("timescale"));
     }
 
     /// Under bus=nats every api pod records history: a per-process history
