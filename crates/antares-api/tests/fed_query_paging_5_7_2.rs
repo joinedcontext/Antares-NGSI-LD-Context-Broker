@@ -227,3 +227,48 @@ async fn a_source_is_asked_only_for_its_registered_types() {
         );
     }
 }
+
+/// 4.3.6.1 for Create EntityMap (5.14.4.4): the forward carries only the ids
+/// the registration can match and its own attribute scope, as a forwarded
+/// query does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entity_map_forward_is_narrowed_to_the_registration() {
+    antares_jsonld::allow_private_egress(true);
+    let st = AppState::new("antares1".into());
+    let (port, seen) = recording_source();
+    let reg = serde_json::json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:em-narrow",
+        "type": "ContextSourceRegistration",
+        "operations": ["createEntityMapQueryEntity"],
+        "information": [{
+            "entities": [{"type": "Vehicle", "id": "urn:ngsi-ld:Vehicle:1"}],
+            "propertyNames": ["speed"]
+        }],
+        "endpoint": format!("http://127.0.0.1:{port}"),
+    })
+    .to_string();
+    let (status, text, _) = call(&st, "POST", "/ngsi-ld/v1/csourceRegistrations", Some(reg)).await;
+    assert_eq!(status, 201, "{text}");
+    let (status, text, _) = call(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entityMaps?id=urn:ngsi-ld:Vehicle:1,urn:ngsi-ld:Vehicle:2&attrs=speed,brand",
+        None,
+    )
+    .await;
+    assert!(status < 300, "{status} {text}");
+    let lines = seen.lock().expect("lock").clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    // the request line carries the ids percent-encoded
+    assert!(lines[0].contains("Vehicle%3A1"), "{}", lines[0]);
+    assert!(
+        !lines[0].contains("Vehicle%3A2"),
+        "an id outside the registration: {}",
+        lines[0]
+    );
+    assert!(
+        !lines[0].contains("brand"),
+        "an attribute outside the registration: {}",
+        lines[0]
+    );
+}

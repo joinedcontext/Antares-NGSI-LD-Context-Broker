@@ -2685,8 +2685,20 @@ pub(crate) async fn fed_entity_maps(
     let fetched = fan_out(regs, move |reg| async move {
         let mut query: Vec<(String, String)> = Vec::new();
         query.extend(forward_types(&reg, ctx, params).map(|t| ("type".into(), t)));
+        // 4.3.6.1, as fed_query narrows them: only the ids this
+        // registration can match, and its own attribute scope
+        if let Some(ids) = params.get("id") {
+            let keep: Vec<&str> = ids
+                .split(',')
+                .map(str::trim)
+                .filter(|i| reg.can_match_id(i))
+                .collect();
+            if keep.is_empty() {
+                return (reg, 404, Value::Null);
+            }
+            query.push(("id".into(), keep.join(",")));
+        }
         for k in [
-            "id",
             "idPattern",
             "timerel",
             "timeAt",
@@ -2698,9 +2710,16 @@ pub(crate) async fn fed_entity_maps(
             }
         }
         query.extend(instance_cap(params));
-        if !split {
+        if let Some(a) = scope_attrs(&reg, ctx) {
+            query.push(a);
+        } else if let Some(a) = params.get("attrs").filter(|_| !split) {
+            query.push(("attrs".into(), a.clone()));
+        }
+        // q/scopeQ terms cannot be recompacted into a registered
+        // jsonldContext (4.3.6.6): they stay home there, as for split
+        // entities
+        if !split && !has_reg_context(&reg) {
             for k in [
-                "attrs",
                 "q",
                 "georel",
                 "geometry",
