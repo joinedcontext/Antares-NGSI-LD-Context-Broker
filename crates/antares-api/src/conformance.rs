@@ -75,7 +75,10 @@ fn amend_attr(v: &mut Value, ver: (u32, u32)) -> bool {
         // every instance carries instanceId — and Notes 2/3 do not cover it,
         // so its history survives intact instead of collapsing to one point.
         let temporal = instances.iter().any(|i| i.get("instanceId").is_some());
-        if ver < (1, 3) && !temporal {
+        // Only an array of Attribute instances is a multi-instance Attribute:
+        // a simplified body (keyValues, concise values) holds plain JSON
+        // arrays as values, which Notes 2/3 do not touch.
+        if ver < (1, 3) && !temporal && is_instance_list(instances) {
             let pick = instances
                 .iter()
                 .position(|i| i.get("datasetId").is_none())
@@ -85,6 +88,9 @@ fn amend_attr(v: &mut Value, ver: (u32, u32)) -> bool {
                 *v = one;
                 return true;
             }
+        }
+        if !temporal && !is_instance_list(instances) {
+            return false;
         }
         for i in instances.iter_mut() {
             changed |= amend_attr(i, ver);
@@ -201,6 +207,28 @@ fn amend_attr(v: &mut Value, ver: (u32, u32)) -> bool {
         }
     }
     changed
+}
+
+/// Whether every element is an Attribute instance: an object naming its
+/// type or carrying one of the value members of clause 5.2.5-5.2.38.
+fn is_instance_list(items: &[Value]) -> bool {
+    !items.is_empty()
+        && items.iter().all(|i| {
+            i.as_object().is_some_and(|o| {
+                [
+                    "type",
+                    "value",
+                    "object",
+                    "languageMap",
+                    "json",
+                    "vocab",
+                    "valueList",
+                    "objectList",
+                ]
+                .iter()
+                .any(|k| o.contains_key(*k))
+            })
+        })
 }
 
 /// Amend whatever entity-bearing payload shape a response carries.
@@ -850,5 +878,26 @@ mod prefer_layer {
             assert_eq!(applied, "ngsi-ld=1.9", "{asked}");
             assert_eq!(body, payload, "{asked}: the body is passed through");
         }
+    }
+
+    /// A plain JSON array value (keyValues, concise) is no multi-instance
+    /// Attribute: a 1.0 preference leaves it whole.
+    #[test]
+    fn a_plain_array_value_survives_a_1_0_preference() {
+        let mut doc = serde_json::json!({"id": "urn:ngsi-ld:T:1", "type": "T",
+            "coords": [1, 2, 3],
+            "loc": {"type": "Point", "coordinates": [[1, 2], [3, 4]]}});
+        let before = doc.clone();
+        assert!(!amend_payload(&mut doc, (1, 0)));
+        assert_eq!(doc, before);
+        // a normalized multi-instance Attribute still collapses
+        let mut doc = serde_json::json!({"id": "urn:ngsi-ld:T:1", "type": "T",
+            "a": [{"type": "Property", "value": 1, "datasetId": "urn:d"},
+                  {"type": "Property", "value": 2}]});
+        assert!(amend_payload(&mut doc, (1, 0)));
+        assert_eq!(
+            doc["a"],
+            serde_json::json!({"type": "Property", "value": 2})
+        );
     }
 }
