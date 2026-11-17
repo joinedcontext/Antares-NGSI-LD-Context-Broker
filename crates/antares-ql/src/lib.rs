@@ -369,6 +369,17 @@ fn parse_capped(input: &str, depth: usize, nodes: usize) -> Result<QNode, NgsiEr
 /// A float parse is much wider: `+5`, `01`, `.5`, `5.`, `NaN` and `inf` all
 /// come back as numbers from it and none of them is a Number here, so each
 /// would compare against a number where the term named text.
+/// Does `s` open with a URI scheme and its colon (RFC 3986 3.1: `ALPHA
+/// *( ALPHA / DIGIT / "+" / "-" / "." ) ":"`)? A dateTime opens with a digit.
+fn starts_with_scheme(s: &str) -> bool {
+    let Some((scheme, _)) = s.split_once(':') else {
+        return false;
+    };
+    let mut c = scheme.chars();
+    c.next().is_some_and(|f| f.is_ascii_alphabetic())
+        && c.all(|ch| ch.is_ascii_alphanumeric() || "+-.".contains(ch))
+}
+
 pub(crate) fn is_json_number(s: &str) -> bool {
     let s = s.strip_prefix('-').unwrap_or(s);
     let digits = |t: &str| t.bytes().take_while(u8::is_ascii_digit).count();
@@ -707,9 +718,14 @@ impl<'a> Parser<'a> {
         // the Range separator is looked for in this token only: across the
         // whole rest, every term rescanned the terms after it. A RegExp has
         // no Range form, and `..` is pattern text there (`n~=a..z`).
+        // 4.9 Range endpoints are ComparableValues (a Number, a quotedStr,
+        // a 4.6.3 date, time or dateTime), and a URI is none of them: a token
+        // that opens with an RFC 3986 3.1 scheme (`http:`, `urn:`) is one
+        // value, its `..` path segment (`http://a/b/../c`) included.
         let end = self
             .rest
             .get(..stop)
+            .filter(|token| !starts_with_scheme(token.trim_start()))
             .and_then(|token| token.find(".."))
             .filter(|_| !regexp)
             .unwrap_or(stop);
@@ -1094,6 +1110,27 @@ mod tests {
         assert!(parse_q("a>1..5").is_err());
         assert!(parse_q("a==true..false").is_err());
         assert!(parse_q("a==1..\"x\"").is_err(), "mixed-type endpoints");
+    }
+
+    /// A URI is no ComparableValue (4.9): its `..` path segment is part of
+    /// the one value, not a Range between two halves of it.
+    #[test]
+    fn unquoted_uri_with_dot_segments_is_one_value() {
+        for uri in ["http://a/b/../c", "urn:ngsi-ld:T:a..b"] {
+            let n = parse_q(&format!("ref=={uri}")).expect("parse");
+            assert!(
+                matches!(n, QNode::Cmp { value: QValue::Str(ref s), .. } if s == uri),
+                "{n:?}"
+            );
+        }
+        // negative: a dateTime Range still splits
+        assert!(matches!(
+            parse_q("observedAt==2021-01-01T00:00:00Z..2021-02-01T00:00:00Z").expect("parse"),
+            QNode::Cmp {
+                value: QValue::Range(_, _),
+                ..
+            }
+        ));
     }
 
     #[test]
