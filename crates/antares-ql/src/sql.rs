@@ -370,13 +370,37 @@ const MAX_PUSHED_PATTERN: usize = 128;
 /// never matches a newline, in Rust it does), POSIX `[:…:]` classes, inline
 /// flags `(?…)`, a NUL, and every pattern Rust itself refuses.
 /// `like_regex` without flags keeps `.` off newlines and `^`/`$` at the
-/// ends of the string, which are the crate's defaults.
+/// ends of the string, which are the crate's defaults. A quantifier with no
+/// atom to repeat is refused too: Postgres answers "quantifier operand
+/// invalid" for one at the start, after `(`, `|`, `^` or `$`, or after
+/// another quantifier (`a**`, `a+*`), where Rust reads it; only the `?`
+/// that makes a quantifier lazy may follow one.
 fn pushable_pattern(p: &str) -> bool {
     if p.is_empty() || p.len() > MAX_PUSHED_PATTERN || crate::regex::compile(p).is_err() {
         return false;
     }
+    /// What the previous token leaves for a quantifier to apply to.
+    enum Prev {
+        /// nothing: the start, `(`, `|`, `^`, `$`
+        NoOperand,
+        /// an atom a quantifier may repeat
+        Atom,
+        /// a quantifier, which a `?` may still make lazy
+        Quantifier,
+        /// a lazy quantifier: nothing may follow it
+        Lazy,
+    }
+    let mut prev = Prev::NoOperand;
     let mut chars = p.chars().peekable();
     while let Some(c) = chars.next() {
+        prev = match (c, &prev) {
+            ('*' | '+' | '?', Prev::NoOperand | Prev::Lazy) => return false,
+            ('?', Prev::Quantifier) => Prev::Lazy,
+            ('*' | '+', Prev::Quantifier) => return false,
+            ('*' | '+' | '?', Prev::Atom) => Prev::Quantifier,
+            ('(' | '|' | '^' | '$', _) => Prev::NoOperand,
+            _ => Prev::Atom,
+        };
         match c {
             '\\' | '{' | '}' | '\0' => return false,
             '(' if chars.peek() == Some(&'?') => return false,
@@ -695,6 +719,27 @@ mod tests {
             &"a".repeat(MAX_PUSHED_PATTERN + 1),
         ] {
             assert!(!pushable_pattern(p), "{p}");
+        }
+    }
+
+    /// A quantifier with nothing to repeat is an error to Postgres
+    /// ("quantifier operand invalid") where Rust reads it: such a pattern
+    /// stays in memory instead of failing the statement. The lazy `?` after
+    /// a quantifier is the one stacking both accept.
+    #[test]
+    fn stacked_quantifier_pattern_stays_in_memory() {
+        for p in ["a**", "a+*", "a*+", "^*", "$*", "a|*", "(*a)", "a*??"] {
+            if ::regex::Regex::new(p).is_ok() {
+                assert!(!pushable_pattern(p), "{p}");
+            }
+        }
+        assert!(
+            ::regex::Regex::new("a**").is_ok(),
+            "fixture: Rust accepts it"
+        );
+        assert!(!pushable_pattern("a**"));
+        for p in ["a*?", "a+?", "a??", "(a)*", "[ab]+", "x.*y"] {
+            assert!(pushable_pattern(p), "{p}");
         }
     }
 
