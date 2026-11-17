@@ -223,3 +223,30 @@ async fn a_flat_join_retrieve_as_geojson_keeps_every_entity() {
         .unwrap_or_default();
     assert_eq!(ids, ["urn:ngsi-ld:T:a", "urn:ngsi-ld:T:b"], "{body}");
 }
+
+/// 6.4.3.2: `scope` is an Entity member an orderBy names like `id`.
+#[tokio::test]
+async fn order_by_scope_orders_by_the_scope_member() {
+    let st = state();
+    for (n, scope) in [(1, "/c"), (2, "/a"), (3, "/b")] {
+        create(
+            &st,
+            &format!(r#"{{"id":"urn:ngsi-ld:T:s{n}","type":"T","scope":"{scope}"}}"#),
+        )
+        .await;
+    }
+    let req = Request::get("/ngsi-ld/v1/entities?type=T&orderBy=scope")
+        .body(Body::empty())
+        .expect("req");
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    let ids: Vec<&str> = body
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        ids,
+        ["urn:ngsi-ld:T:s2", "urn:ngsi-ld:T:s3", "urn:ngsi-ld:T:s1"]
+    );
+}

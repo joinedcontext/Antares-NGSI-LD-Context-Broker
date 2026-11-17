@@ -391,15 +391,18 @@ fn build_collator(tag: &str) -> Result<icu_collator::CollatorBorrowed<'static>, 
 }
 
 /// The expanded Attribute each key of an `orderBy` spec reads, as
-/// [`order_entities`] parses it; `id`, `type`, `createdAt` and `modifiedAt`
-/// are core members, no Attribute.
+/// [`order_entities`] parses it; `id`, `type`, `scope`, `createdAt` and
+/// `modifiedAt` are core members, no Attribute.
 pub(crate) fn order_heads(spec: &str, ctx: &antares_jsonld::Context) -> Vec<String> {
     spec.split(',')
         .filter_map(|part| {
             let member = part.trim().split(';').next()?.trim();
             let head = member.split('[').next()?.split('.').next()?;
-            (!matches!(head, "" | "id" | "type" | "createdAt" | "modifiedAt"))
-                .then(|| ctx.expand_key(head))
+            (!matches!(
+                head,
+                "" | "id" | "type" | "scope" | "createdAt" | "modifiedAt"
+            ))
+            .then(|| ctx.expand_key(head))
         })
         .collect()
 }
@@ -487,6 +490,12 @@ pub fn order_entities(
         let base = match head.as_str() {
             "id" | "createdAt" | "modifiedAt" => doc.get(head.as_str()).cloned(),
             "type" => doc["type"].as_array().and_then(|a| a.first()).cloned(),
+            // 6.4.3.2: scope is an Entity member, ordered by its first entry
+            // as `type` is
+            "scope" => match doc.get("scope")? {
+                Value::Array(a) => a.first().cloned(),
+                other => Some(other.clone()),
+            },
             _ => {
                 let iri = ctx.expand_key(head);
                 let inst = doc.get(&iri).and_then(Value::as_array)?.first()?;
