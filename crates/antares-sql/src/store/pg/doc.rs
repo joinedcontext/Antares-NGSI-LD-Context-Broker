@@ -625,11 +625,6 @@ impl PgDocStore {
             .transpose()
     }
 
-    /// Read-modify-write in ONE transaction under the row lock (the entity
-    /// pattern applied to doc kinds): `SELECT … FOR UPDATE` → apply → `UPDATE`.
-    /// A missing row returns `None` and is NEVER inserted — a concurrent
-    /// DELETE must win, not be resurrected by a bookkeeping writeback
-    /// (the 047_06 leftover-subscription bug).
     /// 5.2.14.2 delivery bookkeeping as ONE statement.
     ///
     /// The generic `mutate` takes an arbitrary closure, so it has to hold the
@@ -722,6 +717,11 @@ impl PgDocStore {
             .collect()
     }
 
+    /// Read-modify-write in ONE transaction under the row lock (the entity
+    /// pattern applied to doc kinds): `SELECT … FOR UPDATE` → apply → `UPDATE`.
+    /// A missing row returns `None` and is NEVER inserted — a concurrent
+    /// DELETE must win, not be resurrected by a bookkeeping writeback
+    /// (the 047_06 leftover-subscription bug).
     pub async fn mutate<T, E>(
         &self,
         tenant: &TenantId,

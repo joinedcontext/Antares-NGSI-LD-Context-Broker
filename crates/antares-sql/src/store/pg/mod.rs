@@ -22,11 +22,6 @@ use sqlx::{Postgres, Transaction};
 /// default — migrates on boot exactly as before.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-/// Is this connect failure a database whose migration history can never match
-/// this binary? A database still booting is worth waiting for; a history from
-/// another release is not, and a caller that retries it reports the timeout
-/// instead of the cause. Only the history errors are permanent: an execution
-/// failure can be a lock the next attempt gets.
 /// The filter values a stored text column can equal. PostgreSQL `text` holds
 /// no NUL, so a request string carrying one names nothing the store holds;
 /// binding it would raise `22021` and turn a query that matches nothing into
@@ -40,6 +35,11 @@ pub(crate) fn storable<S: AsRef<str>>(values: &[S]) -> Vec<String> {
         .collect()
 }
 
+/// Is this connect failure a database whose migration history can never match
+/// this binary? A database still booting is worth waiting for; a history from
+/// another release is not, and a caller that retries it reports the timeout
+/// instead of the cause. Only the history errors are permanent: an execution
+/// failure can be a lock the next attempt gets.
 pub fn is_schema_mismatch(e: &sqlx::Error) -> bool {
     use sqlx::migrate::MigrateError::{
         Dirty, VersionMismatch, VersionMissing, VersionNotPresent, VersionTooNew, VersionTooOld,

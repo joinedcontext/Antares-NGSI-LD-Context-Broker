@@ -529,7 +529,6 @@ impl Store {
         reaped
     }
 
-    /// Tenants that hold any subscriptions (interval-firing scan).
     /// 5.5.10: a Tenant exists once any create operation implicitly created
     /// it (any resource kind was ever written under it).
     pub fn tenant_exists(&self, tenant: &TenantId) -> bool {
@@ -903,6 +902,7 @@ impl Store {
         })
     }
 
+    /// Tenants that hold any subscriptions (interval-firing scan).
     pub fn subscription_tenants(&self) -> Vec<String> {
         let inner = self
             .inner
