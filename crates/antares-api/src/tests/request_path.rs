@@ -405,3 +405,29 @@ async fn set_attribute_value_refuses_another_media_type() {
     let resp = send(&st, with_body("PUT", uri, "application/json", "5")).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }
+
+/// 4.8: Replace Attribute stamps the sub-Attributes of the instance it writes,
+/// as every other write does.
+#[tokio::test]
+async fn replace_attribute_stamps_its_sub_attributes() {
+    let st = state();
+    create(
+        &st,
+        r#"{"id":"urn:ngsi-ld:T:r","type":"T","speed":{"type":"Property","value":1}}"#,
+    )
+    .await;
+    let resp = send(
+        &st,
+        with_body(
+            "PUT",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:T:r/attrs/speed",
+            "application/json",
+            r#"{"type":"Property","value":3,"accuracy":{"type":"Property","value":4}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let doc = get_entity(&st, "urn:ngsi-ld:T:r").await;
+    assert!(doc["speed"]["accuracy"]["createdAt"].is_string(), "{doc}");
+    assert!(doc["speed"]["accuracy"]["modifiedAt"].is_string(), "{doc}");
+}

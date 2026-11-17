@@ -1104,14 +1104,16 @@ pub async fn replace_attr(
                         }) {
                             found = true;
                             let created = slot.get("createdAt").cloned();
-                            let mut ni = new_inst.clone();
-                            if let Some(o) = ni.as_object_mut() {
-                                if let Some(c) = created {
-                                    o.insert("createdAt".into(), c);
-                                } else {
-                                    o.insert("createdAt".into(), Value::String(ts.clone()));
-                                }
-                                o.insert("modifiedAt".into(), Value::String(ts.clone()));
+                            // stamped as every write stamps an instance, its
+                            // sub-Attributes included
+                            let mut stamped = Value::Array(vec![new_inst.clone()]);
+                            crate::stamp::stamp_instances(&mut stamped, &ts);
+                            let mut ni = match stamped {
+                                Value::Array(mut one) => one.pop().unwrap_or(Value::Null),
+                                other => other,
+                            };
+                            if let (Some(o), Some(c)) = (ni.as_object_mut(), created) {
+                                o.insert("createdAt".into(), c);
                             }
                             *slot = ni;
                         }
