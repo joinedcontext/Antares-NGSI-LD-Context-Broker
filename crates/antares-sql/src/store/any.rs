@@ -1091,20 +1091,13 @@ impl AnyStore {
         additions: &Value,
     ) -> Result<(), NgsiError> {
         match self {
+            // The Entity check, the shell and the extension are one hold of
+            // the store lock: a 5.6.6 delete between them would leave history
+            // recreated for an Entity that is gone.
             AnyStore::Mem(s) => {
-                if !s.temporal_only && s.get(tenant, Kind::Entity, id).is_none() {
-                    return Ok(());
-                }
-                if s.get(tenant, Kind::Temporal, id).is_none() {
-                    // the cap the extension below applies, judged before the
-                    // shell is stored: refused there, the empty shell stayed
-                    past_instance_cap(&Default::default(), additions, s.max_instances)?;
-                    // loser of a concurrent create race just extends below
-                    let _ = s.create(tenant, Kind::Temporal, id, shell.clone()).await;
-                }
                 let cap = s.max_instances;
                 let mut refused = None;
-                s.mutate(tenant, Kind::Temporal, id, |doc| {
+                s.temporal_extend(tenant, id, !s.temporal_only, shell, |doc| {
                     let was = if cap > 0 {
                         instance_counts(doc)
                     } else {

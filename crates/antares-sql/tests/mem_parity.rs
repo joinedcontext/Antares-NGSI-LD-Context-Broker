@@ -109,3 +109,44 @@ async fn ids_of(
     got.sort();
     got
 }
+
+/// 5.6.6 deletes the Entity and then its history; an append racing that
+/// pair records either before the history delete or not at all, never
+/// after it: the Entity check and the extension are one hold of the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_append_racing_a_delete_never_resurrects_history() {
+    let s = std::sync::Arc::new(AnyStore::Mem(Store::default()));
+    let t = TenantId::default();
+    let shell = json!({"id": "urn:x:race", "type": ["T"]});
+    let adds = json!({"https://e.org/a": [{"type": "Property", "value": 1,
+                                           "instanceId": "urn:i:race",
+                                           "observedAt": "2026-01-01T00:00:00Z"}]});
+    for round in 0..500 {
+        let id = format!("urn:x:race{round}");
+        let mut doc = shell.clone();
+        doc["id"] = json!(id);
+        assert!(s
+            .create(&t, Kind::Entity, &id, doc.clone())
+            .await
+            .expect("create"));
+        let (a, d) = (s.clone(), s.clone());
+        let (ta, td) = (t.clone(), t.clone());
+        let (ia, idd) = (id.clone(), id.clone());
+        let (sh, ad) = (doc.clone(), adds.clone());
+        let append = tokio::spawn(async move {
+            a.temporal_append(&ta, &ia, &sh, &ad).await.expect("append");
+        });
+        let delete = tokio::spawn(async move {
+            d.delete(&td, Kind::Entity, &idd).await.expect("delete");
+            d.delete(&td, Kind::Temporal, &idd)
+                .await
+                .expect("delete history");
+        });
+        append.await.expect("append task");
+        delete.await.expect("delete task");
+        assert!(
+            s.get(&t, Kind::Temporal, &id).await.expect("get").is_none(),
+            "round {round}: history recreated for a deleted Entity"
+        );
+    }
+}
