@@ -1452,6 +1452,50 @@ impl Store {
         Some(result)
     }
 
+    /// Extend one Entity's temporal evolution under ONE hold of the store
+    /// lock: `None` when `require_entity` is set and no Entity `id` is
+    /// stored (5.6.6 deleted it, history must not come back for it);
+    /// otherwise `f` gets the temporal document, `shell` when there is none
+    /// yet, and what it accepts is stored. A refusal stores nothing, the
+    /// shell included.
+    pub async fn temporal_extend<T, E>(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        require_entity: bool,
+        shell: &Value,
+        f: impl FnOnce(&mut Value) -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        on_blocking(self.shadow.is_some(), || {
+            let mut inner = self.write_inner();
+            let entity_held = Self::map(&inner, Kind::Entity)
+                .get(tenant.as_str())
+                .is_some_and(|m| m.contains_key(id));
+            if require_entity && !entity_held {
+                return None;
+            }
+            let m = Self::map_mut(&mut inner, Kind::Temporal)
+                .entry(tenant.as_str().to_owned())
+                .or_default();
+            let before = m.get(id);
+            let mut candidate = before.cloned().unwrap_or_else(|| shell.clone());
+            Some(match f(&mut candidate) {
+                Ok(t) => {
+                    if before != Some(&candidate) {
+                        self.persist(
+                            table_for(Kind::Temporal),
+                            &key_bytes(tenant.as_str(), id),
+                            Some(&candidate),
+                        );
+                        m.insert(id.to_owned(), candidate);
+                    }
+                    Ok(t)
+                }
+                Err(e) => Err(e),
+            })
+        })
+    }
+
     // jsonldContexts: one keyspace for the whole process (key = context id, no
     // tenant prefix) — Cached rows are copies of public documents shared by
     // every tenant. Ownership of the tenant-authored kinds (Hosted,
