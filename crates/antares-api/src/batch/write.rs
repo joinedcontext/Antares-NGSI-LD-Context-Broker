@@ -668,7 +668,7 @@ fn written_attrs(body: Option<&Value>) -> Vec<String> {
     body.and_then(Value::as_object)
         .map(|o| {
             o.keys()
-                .filter(|k| !matches!(k.as_str(), "id" | "type" | "scope" | "@context"))
+                .filter(|k| *k != "@context" && !antares_model::is_meta(k))
                 .cloned()
                 .collect()
         })

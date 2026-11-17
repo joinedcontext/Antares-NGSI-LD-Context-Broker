@@ -144,7 +144,7 @@ pub(super) fn batch_spec(items: &[BatchItem]) -> (crate::registry::CsrSpec, Vec<
             _ => {}
         }
         for k in o.keys() {
-            if !matches!(k.as_str(), "id" | "type" | "scope" | "@context") {
+            if k != "@context" && !antares_model::is_meta(k) {
                 attrs.push(c.expand_key(k));
             }
         }
