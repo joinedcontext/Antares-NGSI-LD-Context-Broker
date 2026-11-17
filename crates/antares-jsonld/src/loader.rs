@@ -542,21 +542,50 @@ fn policed_builder(policy: EgressPolicy, keep_method: bool) -> reqwest::ClientBu
         .no_proxy()
         .redirect(redirect)
         .dns_resolver(std::sync::Arc::new(PolicyResolver(policy)));
-    if let Ok(path) = std::env::var("ANTARES_EXTRA_CA_FILE") {
-        match std::fs::read(&path) {
-            Ok(pem) => match reqwest::Certificate::from_pem_bundle(&pem) {
-                Ok(certs) => {
-                    for c in certs {
-                        b = b.add_root_certificate(c);
-                    }
-                }
-                // once at startup; this crate carries no tracing dep
-                Err(e) => eprintln!("ANTARES_EXTRA_CA_FILE {path}: not a PEM bundle ({e})"),
-            },
-            Err(e) => eprintln!("ANTARES_EXTRA_CA_FILE {path}: unreadable ({e})"),
+    match extra_ca_certs(std::env::var("ANTARES_EXTRA_CA_FILE").ok().as_deref()) {
+        Ok(certs) => {
+            for c in certs {
+                b = b.add_root_certificate(c);
+            }
         }
+        // the broker refused this at startup (`check_extra_ca_file`); a
+        // file broken since then is reported, and widens nothing
+        Err(e) => eprintln!("{e}"),
     }
     b
+}
+
+/// The certificates of `ANTARES_EXTRA_CA_FILE` (`path`), none when unset.
+/// An unreadable file, or one holding no PEM certificate, is an error that
+/// names the variable and the path.
+#[cfg(not(target_arch = "wasm32"))]
+fn extra_ca_certs(path: Option<&str>) -> Result<Vec<reqwest::Certificate>, String> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+    let pem = std::fs::read(path)
+        .map_err(|e| format!("ANTARES_EXTRA_CA_FILE {path}: unreadable ({e})"))?;
+    match reqwest::Certificate::from_pem_bundle(&pem) {
+        Ok(certs) if !certs.is_empty() => Ok(certs),
+        Ok(_) => Err(format!(
+            "ANTARES_EXTRA_CA_FILE {path}: holds no PEM certificate"
+        )),
+        Err(e) => Err(format!(
+            "ANTARES_EXTRA_CA_FILE {path}: not a PEM bundle ({e})"
+        )),
+    }
+}
+
+/// `ANTARES_EXTRA_CA_FILE` read the way every outbound client reads it: the
+/// broker calls this before it starts, so a bundle that cannot widen the
+/// trust store fails the start like every other bad config value instead
+/// of surfacing as failed TLS to every private-CA peer.
+///
+/// # Errors
+/// The file is unreadable or holds no PEM certificate.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn check_extra_ca_file() -> Result<(), String> {
+    extra_ca_certs(std::env::var("ANTARES_EXTRA_CA_FILE").ok().as_deref()).map(|_| ())
 }
 
 /// wasm32: the browser owns TLS trust, redirects and name resolution —
@@ -566,6 +595,12 @@ fn policed_builder(policy: EgressPolicy, keep_method: bool) -> reqwest::ClientBu
 #[cfg(target_arch = "wasm32")]
 pub fn client_builder(_policy: EgressPolicy) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+}
+
+/// wasm32: the browser owns TLS trust; there is no bundle to check.
+#[cfg(target_arch = "wasm32")]
+pub fn check_extra_ca_file() -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1932,6 +1967,22 @@ mod tests {
             MAX_REDIRECTS + 1,
             "one initial request plus MAX_REDIRECTS hops"
         );
+    }
+
+    /// A trust bundle that cannot widen anything is an error naming the
+    /// variable, never a line on stderr the broker boots past.
+    #[test]
+    fn an_unusable_extra_ca_file_is_an_error() {
+        assert!(extra_ca_certs(None).expect("unset").is_empty());
+        let e = extra_ca_certs(Some("/nonexistent/ca.pem")).expect_err("missing");
+        assert!(e.contains("ANTARES_EXTRA_CA_FILE"), "{e}");
+        let dir = std::env::temp_dir().join(format!("antares-extra-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let junk = dir.join("junk.pem");
+        std::fs::write(&junk, "no certificate in here").expect("write");
+        let e = extra_ca_certs(junk.to_str()).expect_err("no PEM");
+        assert!(e.contains("ANTARES_EXTRA_CA_FILE"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A POST that meets a 302 must not be re-sent as a body-less GET and
