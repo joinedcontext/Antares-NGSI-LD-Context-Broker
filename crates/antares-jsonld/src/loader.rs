@@ -193,19 +193,15 @@ impl EgressPolicy {
         }
     }
 
-    /// Read the switch tolerantly: a security control that only understands
-    /// one spelling hands the operator the opposite of the intent when the
-    /// value is `FALSE`, `off` or `no`, or carries stray whitespace. These
-    /// are the off spellings every other `ANTARES_*` switch reads; an empty
-    /// value is the unset default there too.
+    /// Read the switch in the one grammar every `ANTARES_*` switch reads: a
+    /// security control that only understands one spelling hands the
+    /// operator the opposite of the intent when the value is `FALSE`, `off`
+    /// or `no`, or carries stray whitespace. An empty value is the unset
+    /// default.
     fn allow_private_from(v: Option<&str>) -> bool {
-        v.is_none_or(|v| {
-            let v = v.trim();
-            !(v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off")
-                || v.eq_ignore_ascii_case("no"))
-        })
+        // an unknown spelling denies: the broker refuses to start on one, a
+        // library user reading this past that check gets the safe side
+        antares_model::parse_switch("ANTARES_EGRESS_ALLOW_PRIVATE", v, true).unwrap_or(false)
     }
 
     /// The IPv4 destination an IPv6 address stands for. Four spellings
@@ -3210,6 +3206,12 @@ mod tests {
             EgressPolicy::allow_private_from(None),
             "unset means allowed"
         );
+        for v in ["of", "fasle", "deny"] {
+            assert!(
+                !EgressPolicy::allow_private_from(Some(v)),
+                "{v:?} is no switch value and must not allow private egress"
+            );
+        }
     }
 
     /// The published posture is part of the switch. SECURITY.md told a reader

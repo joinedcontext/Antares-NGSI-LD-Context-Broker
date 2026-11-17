@@ -154,6 +154,28 @@ pub fn dt_key(s: &str) -> String {
     format!("{base}.{digits:0<6}")
 }
 
+/// One on/off switch of the deployment environment, the one grammar every
+/// `ANTARES_*` switch reads: unset, empty or blank is `default`;
+/// `on`/`true`/`1`/`yes` and `off`/`false`/`0`/`no`, in any case and with
+/// surrounding blanks, pick a side; anything else is an error that names the
+/// variable (an unknown spelling must not pick a side, and the value is not
+/// echoed).
+pub fn parse_switch(name: &str, raw: Option<&str>, default: bool) -> Result<bool, String> {
+    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(default);
+    };
+    let is = |set: [&str; 4]| set.iter().any(|w| v.eq_ignore_ascii_case(w));
+    if is(["on", "true", "1", "yes"]) {
+        Ok(true)
+    } else if is(["off", "false", "0", "no"]) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "{name} must be on or off (also true/false, 1/0, yes/no); the value set is neither"
+        ))
+    }
+}
+
 /// One ISO 8601 duration — `P[nY][nM][nW][nD][T[nH][nM][nS]]` — read into
 /// its components. Three NGSI-LD members carry this syntax and weigh it
 /// differently: a Context Source registration's refresh rate (5.2.9) and an
@@ -299,6 +321,34 @@ pub fn has_dot_segment(attr: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_switch_reads_one_grammar_and_refuses_the_rest() {
+        for on in ["1", "true", "on", "yes", "TRUE", "On", " yes ", "1 "] {
+            assert_eq!(
+                super::parse_switch("X", Some(on), false),
+                Ok(true),
+                "{on:?}"
+            );
+        }
+        for off in ["0", "false", "off", "no", "FALSE", "Off", " no", "0 "] {
+            assert_eq!(
+                super::parse_switch("X", Some(off), true),
+                Ok(false),
+                "{off:?}"
+            );
+        }
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(super::parse_switch("X", unset, true), Ok(true));
+            assert_eq!(super::parse_switch("X", unset, false), Ok(false));
+        }
+        for bad in ["of", "2", "enable", "y", "nope", "zz-value-zz"] {
+            let e = super::parse_switch("SOME_SWITCH", Some(bad), false).expect_err(bad);
+            assert!(e.contains("SOME_SWITCH"), "{e}");
+        }
+        let e = super::parse_switch("SOME_SWITCH", Some("zz-value-zz"), false).expect_err("bad");
+        assert!(!e.contains("zz-value-zz"), "the value was echoed: {e}");
+    }
     use super::dt_key;
 
     #[test]

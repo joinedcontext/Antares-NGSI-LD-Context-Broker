@@ -139,18 +139,13 @@ async fn migrate(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
     lenient.run(conn).await.map_err(Into::into)
 }
 
-/// An on/off setting of the environment: unset is `default`, `on`/`true`/`1`
-/// and `off`/`false`/`0` are read, anything else is a configuration error
-/// that names the variable (an unknown spelling must not pick a side).
+/// An on/off setting of the environment, in the one switch grammar of
+/// [`antares_model::parse_switch`]: unset or empty is `default`, an unknown
+/// spelling is a configuration error that names the variable (it must not
+/// pick a side).
 pub fn env_switch(name: &str, raw: Option<&str>, default: bool) -> Result<bool, sqlx::Error> {
-    match raw.map(str::trim) {
-        None => Ok(default),
-        Some("on" | "true" | "1") => Ok(true),
-        Some("off" | "false" | "0") => Ok(false),
-        Some(_) => Err(sqlx::Error::Configuration(
-            format!("{name} must be on or off (also true/false, 1/0)").into(),
-        )),
-    }
+    antares_model::parse_switch(name, raw, default)
+        .map_err(|e| sqlx::Error::Configuration(e.into()))
 }
 
 /// The `ANTARES_MIGRATE` switch: on unless set off.
@@ -546,12 +541,17 @@ mod tests {
     /// silently taking one side (ANTARES_TEMPORAL_DEDUP=OFF kept dedup on).
     #[test]
     fn an_unknown_switch_spelling_is_refused() {
-        for bad in ["OFF", "no", "disabled", ""] {
+        for bad in ["of", "disabled", "2"] {
             let e = super::temporal::temporal_dedup_setting(Some(bad)).expect_err(bad);
             assert!(e.to_string().contains("ANTARES_TEMPORAL_DEDUP"), "{e}");
             assert!(migrate_enabled(Some(bad)).is_err(), "{bad}");
         }
-        assert!(!super::temporal::temporal_dedup_setting(Some("off")).expect("off"));
+        // the one switch grammar of every ANTARES_* switch
+        for off in ["off", "OFF", "no", "false", "0"] {
+            assert!(!super::temporal::temporal_dedup_setting(Some(off)).expect("off"));
+            assert!(!migrate_enabled(Some(off)).expect("off"), "{off}");
+        }
         assert!(super::temporal::temporal_dedup_setting(None).expect("unset"));
+        assert!(super::temporal::temporal_dedup_setting(Some("")).expect("empty"));
     }
 }
