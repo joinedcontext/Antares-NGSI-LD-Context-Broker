@@ -333,19 +333,33 @@ pub(super) async fn dead_letters_list(
             }
         },
     };
-    let mut letters = match st
-        .store
-        .list(&tenant, antares_store::Kind::DeadLetter)
-        .await
-    {
-        Ok(l) => l,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
-    if let Some(sid) = q.get("subscription") {
-        letters.retain(|l| l["subscriptionId"].as_str() == Some(sid.as_str()));
+    // Newest first. The letters are walked page by page and only the newest
+    // `limit` are held, so the listing neither reads every letter at once
+    // (the read that refuses past its row ceiling) nor holds them.
+    let sid = q.get("subscription").map(String::as_str);
+    fn last_at(l: &serde_json::Value) -> Option<&str> {
+        l.get("lastAt").and_then(serde_json::Value::as_str)
     }
-    letters.sort_by(|a, b| b["lastAt"].as_str().cmp(&a["lastAt"].as_str()));
-    letters.truncate(limit);
+    let newest = |ls: &mut Vec<serde_json::Value>| {
+        ls.sort_by(|a, b| last_at(b).cmp(&last_at(a)));
+        ls.truncate(limit);
+    };
+    let mut letters: Vec<serde_json::Value> = Vec::new();
+    let walked = crate::csource::walk_docs(&st, &tenant, antares_store::Kind::DeadLetter, |l| {
+        let of = l.get("subscriptionId").and_then(serde_json::Value::as_str);
+        if sid.is_none_or(|s| of == Some(s)) {
+            letters.push(l);
+            if letters.len() >= limit.saturating_mul(2) {
+                newest(&mut letters);
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(e) = walked {
+        return ApiError::from(e).into_response();
+    }
+    newest(&mut letters);
     for l in &mut letters {
         redact_letter(l);
     }

@@ -604,3 +604,37 @@ async fn a_stored_letter_of_the_wrong_shape_does_not_take_the_listing_down() {
     .await;
     assert_eq!(s, StatusCode::BAD_GATEWAY, "an unreadable letter is a 502");
 }
+
+/// The listing pages through the letters: a Tenant past the row ceiling of
+/// the all-at-once read (which refuses) still lists its newest letters.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listing_does_not_depend_on_the_all_at_once_read() {
+    let mut st = state();
+    for (i, at) in [
+        "2026-01-01T00:00:01Z",
+        "2026-01-01T00:00:03Z",
+        "2026-01-01T00:00:02Z",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("urn:ngsi-ld:DeadLetter:{i}");
+        seed(&st, "acme", &id, "urn:s:1", "http://127.0.0.1:9/n", at).await;
+    }
+    st.store = Arc::new(crate::common::Double::flaky_list(
+        st.store.clone(),
+        usize::MAX,
+    ));
+    let (s, b) = send(&st, "GET", "/q/dead-letters?tenant=acme&limit=2").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let ids: Vec<&str> = b
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|l| l["id"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        ids,
+        ["urn:ngsi-ld:DeadLetter:1", "urn:ngsi-ld:DeadLetter:2"]
+    );
+}
