@@ -833,8 +833,8 @@ pub fn validate_exclusive(doc: &Map<String, Value>) -> Result<(), NgsiError> {
 /// 5.9.2, registering an exclusive Context Source when "an exclusive or
 /// redirect Context Source Registration already matches against the Entity ID
 /// (URI) and any of the Attributes defined in the registration" raises a
-/// Conflict (409; Table 6.3.2-1 defines no Conflict type, so it travels as
-/// AlreadyExists — the project's standing 409 mapping). Redirect overlapping
+/// Conflict (409, the type `check_entity_conflict` raises for the same
+/// clause). Redirect overlapping
 /// redirect stays legal: "operations are distributed to all registered
 /// Context Sources".
 pub async fn check_proxied_overlap(
@@ -914,7 +914,7 @@ pub async fn check_proxied_overlap(
             };
             if csr_matches(&spec, other, ctx) {
                 let oid = other.get("id").and_then(Value::as_str).unwrap_or("?");
-                return Err(NgsiError::AlreadyExists(format!(
+                return Err(NgsiError::Conflict(format!(
                     "proxied registration overlaps {oid} for the same combination of \
                      Entity ID and Attributes (4.3.6.3)"
                 )));
@@ -1690,10 +1690,11 @@ mod csi_tests {
             "speed",
         );
         assert!(
-            check_proxied_overlap(&st, &tenant, &overlap_exc, None, &ctx)
-                .await
-                .is_err(),
-            "second exclusive for the same (id, attr)"
+            matches!(
+                check_proxied_overlap(&st, &tenant, &overlap_exc, None, &ctx).await,
+                Err(NgsiError::Conflict(_))
+            ),
+            "second exclusive for the same (id, attr) is a Conflict, not AlreadyExists"
         );
         let overlap_red = mk(
             "urn:ngsi-ld:ContextSourceRegistration:r1",
