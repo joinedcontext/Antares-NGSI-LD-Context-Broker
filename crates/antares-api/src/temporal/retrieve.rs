@@ -32,15 +32,6 @@ pub(super) async fn retrieve_temporal_outer(
     .await
 }
 
-/// Vanilla: `check_params` already refused `versions` as unknown.
-pub(super) fn versions_asked(
-    _st: &AppState,
-    _params: &HashMap<String, String>,
-    _headers: &HeaderMap,
-) -> ApiResult<bool> {
-    Ok(false)
-}
-
 pub(super) async fn retrieve_temporal_inner(
     st: &AppState,
     id: &str,
@@ -50,7 +41,6 @@ pub(super) async fn retrieve_temporal_inner(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, RETRIEVE_PARAMS)?;
-    let versions = versions_asked(st, params, headers)?;
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
     let filter = gate!(st, &tenant, headers, "5.7.3", ids: &[id]).await?;
@@ -120,10 +110,6 @@ pub(super) async fn retrieve_temporal_inner(
             page_n.desc,
             page_n.size(st.temporal_default_instances, st.temporal_instance_limit),
         );
-        // after the cut: lastN counts measurements, never versions
-        if versions {
-            with_versions(&mut w, &st.temporal.versions(&tenant, id).await?);
-        }
     }
     let payload = present_temporal(&doc, &w, &ctx, &trepr, tq.as_ref(), &timeprop)?;
     if (trepr.pick.is_some() || trepr.omit.is_some())

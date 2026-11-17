@@ -1235,12 +1235,9 @@ mod t3932_time_of_day {
 }
 
 #[cfg(test)]
-mod t4794_held_values_scopes_and_versions {
-    use super::{
-        aggregate_bucket, scope_match_intervals, time_weighted_avg, with_versions, AggrClass,
-        Windowed,
-    };
-    use serde_json::{json, Map, Value};
+mod t4794_held_values_and_scopes {
+    use super::{aggregate_bucket, scope_match_intervals, time_weighted_avg, AggrClass};
+    use serde_json::{json, Value};
 
     fn at(s: &str) -> chrono::DateTime<chrono::FixedOffset> {
         chrono::DateTime::parse_from_rfc3339(s).expect("instant")
@@ -1308,47 +1305,6 @@ mod t4794_held_values_scopes_and_versions {
         );
         assert!(scope_match_intervals(&json!({"scope": "/a"}), "/b").is_empty());
         assert!(scope_match_intervals(&json!({}), "/a").is_empty());
-    }
-
-    /// `versions=all` replaces an instance by every version
-    /// of the same measurement; one with no version stays.
-    #[test]
-    fn versions_replace_the_same_measurement_only() {
-        let speed = "https://x/speed";
-        let mut w = Windowed {
-            attrs: [
-                (
-                    speed.to_owned(),
-                    vec![
-                        json!({"value": 2, "observedAt": "2026-01-01T00:00:00Z"}),
-                        json!({"value": 5, "observedAt": "2026-01-02T00:00:00Z"}),
-                    ],
-                ),
-                ("https://x/other".to_owned(), vec![json!({"value": 1})]),
-            ]
-            .into_iter()
-            .collect(),
-            max_per_attr: 100,
-            ts_min: None,
-            ts_max: None,
-            truncated: false,
-            more: false,
-            cut_served: None,
-            held: Default::default(),
-        };
-        let mut chains = Map::new();
-        chains.insert(
-            speed.to_owned(),
-            json!([
-                {"value": 1, "observedAt": "2026-01-01T00:00:00.000Z"},
-                {"value": 2, "observedAt": "2026-01-01T00:00:00Z"},
-                {"value": 9, "observedAt": "2026-01-01T00:00:00Z", "datasetId": "urn:d"},
-            ]),
-        );
-        with_versions(&mut w, &chains);
-        let values: Vec<&Value> = w.attrs[speed].iter().map(|i| &i["value"]).collect();
-        assert_eq!(values, [&json!(1), &json!(2), &json!(5)]);
-        assert_eq!(w.attrs["https://x/other"], [json!({"value": 1})]);
     }
 
     /// Tables 4.5.19.1-1/2/3: each method over numbers, a List counted by

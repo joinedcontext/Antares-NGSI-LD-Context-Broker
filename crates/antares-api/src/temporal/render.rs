@@ -73,39 +73,6 @@ pub(super) fn truncate(w: &mut Windowed, timeprop: &str, descending: bool, limit
     (w.ts_min, w.ts_max) = (ts_min, ts_max);
 }
 
-/// Each instance of `w` replaced by its chain of versions in `chains` (the
-/// store's `versions`), the same measurement being the same Attribute,
-/// `observedAt` and `datasetId`. An instance the store keeps
-/// no version of stays as it is.
-pub(super) fn with_versions(w: &mut Windowed, chains: &Map<String, Value>) {
-    let key = |i: &Value| {
-        (
-            i.get("observedAt").and_then(Value::as_str).map(dt_key),
-            i.get("datasetId").cloned(),
-        )
-    };
-    for (attr, instances) in &mut w.attrs {
-        let Some(chain) = chains.get(attr).and_then(Value::as_array) else {
-            continue;
-        };
-        *instances = instances
-            .iter()
-            .flat_map(|inst| {
-                let own: Vec<Value> = chain
-                    .iter()
-                    .filter(|v| key(v) == key(inst))
-                    .cloned()
-                    .collect();
-                if own.is_empty() {
-                    vec![inst.clone()]
-                } else {
-                    own
-                }
-            })
-            .collect();
-    }
-}
-
 /// The instant a cut page ends at in its order: the boundary `truncate`
 /// kept every Attribute to.
 pub(super) fn cut_boundary(w: &Windowed, desc: bool) -> Option<&str> {
