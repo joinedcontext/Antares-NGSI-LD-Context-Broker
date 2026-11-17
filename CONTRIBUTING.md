@@ -117,7 +117,7 @@ new transitive packages included:
 | Column | What it says |
 |---|---|
 | From -> To | the version change; `(new)` for a package the lockfile did not have |
-| Published, Age | registry date (crates.io, npm, the action's release, the Docker Hub tag that points at the pinned digest); a date that cannot be fetched is `unknown` |
+| Published, Age | registry date (crates.io, npm, the action's release, the Docker Hub tag that points at the pinned digest, gcr.io's upload time, else the image config's `created` on ghcr.io); a date that cannot be fetched, or a placeholder such as 1970, is `unknown` |
 | Advisories | OSV for the new version, plus `cargo deny check advisories` and `npm audit` on the head lockfiles; IDs the base branch's `deny.toml` ignores are listed, not counted |
 | Supply-chain signals | a crate that gains a `build.rs` or becomes a proc-macro, is yanked, or whose lockfile checksum is not crates.io's; an npm version from another publisher than the previous one, a new install script, provenance dropped, a new dependency; the commit an action tag names; the image digest change |
 | Verdict | `pass`, or `FAIL:` and every reason |
@@ -135,9 +135,10 @@ approve after the usual changelog read. Red means do not approve until
 every `FAIL` is explained:
 
 - under 7 days: wait and re-run the job; the age only grows.
-- date unknown: the registry was not reachable or is not queried
-  (`gcr.io`, `ghcr.io`); check the date by hand and write it in the
-  pull request.
+- date unknown: the registry was not reachable, is not queried (only
+  crates.io, npm, GitHub, Docker Hub, gcr.io and ghcr.io are), or gave a
+  placeholder date; re-run, or check the date by hand and write it in
+  the pull request.
 - an advisory: do not merge; move to a fixed version, or record why it
   does not apply in `deny.toml` on `dev` first.
 - another publisher, a new install or build script, a new proc-macro:

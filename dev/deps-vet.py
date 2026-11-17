@@ -20,6 +20,8 @@ packages included), and checks each new version for three things:
   account than the previous one, install scripts newly present, provenance
   dropped, new dependencies that are not vetted rows of the same table;
   action tags (the commit each tag names is recorded); image digests.
+  Image dates: Docker Hub tag push dates, gcr.io upload times, else the
+  verified image config's `created` (ghcr.io).
 
 The table goes to stdout or --summary (the job summary); exit 1 when any
 row fails, so the pull request shows a red check naming the reason.
@@ -62,7 +64,16 @@ ALLOWED_HOSTS = {
     "api.github.com",
     "registry-1.docker.io",
     "hub.docker.com",
+    # public images, read anonymously through the OCI distribution API
+    "gcr.io",
+    "ghcr.io",
+    "pkg-containers.githubusercontent.com",  # where ghcr.io redirects blob reads
 }
+OCI_REGISTRIES = ("gcr.io", "ghcr.io")
+OCI_INDEX = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json"
+OCI_MANIFEST = "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+CAP_TAG_LIST = 16 << 20  # gcr.io/distroless/cc-debian13 lists ~1.7 MB
+EARLIEST_IMAGE = dt.datetime(2013, 3, 1, tzinfo=dt.UTC)  # Docker's first release; older is a placeholder
 CAP_API = 8 << 20
 CAP_PACKUMENT = 96 << 20  # a full npm packument: vite's is ~40 MB
 CAP_CRATE = 32 << 20
@@ -99,8 +110,13 @@ _OPENER = urllib.request.build_opener(_Redirects)
 _last_crates_api = [0.0]
 
 
-def fetch(url, cap=CAP_API, data=None, headers=None):
+def fetch(url, cap=CAP_API, data=None, headers=None, bearer=None):
     """Bytes of an allow-listed https URL, refused past `cap` bytes."""
+    return fetch_raw(url, cap, data, headers, bearer)[0]
+
+
+def fetch_raw(url, cap=CAP_API, data=None, headers=None, bearer=None):
+    """(bytes, response headers); `bearer` is sent to this host only."""
     _check_url(url)
     host = urllib.parse.urlsplit(url).hostname
     if host == "crates.io":  # crawler policy: at most one request a second
@@ -109,15 +125,16 @@ def fetch(url, cap=CAP_API, data=None, headers=None):
             time.sleep(wait)
         _last_crates_api[0] = time.monotonic()
     req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, **(headers or {})})
-    token = os.environ.get("GITHUB_TOKEN")
-    if host == "api.github.com" and token:
-        # unredirected: never forwarded to another host
+    token = bearer or (os.environ.get("GITHUB_TOKEN") if host == "api.github.com" else None)
+    if token:
+        # unredirected: never forwarded to another host (a blob redirect included)
         req.add_unredirected_header("Authorization", f"Bearer {token}")
     with _OPENER.open(req, timeout=TIMEOUT) as resp:
         body = resp.read(cap + 1)
+        hdrs = dict(resp.headers.items())
     if len(body) > cap:
         raise Refused(f"response over {cap} bytes: {url}")
-    return body
+    return body, hdrs
 
 
 def fetch_json(url, cap=CAP_API, body=None, headers=None):
@@ -396,11 +413,108 @@ def crate_manifest_facts(blob, name, version):
     return {"build": has_build, "proc_macro": proc}
 
 
+def parse_challenge(header):
+    """realm/service/scope of a `WWW-Authenticate: Bearer ...` challenge."""
+    if not header.lower().startswith("bearer "):
+        return {}
+    return dict(re.findall(r'(\w+)="([^"]*)"', header))
+
+
+def pick_platform(index):
+    """The linux/amd64 manifest of an image index, else its first one."""
+    ms = index.get("manifests") or []
+    for m in ms:
+        p = m.get("platform") or {}
+        if p.get("os") == "linux" and p.get("architecture") == "amd64":
+            return m["digest"]
+    if not ms:
+        raise Refused("image index lists no manifest")
+    return ms[0]["digest"]
+
+
+def plausible(when):
+    t = parse_time(when)
+    return t is not None and t >= EARLIEST_IMAGE
+
+
+def gcr_upload_time(listing, digest):
+    """gcr.io's own upload time of a digest, from its tags/list extension."""
+    ms = (listing.get("manifest") or {}).get(digest) or {}
+    try:
+        ms_epoch = int(ms.get("timeUploadedMs") or 0)
+    except ValueError:
+        return None
+    if not ms_epoch:
+        return None
+    return dt.datetime.fromtimestamp(ms_epoch / 1000, dt.UTC).isoformat()
+
+
+def gcr_digest_of(listing, tag):
+    for digest, m in (listing.get("manifest") or {}).items():
+        if tag in (m.get("tag") or []):
+            return digest
+    return None
+
+
+def oci_date(host, repo, tag, digest, get):
+    """Publish date of an image on a public OCI registry.
+
+    gcr.io records when each digest was uploaded; that is the date. Anywhere
+    else (ghcr.io) the image config's `created` is the only date there is,
+    set by whoever built the image; a placeholder such as distroless's 1970
+    is "unknown", not a date. Every manifest and the config blob are checked
+    against their digests before they are believed. `get(url, accept, cap)`
+    returns (bytes, headers)."""
+    base = f"https://{host}/v2/{repo}"
+    if host == "gcr.io":
+        listing = json.loads(get(f"{base}/tags/list", "application/json", CAP_TAG_LIST)[0])
+        digest = digest or gcr_digest_of(listing, tag)
+        when = gcr_upload_time(listing, digest) if digest else None
+        if when:
+            return {"published": when, "date_from": "gcr.io upload time"}
+
+    def verified(ref, accept, cap=CAP_API):
+        body, _ = get(f"{base}/{ref}", accept, cap)
+        want = ref.rsplit("/", 1)[-1]
+        if want.startswith("sha256:") and "sha256:" + hashlib.sha256(body).hexdigest() != want:
+            raise Refused(f"{host}/{repo}: {want} does not match its content")
+        return json.loads(body)
+
+    doc = verified(f"manifests/{digest or tag}", f"{OCI_INDEX}, {OCI_MANIFEST}")
+    if "manifests" in doc:
+        doc = verified(f"manifests/{pick_platform(doc)}", OCI_MANIFEST)
+    config = verified(f"blobs/{doc['config']['digest']}", "*/*", CAP_MANIFEST)
+    created = config.get("created")
+    if not plausible(created):
+        return {"published": None, "why": f"image config date {created} is a placeholder"}
+    return {"published": created, "date_from": "image config created (set by the publisher)"}
+
+
 class Registry:
     """Live lookups; selftest swaps in canned answers with the same shape."""
 
     def __init__(self):
         self.cache = {}
+        self.tokens = {}
+
+    def oci_get(self, url, accept, cap=CAP_API):
+        """GET from a public registry, answering its Bearer challenge with an
+        anonymous pull token (no credentials are ever sent)."""
+        host = urllib.parse.urlsplit(url).hostname
+        repo = re.sub(r"^/v2/|/(manifests|blobs|tags)/.*$", "", urllib.parse.urlsplit(url).path)
+        key = (host, repo)
+        try:
+            return fetch_raw(url, cap, headers={"Accept": accept}, bearer=self.tokens.get(key))
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or key in self.tokens:
+                raise
+            ch = parse_challenge(e.headers.get("WWW-Authenticate", ""))
+        if not ch.get("realm"):
+            raise Refused(f"{host}: 401 without a Bearer challenge")
+        q = urllib.parse.urlencode({k: ch[k] for k in ("service", "scope") if ch.get(k)})
+        tok = fetch_json(ch["realm"] + ("?" + q if q else ""))  # realm is allow-list checked too
+        self.tokens[key] = tok.get("token") or tok.get("access_token")
+        return fetch_raw(url, cap, headers={"Accept": accept}, bearer=self.tokens[key])
 
     def _memo(self, key, fn):
         if key not in self.cache:
@@ -511,6 +625,10 @@ class Registry:
         def go():
             parts = repo.split("/")
             if "." in parts[0] or ":" in parts[0] or parts[0] == "localhost":
+                if parts[0] in OCI_REGISTRIES:
+                    if not (tag or digest):
+                        return {"published": None, "why": "no tag to look up"}
+                    return oci_date(parts[0], "/".join(parts[1:]), tag, digest, self.oci_get)
                 if parts[0] not in ("docker.io", "index.docker.io"):
                     return {"published": None, "why": f"registry {parts[0]} is not queried"}
                 parts = parts[1:]
@@ -759,7 +877,7 @@ def judge(c, now, ignored=frozenset()):
         if od != nd:
             sig.append((f"digest {short(od)} -> {short(nd)}", False))
         if f.get("date_from"):
-            sig.append((f"date of {f['date_from']}", False))
+            sig.append((f"date from {f['date_from']}", False))
 
     c.fails += [s for s, bad in sig if bad]
 
@@ -864,8 +982,8 @@ def render(changes, removed, notes, now, header, tool_failed=False):
             pub = pub.strftime("%Y-%m-%d") if not isinstance(pub, str) else pub
             age = f.get("age")
             age = "unknown" if age is None else f"{age:.0f}"
-            if c.eco == "docker" and age != "unknown":
-                age = f">= {age}"
+            if c.eco == "docker" and age != "unknown" and str(f.get("date_from", "")).startswith("tag "):
+                age = f">= {age}"  # a Docker Hub tag's push date bounds the digest's age from below
             adv = ", ".join(c.advisories) or ("n/a (no image feed)" if c.eco == "docker" else "none")
             signals = "; ".join(s for s, _ in c.signals) or "none"
             verdict = "FAIL: " + "; ".join(c.fails) if c.fails else "pass"
@@ -1251,6 +1369,38 @@ def selftest():
     img = one("docker", {"published": old_day, "date_from": "tag 1.99.0-slim"}, lock_old={"digest": "sha256:aaaa"}, lock_new={"digest": "sha256:bbbb"})
     expect(not img.fails and any("digest aaaa -> bbbb" in s for s, _ in img.signals), "image digest listed")
     expect(one("docker", {"published": None, "why": "registry gcr.io is not queried"}).fails == ["publish date unknown (registry gcr.io is not queried)"], "unqueried registry fails")
+
+    # public OCI registries: gcr.io's upload time, else a verified config date
+    def blob(obj):
+        b = json.dumps(obj).encode()
+        return "sha256:" + hashlib.sha256(b).hexdigest(), b
+    cfg_d, cfg = blob({"created": "2026-09-01T05:26:38Z"})
+    man_d, man = blob({"config": {"digest": cfg_d}})
+    idx_d, idx = blob({"manifests": [{"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}},
+                                     {"digest": man_d, "platform": {"os": "linux", "architecture": "amd64"}}]})
+    epoch_d, epoch_cfg = blob({"created": "1970-01-01T00:00:00Z"})
+    epoch_m_d, epoch_m = blob({"config": {"digest": epoch_d}})
+    listing = json.dumps({"manifest": {idx_d: {"tag": ["nonroot"], "timeUploadedMs": "1792796036718"},
+                                       epoch_m_d: {"tag": ["old"], "timeUploadedMs": "0"}}}).encode()
+    served = {"tags/list": listing, f"manifests/{idx_d}": idx, f"manifests/{man_d}": man, f"blobs/{cfg_d}": cfg,
+              "manifests/latest": idx, f"manifests/{epoch_m_d}": epoch_m, f"blobs/{epoch_d}": epoch_cfg,
+              "manifests/sha256:" + "0" * 64: idx}
+
+    def fake_get(url, accept, cap=CAP_API):
+        return served[url.split("/", 6)[-1]], {}
+    expect(oci_date("gcr.io", "distroless/cc", "nonroot", idx_d, fake_get)
+           == {"published": "2026-10-23T22:53:56.718000+00:00", "date_from": "gcr.io upload time"}, "gcr.io upload time")
+    expect(oci_date("ghcr.io", "baosystems/postgis", "17", idx_d, fake_get)["published"] == "2026-09-01T05:26:38Z", "ghcr config date via the amd64 manifest")
+    expect(oci_date("ghcr.io", "x/y", "latest", None, fake_get)["published"] == "2026-09-01T05:26:38Z", "tag without digest")
+    expect(oci_date("gcr.io", "distroless/cc", "old", epoch_m_d, fake_get)["published"] is None, "1970 placeholder is unknown, not a date")
+    try:
+        oci_date("ghcr.io", "x/y", "t", "sha256:" + "0" * 64, fake_get)
+        failures.append("a manifest that does not match its digest was believed")
+    except Refused:
+        pass
+    expect(parse_challenge('Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:a/b:pull"')
+           == {"realm": "https://ghcr.io/token", "service": "ghcr.io", "scope": "repository:a/b:pull"}, "bearer challenge")
+    expect(parse_challenge("Basic realm=x") == {}, "only Bearer challenges are answered")
 
     # the report's first line
     ok = render([one("cargo", {**clean, "old": clean})], [], [], now, "h").splitlines()[0]
