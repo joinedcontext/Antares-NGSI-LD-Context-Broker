@@ -75,12 +75,15 @@ pub(super) async fn query_temporal_outer(
         let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
             .await
             .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
+        // an unreadable recheck must fail, never read as "nothing matches":
+        // that would prune every local entry from the stored map (5.5.14)
+        let answer: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| NgsiError::InternalError("temporal map recheck parse".into()))?;
+        let rows = answer
+            .as_array()
+            .ok_or_else(|| NgsiError::InternalError("temporal map recheck answer".into()))?;
         matching.extend(
-            serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .and_then(|v| v.as_array().cloned())
-                .unwrap_or_default()
-                .iter()
+            rows.iter()
                 .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_owned)),
         );
     }
