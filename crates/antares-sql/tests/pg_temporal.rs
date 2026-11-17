@@ -1827,26 +1827,36 @@ async fn clause_4_22_the_entity_reap_works_in_bounded_batches() {
                          "expiresAt": "2000-01-02T00:00:00Z"});
         assert!(store.create(&t, id, &doc).await.expect("create"));
     }
-    let mut rounds = 0;
-    loop {
+    let left = || async {
+        let mut tx = pool.begin().await.expect("tx");
+        pg::set_tenant(&mut tx, &t).await.expect("tenant");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE tenant_id = $1")
+            .bind(t.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count");
+        tx.commit().await.expect("commit");
+        n
+    };
+    // a sibling's maintenance pass may hold some of these rows (SKIP
+    // LOCKED passes them by) or reap them itself: batch until none is left
+    for _ in 0..200 {
         let gone = pg::maintenance::reap_expired_entities_once(&pool, 2)
             .await
             .expect("reap");
         assert!(gone <= 2, "one batch reaped {gone} entities");
-        rounds += 1;
-        if gone == 0 || rounds > 1000 {
+        if left().await == 0 {
             break;
         }
+        if gone == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
-    let mut tx = pool.begin().await.expect("tx");
-    pg::set_tenant(&mut tx, &t).await.expect("tenant");
-    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE tenant_id = $1")
-        .bind(t.as_str())
-        .fetch_one(&mut *tx)
-        .await
-        .expect("count");
-    tx.commit().await.expect("commit");
-    assert_eq!(left, 0, "the batches worked off every expired entity");
+    assert_eq!(
+        left().await,
+        0,
+        "the batches worked off every expired entity"
+    );
 }
 
 /// A pushed temporal page counts the whole match set only for count=true;
