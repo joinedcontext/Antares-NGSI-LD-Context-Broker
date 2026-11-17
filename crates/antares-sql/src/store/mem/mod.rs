@@ -1352,15 +1352,29 @@ impl Store {
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::map(&inner, kind)
-            .get(tenant.as_str())
-            .map(|m| {
-                (
-                    m.values().skip(offset).take(limit).cloned().collect(),
-                    m.len(),
-                )
+        let Some(m) = Self::map(&inner, kind).get(tenant.as_str()) else {
+            return Default::default();
+        };
+        if kind != Kind::Entity {
+            return (
+                m.values().skip(offset).take(limit).cloned().collect(),
+                m.len(),
+            );
+        }
+        // 4.22, as `list_page` and the Postgres arm: an expired Entity is
+        // neither served nor counted, an expired instance is not served
+        let now = crate::store::any::now_utc();
+        let live = || m.values().filter(|v| !filter::expired_at(v, &now));
+        let page = live()
+            .skip(offset)
+            .take(limit)
+            .map(|v| {
+                let mut v = v.clone();
+                filter::strip_expired(&mut v, &now);
+                v
             })
-            .unwrap_or_default()
+            .collect();
+        (page, live().count())
     }
 
     /// Read-modify-write on one document. Returns `None` when absent; the
