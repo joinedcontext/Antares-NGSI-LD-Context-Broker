@@ -484,7 +484,8 @@ impl SubMirror {
             .collect()
     }
 
-    #[cfg(any(test, feature = "test-kit"))]
+    /// Every subscription the mirror holds for `tenant`: what a re-read
+    /// from the store is compared against.
     pub fn docs(&self, tenant: &str) -> Vec<std::sync::Arc<Value>> {
         self.map
             .read()
@@ -548,7 +549,7 @@ impl SubMirror {
         }
     }
 
-    #[cfg(any(test, feature = "test-kit"))]
+    /// The tenants the mirror holds subscriptions of.
     pub fn tenants(&self) -> Vec<String> {
         self.map
             .read()
@@ -664,7 +665,7 @@ impl DocMirror {
             .collect()
     }
 
-    #[cfg(any(test, feature = "test-kit"))]
+    /// The tenants the mirror holds documents of.
     pub fn tenants(&self) -> Vec<String> {
         self.map
             .read()
