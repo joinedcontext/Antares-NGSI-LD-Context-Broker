@@ -268,7 +268,8 @@ async fn another_component_may_still_extend_a_map_it_did_not_build() {
     let st = state(Decision::Allow);
     seed(&st).await;
     let mine = build_map(&st, "alice").await;
-    let later = (chrono::Utc::now() + chrono::Duration::seconds(600))
+    // past the default lifetime the map was built with: an extension
+    let later = (chrono::Utc::now() + chrono::Duration::seconds(7200))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
 
@@ -282,6 +283,33 @@ async fn another_component_may_still_extend_a_map_it_did_not_build() {
     )
     .await;
     assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+
+    // extending is all it may do: moving the expiry into the past would
+    // delete a map only its creator may delete
+    let (code, _, body) = call(
+        &st,
+        "PATCH",
+        &format!("entityMaps/{mine}"),
+        Some("mallory"),
+        None,
+        Some(json!({"expiresAt": "2000-01-01T00:00:00Z"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
+    let (code, _, body) = call(
+        &st,
+        "GET",
+        &format!("entityMaps/{mine}"),
+        Some("alice"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::OK,
+        "the creator's map outlived a shortening: {body}"
+    );
 }
 
 /// Table 5.2.39-1/-2 lists every member an EntityMap has, and whose map it

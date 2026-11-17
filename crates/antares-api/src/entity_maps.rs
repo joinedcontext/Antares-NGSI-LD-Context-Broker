@@ -77,11 +77,19 @@ pub async fn update_entity_map(
             NgsiError::BadRequestData("EntityMap fragment must be a JSON object".into())
         })?;
         let gone = || NgsiError::ResourceNotFound(format!("EntityMap {id} not found"));
-        map_get(&st, &tenant, &id).await?.ok_or_else(gone)?;
+        let held = map_get(&st, &tenant, &id).await?.ok_or_else(gone)?;
+        let own = crate::policy::belongs_to(&held, &crate::policy::subject_of(&tenant, &headers));
         if let Some(e) = obj.get("expiresAt") {
             let s = e.as_str().filter(|s| dt(s).is_some()).ok_or_else(|| {
                 NgsiError::BadRequestData("expiresAt must be a DateTime (4.6.3)".into())
             })?;
+            // 5.5.14: another component may only extend the expiry; one
+            // that shortens it would delete a map only its creator may
+            // delete (5.14.3), so the map is as inaccessible as on retrieve
+            let stored = held.get("expiresAt").and_then(Value::as_str).and_then(dt);
+            if !own && dt(s) <= stored {
+                return Err(gone().into());
+            }
             // only the member this update names, onto the map as stored now
             if !map_set_expiry(&st, &tenant, &id, s).await? {
                 return Err(gone().into());
