@@ -2121,6 +2121,7 @@ async fn purge_locally(
             0
         } else if prune {
             let mut changed = 0usize;
+            let ts = now_iso();
             st.store
                 .batch_mutate(tenant, &ids, |_, doc| {
                     let target = antares_store::stored_object(doc)?;
@@ -2138,6 +2139,8 @@ async fn purge_locally(
                         }
                     }
                     if target.len() != before {
+                        // an Attribute delete moves the Entity's modifiedAt
+                        target.insert("modifiedAt".into(), Value::String(ts.clone()));
                         changed = changed.saturating_add(1);
                     }
                     Ok::<(), NgsiError>(())
