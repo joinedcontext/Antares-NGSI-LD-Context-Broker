@@ -345,4 +345,51 @@ mod tests {
     fn serves_exactly_the_two_http_schemes() {
         assert_eq!(sink().schemes(), &["http", "https"]);
     }
+
+    /// A 302 would re-send the notification as a body-less GET, and that
+    /// GET's 200 said nothing about the payload: over the POST client the
+    /// broker builds for this sink the 302 is the answer, booked a failure.
+    #[tokio::test]
+    async fn a_redirect_that_drops_the_body_is_no_delivery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let resp = if buf[..n].starts_with(b"POST /moved") {
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{addr}/gone\r\nContent-Length: 0\r\n\r\n")
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_owned()
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let sink = HttpSink::new(
+            antares_jsonld::post_client_builder(antares_jsonld::EgressPolicy {
+                allow_private: true,
+                private_hosts: &[],
+            })
+            .build()
+            .expect("client"),
+        );
+        let o = out("application/json", &[]);
+        let err = sink
+            .deliver(&format!("http://{addr}/moved"), &o, Duration::from_secs(5))
+            .await
+            .expect_err("a redirected POST is not delivered");
+        assert!(err.message.contains("302"), "{}", err.message);
+        assert!(!err.timed_out);
+        // negative: a plain 200 to the POST is a delivery
+        sink.deliver(&format!("http://{addr}/ok"), &o, Duration::from_secs(5))
+            .await
+            .expect("delivered");
+    }
 }
