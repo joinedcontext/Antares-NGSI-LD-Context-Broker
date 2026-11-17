@@ -2046,5 +2046,6 @@ async fn tenant_containing_snap_is_not_reserved() {
 }
 
 mod history;
+mod request_path;
 mod temporal_window;
 mod validation;
