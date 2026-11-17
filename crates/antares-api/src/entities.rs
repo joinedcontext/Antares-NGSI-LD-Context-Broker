@@ -722,27 +722,15 @@ async fn query_entities_outer(
     }
     // 6.3.10 links from the original query — the inner call saw offset 0
     // over exactly one page, so it emitted none
-    for (off, rel, cond) in [
-        (offset.saturating_add(limit), "next", more && limit > 0),
-        (offset.saturating_sub(limit.max(1)), "prev", offset > 0),
-    ] {
-        if !cond {
-            continue;
-        }
-        let mut qp: Vec<String> = link_params
-            .iter()
-            .filter(|(k, _)| k.as_str() != "offset")
-            .map(|(k, v)| format!("{k}={}", crate::paging::query_value(v)))
-            .collect();
-        qp.push(format!("offset={off}"));
-        qp.sort(); // deterministic order — the suite string-compares links
-        let ty = match accept {
-            Accept::LdJson => ";type=\"application/ld+json\"",
-            Accept::Json => ";type=\"application/json\"",
-            Accept::GeoJson => ";type=\"application/geo+json\"",
-        };
-        if let Ok(v) = format!("</ngsi-ld/v1/entities?{}>; rel=\"{rel}\"{ty}", qp.join("&")).parse()
-        {
+    for link in crate::paging::page_links(
+        &link_params,
+        "/ngsi-ld/v1/entities",
+        accept,
+        offset,
+        limit,
+        more && limit > 0,
+    ) {
+        if let Ok(v) = link.parse() {
             resp.headers_mut().append(axum::http::header::LINK, v);
         }
     }
