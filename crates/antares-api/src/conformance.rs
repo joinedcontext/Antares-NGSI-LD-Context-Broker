@@ -168,35 +168,7 @@ fn amend_attr(v: &mut Value, ver: (u32, u32)) -> bool {
     // its own previous value had several.
     let subs: Vec<String> = obj
         .keys()
-        .filter(|k| {
-            !matches!(
-                k.as_str(),
-                "type"
-                    | "value"
-                    | "object"
-                    | "languageMap"
-                    | "json"
-                    | "vocab"
-                    | "valueList"
-                    | "objectList"
-                    | "previousValue"
-                    | "previousObject"
-                    | "previousLanguageMap"
-                    | "previousJson"
-                    | "previousVocab"
-                    | "previousValueList"
-                    | "previousObjectList"
-                    | "datasetId"
-                    | "observedAt"
-                    | "unitCode"
-                    | "objectType"
-                    | "valueType"
-                    | "expiresAt"
-                    | "createdAt"
-                    | "modifiedAt"
-                    | "instanceId"
-            )
-        })
+        .filter(|k| !antares_jsonld::RESERVED_MEMBERS.contains(&k.as_str()))
         .cloned()
         .collect();
     for name in subs {
