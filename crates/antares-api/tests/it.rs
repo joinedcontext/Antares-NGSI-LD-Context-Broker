@@ -49,6 +49,7 @@ mod federation_store_failure_5_7;
 mod federation_topology;
 mod filter_pushdown_5_7_2;
 mod forward_context_4_3_6_6;
+mod forward_faults;
 mod id_routing_5_12;
 mod internal_tenant_leaks;
 mod join_budget_4_5_23;

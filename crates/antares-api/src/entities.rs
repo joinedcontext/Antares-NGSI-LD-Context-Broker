@@ -2507,7 +2507,10 @@ async fn merge_entity_inner(
             crate::history::settle(id, matches!(res, Some(Ok(()))));
             parts.push(match res {
                 Some(Ok(())) => crate::federation::Part::local(204, "merged locally"),
-                _ => crate::federation::Part::local(404, format!("entity {id} not found locally")),
+                Some(Err(e)) => crate::federation::Part::local_error(&e),
+                None => {
+                    crate::federation::Part::local(404, format!("entity {id} not found locally"))
+                }
             });
         }
         let ctx_url = crate::federation::ctx_link_url(headers, &parsed.ctx.source);
@@ -3146,7 +3149,8 @@ pub async fn replace_entity(
                     Some(Ok(())) => {
                         parts.push(crate::federation::Part::local(204, "replaced locally"))
                     }
-                    _ => parts.push(gone),
+                    Some(Err(e)) => parts.push(crate::federation::Part::local_error(&e)),
+                    None => parts.push(gone),
                 }
             }
         }

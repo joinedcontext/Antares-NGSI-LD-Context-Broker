@@ -635,8 +635,9 @@ pub(super) async fn answer_temporal_attr_write(
         None => {
             crate::federation::Part::local(404, format!("temporal entity {id} not found locally"))
         }
-        Some(_) if local.found => crate::federation::Part::local(204, local.applied),
-        Some(_) => {
+        Some(Err(e)) => crate::federation::Part::local_error(e),
+        Some(Ok(())) if local.found => crate::federation::Part::local(204, local.applied),
+        Some(Ok(())) => {
             crate::federation::Part::local(404, format!("{} not found locally", local.missing))
         }
     };
