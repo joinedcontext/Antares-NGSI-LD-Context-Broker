@@ -167,13 +167,20 @@ async fn create_map(
             allowed_create_params()
         };
         // The Query object is folded into the parameters BEFORE 6.3.20 runs:
-        // a member it carries is a parameter of this request.
-        let vp = match &body {
-            Some(b) => query_body_params(b, &params, temporal)?,
-            None => params,
+        // a member it carries is a parameter of this request. 6.3.5: an
+        // ld+json body brings its own @context, a JSON body takes the Link.
+        let (vp, ctx) = match &body {
+            Some(b) => {
+                let parsed = parse_body(&st, &headers, b, BodyKind::Standard).await?;
+                (
+                    query_body_params(&parsed.value, &params, temporal)?,
+                    parsed.ctx,
+                )
+            }
+            None => (params, request_context(&st.loader, &headers).await?),
         };
         // ADR-0020: the engine is shown the query the map pages
-        let named = crate::entities::ReadMembers::of(&st, &headers, &vp).await;
+        let named = crate::entities::ReadMembers::with_ctx(&st, &vp, &ctx);
         let filter = gate!(
             st, &tenant, &headers, if temporal { "5.14.5" } else { "5.14.4" },
             q: named.q.as_ref(),
@@ -185,7 +192,6 @@ async fn create_map(
         .await?;
         check_params(&vp, &allowed)?;
         let accept = parse_accept(&headers)?;
-        let ctx = request_context(&st.loader, &headers).await?;
         // 5.14.4/5.14.5: the map is the id set of the query it was built
         // from, so it is built from the NARROWED query — an id the subject
         // may not see never enters the map it will page through.
@@ -194,7 +200,9 @@ async fn create_map(
         } else {
             crate::entities::build_query_map(&st, &tenant, &headers, &ctx, &vp, &filter).await?
         };
-        let mut resp = created_response(doc, &ctx, accept, &tenant);
+        // 6.3.6: the json answer's Link names the @context it was compacted in
+        let served = crate::contexts::linkable(&st, &tenant, &headers, &ctx, accept).await?;
+        let mut resp = created_response(doc, &served, accept, &tenant);
         filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
@@ -204,12 +212,10 @@ async fn create_map(
 /// 5.2.23: a Query object stands in for the query parameters. Its members are
 /// folded into them, so one rule serves both forms of every Create EntityMap.
 fn query_body_params(
-    body: &Bytes,
+    q: &Value,
     params: &HashMap<String, String>,
     temporal: bool,
 ) -> ApiResult<HashMap<String, String>> {
-    let q: Value = serde_json::from_slice(body)
-        .map_err(|e| NgsiError::InvalidRequest(format!("body is not valid JSON: {e}")))?;
     if q.get("type").and_then(Value::as_str) != Some("Query") {
         return Err(NgsiError::BadRequestData("body type must be Query".into()).into());
     }
