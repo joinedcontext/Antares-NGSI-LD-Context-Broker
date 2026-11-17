@@ -1780,3 +1780,46 @@ async fn clause_5_16_3_an_unreadable_snapshot_is_not_reported_missing() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
 }
+
+/// 5.16.7.4: a purge q may name the Snapshot's timestamps, and one that
+/// names them deletes the snapshots it matches, no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_16_7_purge_by_creation_time() {
+    let st = state().await;
+    let snap = json!({"type": "Snapshot",
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, headers, body) =
+        send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let loc = headers
+        .get("Location")
+        .and_then(|v| v.to_str().ok())
+        .expect("Location header")
+        .to_owned();
+    wait_ready(&st, &loc).await;
+    let (status, body) = send(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/snapshots?q=createdAt%3C2000-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = send(&st, "GET", &loc, None).await;
+    assert_eq!(status, StatusCode::OK, "a snapshot made later is kept");
+    let (status, body) = send(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/snapshots?q=createdAt%3C2999-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, _) = send(&st, "GET", &loc, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a snapshot made earlier is purged"
+    );
+}
