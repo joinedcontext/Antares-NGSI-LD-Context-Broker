@@ -278,6 +278,15 @@ pub fn strip_expired(doc: &mut Value, now: &str) -> bool {
     if expired_at(doc, now) {
         return true;
     }
+    strip_expired_instances(doc, now);
+    false
+}
+
+/// 4.22 on a document a statement has already admitted as a live Entity:
+/// only its expired attribute instances go (an Attribute left with none is
+/// removed), the document itself stays, so a page keeps the length its
+/// statement gave it.
+pub fn strip_expired_instances(doc: &mut Value, now: &str) {
     if let Some(obj) = doc.as_object_mut() {
         let mut empty: Vec<String> = Vec::new();
         for (k, v) in obj.iter_mut() {
@@ -294,7 +303,6 @@ pub fn strip_expired(doc: &mut Value, now: &str) -> bool {
             obj.remove(&k);
         }
     }
-    false
 }
 
 /// What a temporal query produced. `paged` = LIMIT/OFFSET (and the
