@@ -890,7 +890,6 @@ async fn rehydrate_registrations(
     Ok(())
 }
 
-/// Hydrate a mirror from the system of record (Postgres) at startup.
 /// Attempts a mirror write gets before the divergence is logged as an error.
 const MIRROR_SYNC_ATTEMPTS: u32 = 5;
 
