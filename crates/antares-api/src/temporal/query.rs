@@ -1208,7 +1208,7 @@ pub async fn batch_temporal_query(
             &params,
             &["limit", "offset", "count", "options", "format", "local"],
         )?;
-        parse_accept(&headers)?;
+        let accept = parse_accept(&headers)?;
         let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let q = parsed.object(NgsiError::BadRequestData(
             "query body must be an object".into(),
@@ -1234,7 +1234,10 @@ pub async fn batch_temporal_query(
         .await?;
         // 5.5.7: the terms of an application/ld+json body resolve against
         // the body's own @context, not the Link header's
-        query_temporal_collected(&st, &vp, &headers, &filter, None, Some(parsed.ctx.clone())).await
+        // the body's own @context, not the Link header's; a json answer
+        // links that @context, hosted when it is inline (6.3.6)
+        let ctx = crate::contexts::linkable(&st, &tenant, &headers, &parsed.ctx, accept).await?;
+        query_temporal_collected(&st, &vp, &headers, &filter, None, Some(ctx)).await
     };
     go.await.unwrap_or_else(|e| e.into_response())
 }
