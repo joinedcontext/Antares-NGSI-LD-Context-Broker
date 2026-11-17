@@ -153,6 +153,7 @@ dependencies = [
  "ngsild-model",
  "rumqttc",
  "rustls",
+ "rustls-native-certs",
  "serde_json",
  "tokio",
  "tracing",

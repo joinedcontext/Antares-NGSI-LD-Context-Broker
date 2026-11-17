@@ -261,23 +261,69 @@ fn client_id(kind: &str, seq: &std::sync::atomic::AtomicU64) -> String {
 }
 
 /// The mqtts trust store, built ONCE per process. Loading the platform
-/// certificate store on every connect is wasted work, and rumqttc's
-/// `TlsConfiguration::default()` panics when the store is unreadable — a
-/// bad cert bundle must fail the one delivery, not the broker.
+/// certificate store on every connect is wasted work, and a store that
+/// cannot be built must fail the one delivery, not the broker: the failure
+/// is cached, logged once, and every mqtts delivery reports it.
 fn shared_tls_config() -> Result<rumqttc::TlsConfiguration, NgsiError> {
     static TLS: std::sync::OnceLock<Option<rumqttc::TlsConfiguration>> = std::sync::OnceLock::new();
     TLS.get_or_init(|| {
-        // `TlsConfiguration::default()` is the only rumqttc constructor
-        // that loads the platform trust store, and it panics on failure —
-        // contain that so a broken cert bundle degrades to failed mqtts
-        // deliveries instead of killing the process. The failure is cached:
-        // a store unreadable at first use will not become readable later.
-        std::panic::catch_unwind(rumqttc::TlsConfiguration::default)
-            .map_err(|_| tracing::error!("mqtts: loading the platform certificate store failed"))
-            .ok()
+        let roots = trust_store(std::env::var("ANTARES_EXTRA_CA_FILE").ok().as_deref())
+            .map_err(|e| tracing::error!("mqtts trust store: {e}"))
+            .ok()?;
+        // the builder takes the process's crypto provider and panics
+        // without one; contained like the store itself
+        std::panic::catch_unwind(|| {
+            rumqttc::TlsConfiguration::Rustls(std::sync::Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            ))
+        })
+        .map_err(|_| tracing::error!("mqtts: no TLS crypto provider is installed"))
+        .ok()
     })
     .clone()
     .ok_or_else(|| NgsiError::InternalError("mqtts trust store unavailable".into()))
+}
+
+/// The mqtts trust anchors: the platform certificate store, widened by the
+/// PEM bundle of `ANTARES_EXTRA_CA_FILE` (`extra`) as every HTTPS client of
+/// the broker is, so an MQTT broker behind a private CA verifies. The
+/// broker refuses to start on a bundle it cannot read; here an unusable one
+/// is an error, never a silent fallback to the platform store alone.
+fn trust_store(extra: Option<&str>) -> Result<rustls::RootCertStore, String> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        tracing::warn!(
+            "mqtts: {} platform certificate(s) or location(s) unreadable",
+            native.errors.len()
+        );
+    }
+    roots.add_parsable_certificates(native.certs);
+    if let Some(path) = extra {
+        let pem = std::fs::read(path)
+            .map_err(|e| format!("ANTARES_EXTRA_CA_FILE {path}: unreadable ({e})"))?;
+        let mut added = 0usize;
+        for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
+            let cert =
+                cert.map_err(|e| format!("ANTARES_EXTRA_CA_FILE {path}: not a PEM bundle ({e})"))?;
+            roots
+                .add(cert)
+                .map_err(|e| format!("ANTARES_EXTRA_CA_FILE {path}: unusable certificate ({e})"))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(format!(
+                "ANTARES_EXTRA_CA_FILE {path}: holds no PEM certificate"
+            ));
+        }
+    }
+    if roots.is_empty() {
+        return Err("no trust anchor: the platform certificate store is empty".into());
+    }
+    Ok(roots)
 }
 
 /// Is egress to private/loopback ranges allowed? The MQTT destination is
@@ -668,6 +714,43 @@ impl crate::NotificationSink for MqttSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway self-signed CA (P-256, no key anywhere): a private CA the
+    /// platform store does not hold.
+    const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBlTCCATugAwIBAgIUa7AzBbKAdXvBSalVcq7epB5IqNowCgYIKoZIzj0EAwIw
+HzEdMBsGA1UEAwwUYW50YXJlcyB0ZXN0IG1xdHQgY2EwIBcNMjYxMTE3MTUxNDQ0
+WhgPMjEyNjEwMjQxNTE0NDRaMB8xHTAbBgNVBAMMFGFudGFyZXMgdGVzdCBtcXR0
+IGNhMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFxQ5/YP8nVdUXkG4D3X7+RNR
+BuuQA5lEa2VSyjtabq8yP89Em2zvP6N3K6ABJ8wfebwDMCaO23ONe8gfcl01AaNT
+MFEwHQYDVR0OBBYEFNEz3+/pMGv6AiD28/3BsaTXlTeMMB8GA1UdIwQYMBaAFNEz
+3+/pMGv6AiD28/3BsaTXlTeMMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwID
+SAAwRQIhAM7oiDAj79MGrXc/tSDGdyaHjK31vzB5ZwFxSFfK2mlTAiB6CGfKBPVK
+NnXaMvcbRHGLmtb5/8L1jT0DUwrxMvXhsg==
+-----END CERTIFICATE-----
+";
+
+    /// mqtts trusts what every HTTPS client of the broker trusts: the
+    /// platform store widened by ANTARES_EXTRA_CA_FILE. A bundle that
+    /// cannot widen it is an error naming the variable, not a store that
+    /// silently lacks the private CA.
+    #[test]
+    fn the_mqtts_trust_store_takes_the_extra_ca_file() {
+        let dir = std::env::temp_dir().join(format!("antares-mqtt-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, TEST_CA).expect("write");
+        let junk = dir.join("junk.pem");
+        std::fs::write(&junk, "no certificate in here").expect("write");
+        let platform = trust_store(None).map(|r| r.len()).unwrap_or(0);
+        let widened = trust_store(ca.to_str()).expect("the bundle widens the store");
+        assert_eq!(widened.len(), platform + 1, "the private CA is trusted");
+        for bad in [junk.to_str(), Some("/nonexistent/ca.pem")] {
+            let e = trust_store(bad).expect_err("unusable bundle");
+            assert!(e.contains("ANTARES_EXTRA_CA_FILE"), "{e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use serde_json::json;
 
     /// Two replicas are both PID 1 with their counters at 0: the ClientID
