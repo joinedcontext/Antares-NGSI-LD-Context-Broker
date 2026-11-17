@@ -469,11 +469,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The values `run` needs, each parsed and fatal here, before a store
     // connection or a migration runs.
     let roles = wiring::Roles::parse(&roles).map_err(|e| format!("ANTARES_ROLES: {e}"))?;
-    check_bus(&bus_mode, roles, &store_name)?;
     let history = temporal_choice(
         &store_name,
         std::env::var("ANTARES_TEMPORAL").ok().as_deref(),
     )?;
+    check_bus(&bus_mode, roles, &store_name, &history)?;
     let temporal_record: antares_api::TemporalRecord = std::env::var("ANTARES_TEMPORAL_RECORD")
         .as_deref()
         .unwrap_or("all")
@@ -1425,9 +1425,14 @@ async fn run(
     }
 }
 
-/// The bus seam: local (default) or nats, checked against the roles and
-/// the store. An unknown value is fatal.
-fn check_bus(bus_mode: &str, roles: wiring::Roles, store_name: &str) -> Result<(), String> {
+/// The bus seam: local (default) or nats, checked against the roles, the
+/// store and the history backend. An unknown value is fatal.
+fn check_bus(
+    bus_mode: &str,
+    roles: wiring::Roles,
+    store_name: &str,
+    history: &TemporalChoice,
+) -> Result<(), String> {
     match bus_mode {
         "local" => {
             // bus=local means ONE process running every role — a role
@@ -1446,6 +1451,17 @@ fn check_bus(bus_mode: &str, roles: wiring::Roles, store_name: &str) -> Result<(
                     "ANTARES_BUS=nats requires a shared store (ANTARES_STORE=postgres|timescale); \
                      {store_name} state is per-process and cannot back multiple instances"
                 ));
+            }
+            // history in a per-process backend would hold, on each api pod,
+            // only the writes that pod served
+            if let TemporalChoice::Second(name) = history {
+                if !shared_state(name) {
+                    return Err(format!(
+                        "ANTARES_BUS=nats requires shared history (ANTARES_TEMPORAL=postgres|\
+                         timescale|none); {name} history is per-process and differs between \
+                         instances"
+                    ));
+                }
             }
         }
         other => return Err(format!("unknown ANTARES_BUS={other} (local|nats)")),
@@ -1884,11 +1900,12 @@ mod driver_registry_tests {
         use super::{check_bus, parse_header_read_timeout, parse_retention_days};
         let all = crate::wiring::Roles::parse("all").expect("all");
         let api = crate::wiring::Roles::parse("api").expect("api");
-        assert!(check_bus("local", all, "memory").is_ok());
-        assert!(check_bus("nats", api, "postgres").is_ok());
-        assert!(check_bus("kafka", all, "memory").is_err());
-        assert!(check_bus("local", api, "memory").is_err());
-        assert!(check_bus("nats", api, "file").is_err());
+        let same = TemporalChoice::SameAsStore;
+        assert!(check_bus("local", all, "memory", &same).is_ok());
+        assert!(check_bus("nats", api, "postgres", &same).is_ok());
+        assert!(check_bus("kafka", all, "memory", &same).is_err());
+        assert!(check_bus("local", api, "memory", &same).is_err());
+        assert!(check_bus("nats", api, "file", &same).is_err());
         assert_eq!(parse_retention_days(None), Ok(None));
         assert_eq!(parse_retention_days(Some("30")), Ok(Some(30)));
         for bad in ["0", "-1", "x", "2147483648"] {
@@ -1903,6 +1920,31 @@ mod driver_registry_tests {
             Ok(std::time::Duration::from_millis(250))
         );
         assert!(parse_header_read_timeout(Some("10s")).is_err());
+    }
+
+    /// Under bus=nats every api pod records history: a per-process history
+    /// backend would hold on each pod only the writes it served, and a
+    /// temporal read would answer differently per pod.
+    #[test]
+    fn nats_needs_shared_history_or_none() {
+        use super::check_bus;
+        let api = crate::wiring::Roles::parse("api").expect("api");
+        for local in ["memory", "file"] {
+            let second = TemporalChoice::Second(local.into());
+            let e = check_bus("nats", api, "postgres", &second).expect_err(local);
+            assert!(e.contains("ANTARES_TEMPORAL"), "{e}");
+        }
+        for ok in [
+            TemporalChoice::None,
+            TemporalChoice::SameAsStore,
+            TemporalChoice::Second("timescale".into()),
+        ] {
+            assert!(check_bus("nats", api, "postgres", &ok).is_ok(), "{ok:?}");
+        }
+        // negative: bus=local keeps its single-process mixes
+        let all = crate::wiring::Roles::parse("all").expect("all");
+        let file = TemporalChoice::Second("file".into());
+        assert!(check_bus("local", all, "memory", &file).is_ok());
     }
     use antares_sql::StoreMode;
 
