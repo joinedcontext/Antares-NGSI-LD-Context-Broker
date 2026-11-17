@@ -175,6 +175,134 @@ async fn a_source_past_the_ceiling_is_cut_with_a_warning() {
     );
 }
 
+/// Mock Context Source holding `held` Vehicles of about `pad` bytes each,
+/// paged by `limit` and `offset`; with `counts` it answers
+/// `NGSILD-Results-Count` when asked. It keeps every request line.
+fn counting_source(
+    held: usize,
+    pad: usize,
+    counts: bool,
+) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+    let recorder = seen.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let line = head.lines().next().unwrap_or_default().to_owned();
+            if let Ok(mut v) = recorder.lock() {
+                v.push(line.clone());
+            }
+            let target = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+            let param = |k: &str| {
+                target
+                    .split(['?', '&'])
+                    .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+                    .map(str::to_owned)
+            };
+            let num = |k: &str, d: usize| param(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+            let (limit, offset) = (num("limit", 20), num("offset", 0));
+            let page: Vec<serde_json::Value> = (offset..held.min(offset + limit))
+                .map(|i| {
+                    serde_json::json!({
+                        "id": format!("urn:ngsi-ld:Vehicle:counted-{i:03}"),
+                        "type": "Vehicle",
+                        "speed": {"type": "Property", "value": i},
+                        "note": {"type": "Property", "value": "x".repeat(pad)},
+                    })
+                })
+                .collect();
+            let body = serde_json::Value::Array(page).to_string();
+            let count = match counts && param("count").as_deref() == Some("true") {
+                true => format!("NGSILD-Results-Count: {held}\r\n"),
+                false => String::new(),
+            };
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{count}\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(reply.as_bytes());
+        }
+    });
+    (port, seen)
+}
+
+/// The pages read of the Context Sources draw on one byte budget per
+/// request: a source that keeps answering full pages is read up to it, and
+/// the client learns from an NGSILD-Warning that the merge lacks matches.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_is_read_within_the_byte_budget() {
+    antares_jsonld::allow_private_egress(true);
+    let mut st = AppState::new("antares1".into());
+    st.max_limit = 2;
+    st.default_limit = 2;
+    // about two pages of two padded Entities
+    st.max_answer_bytes = 5_000;
+    let (port, seen) = counting_source(30, 1_000, false);
+    register(&st, port).await;
+    let (status, text, warns) = call(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Vehicle&limit=2&offset=16",
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let asked = seen.lock().expect("lock").len();
+    assert!(
+        asked <= 3,
+        "the source was read past the budget: {asked} pages"
+    );
+    assert!(
+        warns.iter().any(|w| w.starts_with("199 ")),
+        "a source cut at the budget is reported: {warns:?}"
+    );
+}
+
+/// 6.3.13 on a distributed query: a source that counts its own matches is
+/// asked for its count and read only as far as the client's page needs;
+/// the count it answered stands for the matches not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_count_is_read_from_the_source() {
+    antares_jsonld::allow_private_egress(true);
+    let st = AppState::new("antares1".into());
+    let (port, seen) = counting_source(30, 0, true);
+    register(&st, port).await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/ngsi-ld/v1/entities?type=Vehicle&limit=2&count=true")
+        .body(Body::empty())
+        .expect("request");
+    let res = antares_api::router(st.clone())
+        .oneshot(req)
+        .await
+        .expect("response");
+    assert_eq!(res.status().as_u16(), 200);
+    let count = res
+        .headers()
+        .get("NGSILD-Results-Count")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(ids_in(&String::from_utf8_lossy(&bytes)).len(), 2);
+    assert_eq!(count.as_deref(), Some("30"), "the source's count");
+    let lines = seen.lock().expect("lock").clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("count=true"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("limit=3"),
+        "only what the page needs is read: {}",
+        lines[0]
+    );
+}
+
 /// A Context Source answering `[]` that keeps the request line of every
 /// request it got.
 fn recording_source() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {

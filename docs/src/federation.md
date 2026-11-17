@@ -176,6 +176,13 @@ Link: <https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld>; rel="h
 ```
 
 Entity halves from several sources merge per 4.5.5 before pagination.
+A source is read past its own page size, as far as the client's page
+needs, at most ten pages, `ANTARES_MAX_FED_RESPONSE_BYTES` over all of
+its pages, and all sources together within the bytes one answer may
+buffer. With `count=true` the forward asks the source for its own count
+(`NGSILD-Results-Count`) and adds the matches it did not read; a source
+that answers no count is read in full within the same bounds. A source
+cut at a bound raises warning 199.
 
 ### Partial failures
 
