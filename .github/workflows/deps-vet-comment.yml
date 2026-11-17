@@ -1,0 +1,81 @@
+name: deps-vet-comment
+
+# Puts the deps-vet table on the pull request as one comment, updated in
+# place on every run, so the verdict is readable without opening the job.
+#
+# Why a second workflow: deps-vet runs on pull_request with a read-only
+# token, which cannot comment. This one holds `pull-requests: write`, so it
+# never checks out, builds or runs anything from the pull request. It reads
+# one thing the vet job produced, the `deps-vet` artifact, and treats it as
+# untrusted text: size-capped, @-mentions defused, sent as a JSON string.
+# The pull request number comes from GitHub's own event payload, never from
+# the artifact, and only for a branch of this repository (Dependabot's or a
+# maintainer's): for a fork the payload lists no pull request and the job
+# does not run.
+on:
+  workflow_run:
+    workflows: [deps-vet]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  comment:
+    name: Post the vet table
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled' &&
+      github.event.workflow_run.conclusion != 'skipped' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.pull_requests[0].number
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read  # the vet run's artifact
+      pull-requests: write  # the one comment
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: deps-vet
+          path: ${{ runner.temp }}/deps-vet
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Post or update the comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SUMMARY: ${{ runner.temp }}/deps-vet/summary.md
+          BODY: ${{ runner.temp }}/deps-vet-comment.json
+        run: |
+          # A run for an older head than the pull request has now would
+          # overwrite the newer table; leave it to the newer run.
+          head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          if [ "$head" != "$RUN_SHA" ]; then
+            echo "pull request #$PR moved on to $head; this run vetted $RUN_SHA"; exit 0
+          fi
+          # Build the body in Python with -I (no site, no cwd on the path):
+          # it only reads the file as bytes and writes JSON.
+          python3 -I - <<'PY'
+          import json, os
+          marker = "<!-- deps-vet -->"
+          try:
+              with open(os.environ["SUMMARY"], "rb") as fh:
+                  text = fh.read(60_000).decode("utf-8", "replace")
+          except OSError:
+              text = "The vet job left no table; see the run."
+          text = text.replace("<!--", "&lt;!--")  # no forged marker
+          text = text.replace("@", "@\u200b")  # npm scopes are not team mentions
+          body = f"{marker}\n{text}\n\n[deps-vet run]({os.environ['RUN_URL']}) for {os.environ['RUN_SHA'][:12]}\n"
+          with open(os.environ["BODY"], "w", encoding="utf-8") as fh:
+              json.dump({"body": body}, fh)
+          PY
+          id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- deps-vet -->"))) | .id' | head -n1)
+          if [ -n "$id" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$id" --input "$BODY" >/dev/null
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" --input "$BODY" >/dev/null
+          fi
