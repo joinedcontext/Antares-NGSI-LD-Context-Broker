@@ -15,6 +15,7 @@ pub(crate) fn dead_letters_written() -> u64 {
 /// is settled at once: its dead letter is written instead of a chain that
 /// would hold its payload for the policy's age (ADR-0015 parks what the
 /// policy cannot deliver; this parks what the broker cannot hold).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) const RETRY_CHAINS: usize = 256;
 
 /// The retries the delivery policy grants after a failed first attempt,
