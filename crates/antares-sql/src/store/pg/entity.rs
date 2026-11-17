@@ -2017,6 +2017,11 @@ impl PgEntityStore {
         let mut seen = std::collections::HashSet::new();
         let mut payload = Vec::new();
         let mut ids = Vec::new();
+        // the first item of each id with its types, for the outbox events:
+        // one map, not a scan of the items per returned row
+        let outbox = self.outbox_on();
+        let mut firsts: std::collections::HashMap<&str, (&Value, Vec<String>)> =
+            std::collections::HashMap::new();
         for (id, doc) in items {
             if seen.insert(id.as_str()) {
                 let e = extract(doc);
@@ -2027,6 +2032,9 @@ impl PgEntityStore {
                     "location": e.location, "loc_ambiguous": e.location_ambiguous,
                     "attrs_expire": e.attrs_expire,
                 }));
+                if outbox {
+                    firsts.insert(id.as_str(), (doc, e.types));
+                }
             }
         }
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
@@ -2101,16 +2109,12 @@ impl PgEntityStore {
             // the id came out of `items`, so the lookup answers; an
             // outbox row for a document that is not there would carry no
             // payload, so there is nothing to emit either way
-            if let (true, Some(doc)) = (
-                self.outbox_on(),
-                items.iter().find(|(i, _)| *i == id).map(|(_, d)| d),
-            ) {
-                let e = extract(doc);
+            if let Some((doc, types)) = firsts.get(id.as_str()) {
                 events.push(change_event(
                     tenant,
                     if inserted { "create" } else { "update" },
                     &id,
-                    &e.types,
+                    types,
                     prevs.get(&id),
                     Some(doc),
                     r.get::<i64, _>(2),
