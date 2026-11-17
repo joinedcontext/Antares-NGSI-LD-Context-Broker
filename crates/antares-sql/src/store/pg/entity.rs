@@ -351,19 +351,6 @@ fn named<'q>(q: &'q QNode, expand: &dyn Fn(&str) -> String) -> Option<&'q str> {
     }
 }
 
-/// The Entity's own members, which `entity_value_rows` (0024) gives no row:
-/// an `attrs=` naming one is not narrowed.
-const OWN_MEMBERS: &[&str] = &[
-    "id",
-    "type",
-    "scope",
-    "@context",
-    "createdAt",
-    "modifiedAt",
-    "deletedAt",
-    "expiresAt",
-];
-
 /// The longest string `entity_values.txt` (0024) keys, in bytes.
 const MAX_KEYED_TEXT: usize = 1024;
 
@@ -460,7 +447,12 @@ fn value_probe(tenant: &TenantId, iri: String, key: ValueKey<'_>) -> Probe {
 /// `attrs=` as a probe of presence rows (0024), `None` when it names one of
 /// the Entity's own members, which have none.
 fn attrs_probe(tenant: &TenantId, attrs: &[String]) -> Option<Probe> {
-    if attrs.iter().any(|a| OWN_MEMBERS.contains(&a.as_str())) {
+    // the Entity's own members, which `entity_value_rows` (0024) gives no
+    // row: an `attrs=` naming one is not narrowed
+    if attrs
+        .iter()
+        .any(|a| antares_model::ENTITY_META_KEYS.contains(&a.as_str()))
+    {
         return None;
     }
     let names = Bind::TextArr(super::storable(attrs));
@@ -2555,7 +2547,7 @@ mod tests {
             "SELECT id FROM entity_values WHERE tenant_id = $1 AND attr = ANY($2) LIMIT $3"
         );
         assert!(matches!(p.binds.get(1), Some(Bind::TextArr(v)) if v.as_slice() == attrs));
-        for own in OWN_MEMBERS {
+        for own in antares_model::ENTITY_META_KEYS {
             let attrs = ["https://x/a".to_owned(), (*own).to_owned()];
             assert!(attrs_probe(&tenant, &attrs).is_none(), "{own}");
         }
