@@ -1848,3 +1848,48 @@ async fn clause_4_22_the_entity_reap_works_in_bounded_batches() {
     tx.commit().await.expect("commit");
     assert_eq!(left, 0, "the batches worked off every expired entity");
 }
+
+/// A pushed temporal page counts the whole match set only for count=true;
+/// otherwise one row past the page tells whether a next one exists, as on
+/// the entity query path, and the total is the smallest one consistent
+/// with that.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paged_temporal_query_counts_only_when_asked() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgtemppagecount").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let attr = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    for i in 0..3 {
+        let id = format!("urn:ngsi-ld:Vehicle:pagecount{i}");
+        let _ = s.delete(&t, &id).await;
+        let doc = json!({
+            "id": id, "type": "https://e.org/PageCount",
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+            attr: [{"type": "Property", "value": i, "observedAt": "2026-08-04T09:00:00Z",
+                    "instanceId": format!("urn:ngsi-ld:Instance:pagecount{i}")}]
+        });
+        assert!(s.create(&t, &id, &doc).await.expect("create"));
+    }
+    let types = ["https://e.org/PageCount".to_owned()];
+    let query = |count: bool| antares_store::filter::TemporalFilter {
+        types: Some(&types),
+        page: Some(antares_store::filter::Page {
+            offset: 0,
+            limit: 1,
+            count,
+        }),
+        ..Default::default()
+    };
+    let counted = s.query(&t, &query(true)).await.expect("counted");
+    assert!(counted.paged);
+    assert_eq!((counted.rows.len(), counted.total), (1, Some(3)));
+    let uncounted = s.query(&t, &query(false)).await.expect("uncounted");
+    assert!(uncounted.paged);
+    assert_eq!(
+        (uncounted.rows.len(), uncounted.total),
+        (1, Some(2)),
+        "one row and the sign of a next page"
+    );
+}

@@ -876,7 +876,9 @@ async fn fetch_temporal(
         page: plan.page.then_some(antares_store::filter::Page {
             offset: plan.offset as i64,
             limit: plan.limit as i64,
-            count: true,
+            // without count=true the store only says whether a next page
+            // exists, as on the entity query path
+            count: req.params.get("count").map(String::as_str) == Some("true"),
         }),
         page_attrs: plan.page_attrs.as_deref().filter(|_| plan.page),
         q: qry.q_ast.as_ref(),
