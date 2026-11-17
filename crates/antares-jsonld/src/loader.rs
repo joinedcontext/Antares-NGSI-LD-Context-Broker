@@ -190,11 +190,16 @@ impl EgressPolicy {
 
     /// Read the switch tolerantly: a security control that only understands
     /// one spelling hands the operator the opposite of the intent when the
-    /// value is `FALSE` or carries stray whitespace.
+    /// value is `FALSE`, `off` or `no`, or carries stray whitespace. These
+    /// are the off spellings every other `ANTARES_*` switch reads; an empty
+    /// value is the unset default there too.
     fn allow_private_from(v: Option<&str>) -> bool {
         v.is_none_or(|v| {
             let v = v.trim();
-            !(v.eq_ignore_ascii_case("false") || v == "0")
+            !(v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
         })
     }
 
@@ -3008,7 +3013,9 @@ mod tests {
     /// the operator the opposite of the intent.
     #[test]
     fn egress_switch_ignores_case_and_whitespace() {
-        for v in ["false", "FALSE", "False", " false ", "0", " 0\t"] {
+        for v in [
+            "false", "FALSE", "False", " false ", "0", " 0\t", "off", "OFF", "no", " No ",
+        ] {
             assert!(
                 !EgressPolicy::allow_private_from(Some(v)),
                 "{v:?} must turn the private-egress deny ON"
