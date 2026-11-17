@@ -136,7 +136,9 @@ pub(crate) fn mask_registration(doc: &mut Value) {
 /// values it was answered: such a value keeps the one stored under the same
 /// key, and the masked endpoint keeps the stored endpoint. A stored
 /// credential stays with its endpoint: sent beside another endpoint it is
-/// refused, or an update-right holder could redirect it.
+/// refused, or an update-right holder could redirect it. A fragment that
+/// moves the endpoint and leaves `contextSourceInfo` out is refused while a
+/// credential is stored, for the same reason: the merge would keep it.
 pub(crate) fn keep_masked_registration(
     fragment: &mut Map<String, Value>,
     stored: &Map<String, Value>,
@@ -167,6 +169,18 @@ pub(crate) fn keep_masked_registration(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // a merge keeps the stored members the fragment leaves out, so the
+    // stored credentials would be sent to the new endpoint
+    if moved
+        && !fragment.contains_key("contextSourceInfo")
+        && held.iter().any(|pair| !csi_shown(pair))
+    {
+        return Err(antares_model::NgsiError::BadRequestData(
+            "contextSourceInfo: a stored credential cannot move to another endpoint: \
+             send contextSourceInfo with the endpoint"
+                .into(),
+        ));
+    }
     let pairs = fragment
         .get_mut("contextSourceInfo")
         .and_then(Value::as_array_mut);
