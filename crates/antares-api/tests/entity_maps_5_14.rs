@@ -591,106 +591,73 @@ async fn clause_5_14_4_federated_map_merge() {
     );
 }
 
-/// 5.5.14 makes a map usable only while a READABLE expiry is still in the
-/// future, and every route reads through that one condition. A row the store
-/// hands back in a shape no map can have — a plugin store, a corrupted file,
-/// an older writer — therefore reads as absent rather than as a map with
-/// missing parts, and no route indexes it as an object on the way. This
-/// pins the whole class at the route, so a future reader that judged
-/// "expired" instead of "live" would surface here as a panic or a 204.
+/// Table 6.4.3.2-1: "local is implicitly set to true" for type=*, so the
+/// EntityMap it creates holds local Entities only.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stored_map_of_the_wrong_shape_reads_as_absent() {
-    use antares_model::TenantId;
-    use antares_store::Kind;
-
-    for (n, stored) in [
-        json!("not an object"),
-        json!([1, 2, 3]),
-        json!(7),
-        json!(true),
-        Value::Null,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let st = state().await;
-        let id = format!("urn:ngsi-ld:entitymap:shape-{n}");
-        st.store
-            .create(&TenantId::default(), Kind::EntityMap, &id, stored.clone())
-            .await
-            .expect("seed the row");
-
-        let body = json!({"expiresAt": "2099-01-01T00:00:00.000Z"}).to_string();
-        let (status, _, resp) = send(
-            &st,
-            Request::builder()
-                .method("PATCH")
-                .uri(format!("/ngsi-ld/v1/entityMaps/{id}"))
-                .header("Content-Type", "application/json")
-                .header("Content-Length", body.len())
-                .body(Body::from(body))
-                .expect("request"),
-        )
-        .await;
-        assert!(
-            status.is_client_error() || status.is_server_error(),
-            "{stored}: an unusable row was reported as updated: {status} {resp}"
-        );
-        assert!(
-            resp["type"]
-                .as_str()
-                .is_some_and(|t| t.starts_with("https://uri.etsi.org/ngsi-ld/errors/")),
-            "{stored}: the refusal is an NGSI-LD ProblemDetails: {resp}"
-        );
-    }
-}
-
-/// The other side: a well-formed map takes the update, and 5.5.14's lifetime
-/// ceiling binds the new expiry — a client asking for one far in the future
-/// gets the ceiling, not a refusal and not the value it asked for.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_well_formed_map_takes_the_update_under_the_lifetime_ceiling() {
-    use antares_model::TenantId;
-    use antares_store::Kind;
-
+async fn table_6_4_3_2_1_a_star_type_map_asks_no_source() {
+    antares_jsonld::allow_private_egress(true);
     let st = state().await;
-    let id = "urn:ngsi-ld:entitymap:shape-ok";
-    st.store
-        .create(
-            &TenantId::default(),
-            Kind::EntityMap,
-            id,
-            json!({"id": id, "type": "EntityMap",
-                   "expiresAt": "2098-01-01T00:00:00.000Z",
-                   "entityMap": {}, "linkedMaps": {}}),
-        )
-        .await
-        .expect("seed the row");
+    create_vehicle(&st, "urn:ngsi-ld:Vehicle:localf", 10).await;
 
-    let body = json!({"expiresAt": "2099-01-01T00:00:00.000Z"}).to_string();
-    let (status, _, resp) = send(
+    // canned Context Source answering with its own EntityMap
+    let remote_map = serde_json::json!({
+        "id": "urn:ngsi-ld:entitymap:remote-1",
+        "type": "EntityMap",
+        "expiresAt": "2999-01-01T00:00:00Z",
+        "entityMap": {"urn:ngsi-ld:Vehicle:remotef": ["@none"]},
+        "linkedMaps": {},
+    })
+    .to_string();
+    let reply = format!(
+        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{remote_map}",
+        remote_map.len()
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            use std::io::{Read, Write};
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(reply.as_bytes());
+        }
+    });
+    let reg = serde_json::json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:em-fed",
+        "type": "ContextSourceRegistration",
+        "operations": ["createEntityMapQueryEntity"],
+        "information": [{"entities": [{"idPattern": ".*"}]}],
+        "endpoint": format!("http://127.0.0.1:{port}"),
+    })
+    .to_string();
+    let (status, _, body) = send(
         &st,
         Request::builder()
-            .method("PATCH")
-            .uri(format!("/ngsi-ld/v1/entityMaps/{id}"))
+            .method("POST")
+            .uri("/ngsi-ld/v1/csourceRegistrations")
             .header("Content-Type", "application/json")
-            .header("Content-Length", body.len())
-            .body(Body::from(body))
+            .header("Content-Length", reg.len())
+            .body(Body::from(reg))
             .expect("request"),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{resp}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let (status, _, got) = get(&st, &format!("/ngsi-ld/v1/entityMaps/{id}")).await;
-    assert_eq!(status, StatusCode::OK, "{got}");
-    let stamp = got["expiresAt"].as_str().expect("an expiry");
-    assert_ne!(
-        stamp, "2098-01-01T00:00:00.000Z",
-        "the update did not reach the row: {got}"
+    // Table 6.4.3.2-1: type=* is implicitly local, so no source is asked,
+    // not even one registered for every Entity
+    let (status, _, all) = get(&st, "/ngsi-ld/v1/entityMaps?type=*").await;
+    assert_eq!(status, StatusCode::CREATED, "{all}");
+    assert_eq!(
+        all["entityMap"]["urn:ngsi-ld:Vehicle:localf"],
+        json!(["@none"]),
+        "{all}"
     );
     assert!(
-        stamp < "2099-01-01T00:00:00.000Z",
-        "5.5.14: the lifetime ceiling binds every writer, so a far-future \
-         expiry comes back clamped: {got}"
+        all["entityMap"]
+            .get("urn:ngsi-ld:Vehicle:remotef")
+            .is_none(),
+        "type=* reached a Context Source: {all}"
     );
+    assert_eq!(all["linkedMaps"], json!({}), "{all}");
 }

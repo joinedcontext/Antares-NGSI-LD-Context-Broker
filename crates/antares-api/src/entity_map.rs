@@ -407,10 +407,11 @@ pub(crate) async fn merge_and_store_map(
         ("createEntityMapQueryEntity", "entityMaps")
     };
     let mut linked = Map::new();
-    // 5.5.13 local=true: no Context Source Registration is considered, so
-    // nothing merges in and linkedMaps stays empty.
-    if params.get("local").map(String::as_str) != Some("true") {
-        let split = params.get("splitEntities").map(String::as_str) == Some("true");
+    // 5.5.13 local=true (and type=*, which implies it, Table 6.4.3.2-1): no
+    // Context Source Registration is considered, so nothing merges in and
+    // linkedMaps stays empty.
+    if crate::federation::active(params) {
+        let split = crate::federation::split_entities(params);
         for (reg_id, remote) in
             crate::federation::fed_entity_maps(st, tenant, headers, ctx, params, split, op, path)
                 .await?
