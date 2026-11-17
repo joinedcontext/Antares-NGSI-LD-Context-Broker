@@ -4,7 +4,8 @@
 
 use crate::context::Context;
 use crate::pinned::{
-    core_context, merge_context_value, pinned, CORE_CONTEXT, MAX_CONTEXT_BYTES, MAX_CONTEXT_URLS,
+    check_depth, check_url_count, core_context, merge_context_value, merge_document_object, pinned,
+    CORE_CONTEXT, MAX_CONTEXT_BYTES,
 };
 use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
@@ -1320,14 +1321,10 @@ impl Loader {
         Box::pin(async move {
             // 5.5.6: an @context that "is invalid" is BadRequestData; 504
             // LdContextNotAvailable is reserved for one that "is not
-            // available". Both caps below are reached from client-supplied
+            // available". Both caps are reached from client-supplied
             // structure alone, so a client must not be able to mint gateway
-            // errors on demand.
-            if depth > 8 {
-                return Err(NgsiError::BadRequestData(
-                    "@context nesting too deep".into(),
-                ));
-            }
+            // errors on demand; they are the ones `resolve_with` applies.
+            check_depth(depth)?;
             match entry {
                 Value::Array(items) => {
                     for item in items {
@@ -1363,12 +1360,7 @@ impl Loader {
                     // resolution has already fetched MAX_CONTEXT_URLS
                     // documents, the next reference fails instead of
                     // extending the crawl. Poisoned lock fails closed.
-                    let fetched_so_far = urls.lock().map(|u| u.len()).unwrap_or(usize::MAX);
-                    if fetched_so_far >= MAX_CONTEXT_URLS {
-                        return Err(NgsiError::BadRequestData(format!(
-                            "@context resolution exceeds {MAX_CONTEXT_URLS} referenced URLs"
-                        )));
-                    }
+                    check_url_count(urls.lock().map(|u| u.len()).unwrap_or(usize::MAX))?;
                     let doc = self.fetch(&resolved, tenant).await?;
                     if let Ok(mut u) = urls.lock() {
                         u.push(resolved.clone());
@@ -1383,14 +1375,9 @@ impl Loader {
                     )
                     .await
                 }
-                // 5.5.7's Scoped Context prohibition binds the user
-                // @context. A document fetched from a pinned core URL is
-                // a Core @context, not client input, so it merges under
-                // the Core rule; everything else is the user's.
-                Value::Object(obj) => match base.as_deref() {
-                    Some(b) if Self::is_pinned_core(b) => ctx.merge_core_object(obj),
-                    _ => ctx.merge_object(obj),
-                },
+                Value::Object(obj) => {
+                    merge_document_object(ctx, obj, base.as_deref().map(String::as_str))
+                }
                 Value::Null => Ok(()),
                 _ => Err(NgsiError::BadRequestData("invalid @context entry".into())),
             }

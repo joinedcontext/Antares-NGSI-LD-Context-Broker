@@ -114,6 +114,48 @@ pub(crate) fn merge_context_value(ctx: &mut Context, v: &Value) -> Result<(), Ng
     }
 }
 
+/// Deepest nesting of @context arrays and documents one resolution walks.
+const MAX_CONTEXT_DEPTH: usize = 8;
+
+/// The caps and the merge rule both @context walkers apply — this module's
+/// [`resolve_with`] and the fetching `Loader` — so neither can drift from
+/// the other. 5.5.6: an @context that "is invalid" is BadRequestData; both
+/// caps are reached from client-supplied structure alone.
+pub(crate) fn check_depth(depth: usize) -> Result<(), NgsiError> {
+    if depth > MAX_CONTEXT_DEPTH {
+        return Err(NgsiError::BadRequestData(
+            "@context nesting too deep".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The [`MAX_CONTEXT_URLS`] cap, checked before the next URL is loaded with
+/// `loaded` URLs already loaded in this resolution.
+pub(crate) fn check_url_count(loaded: usize) -> Result<(), NgsiError> {
+    if loaded >= MAX_CONTEXT_URLS {
+        return Err(NgsiError::BadRequestData(format!(
+            "@context resolution exceeds {MAX_CONTEXT_URLS} referenced URLs"
+        )));
+    }
+    Ok(())
+}
+
+/// Merge one @context object found in the document at `base` (`None`:
+/// inline in the request). 5.5.7's Scoped Context prohibition binds the
+/// user @context; a document fetched from a pinned core URL is a Core
+/// @context, not client input, and merges under the Core rule.
+pub(crate) fn merge_document_object(
+    ctx: &mut Context,
+    obj: &serde_json::Map<String, Value>,
+    base: Option<&str>,
+) -> Result<(), NgsiError> {
+    match base {
+        Some(b) if pinned(b).is_some() => ctx.merge_core_object(obj),
+        _ => ctx.merge_object(obj),
+    }
+}
+
 /// Supplies the documents a resolution names beyond the pinned core
 /// contexts. `None` means this loader has no such document; the resolution
 /// then answers `LdContextNotAvailable`, as the broker does for a URL it
@@ -159,21 +201,13 @@ fn merge_entry(
     urls: &mut usize,
     base: Option<&str>,
 ) -> Result<(), NgsiError> {
-    if depth > 8 {
-        return Err(NgsiError::BadRequestData(
-            "@context nesting too deep".into(),
-        ));
-    }
+    check_depth(depth)?;
     match entry {
         Value::Array(items) => items
             .iter()
             .try_for_each(|i| merge_entry(loader, ctx, i, depth.saturating_add(1), urls, base)),
         Value::String(url) => {
-            if *urls >= MAX_CONTEXT_URLS {
-                return Err(NgsiError::BadRequestData(format!(
-                    "@context resolution exceeds {MAX_CONTEXT_URLS} referenced URLs"
-                )));
-            }
+            check_url_count(*urls)?;
             *urls = urls.saturating_add(1);
             let resolved = match base {
                 Some(b) if !url.starts_with("http://") && !url.starts_with("https://") => {
@@ -197,12 +231,7 @@ fn merge_entry(
                 Some(&resolved),
             )
         }
-        // 5.5.7: a document fetched from a pinned core URL is a Core
-        // @context and merges under the Core rule; the rest is the user's.
-        Value::Object(obj) => match base {
-            Some(b) if pinned(b).is_some() => ctx.merge_core_object(obj),
-            _ => ctx.merge_object(obj),
-        },
+        Value::Object(obj) => merge_document_object(ctx, obj, base),
         Value::Null => Ok(()),
         _ => Err(NgsiError::BadRequestData("invalid @context entry".into())),
     }
