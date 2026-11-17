@@ -915,12 +915,12 @@ async fn registration_matching_uses_the_csource_index() {
     let plan = plan_of(
         &pool,
         "pgexplain",
-        r#"SELECT DISTINCT r.id, r.registration
+        r#"SELECT r.id, r.registration
              FROM csource_registrations r
-             JOIN csource_index x
-               ON x.tenant_id = r.tenant_id AND x.registration_id = r.id
             WHERE r.tenant_id = 'pgexplain'
-              AND (x.entity_type IS NULL OR x.entity_type = ANY(ARRAY['T7']))
+              AND EXISTS (SELECT 1 FROM csource_index x
+                           WHERE x.tenant_id = r.tenant_id AND x.registration_id = r.id
+                             AND (x.entity_type IS NULL OR x.entity_type = ANY(ARRAY['T7'])))
             ORDER BY r.id LIMIT 10000"#,
     )
     .await;
@@ -939,13 +939,13 @@ async fn registration_matching_uses_the_csource_index() {
     let plan = plan_of(
         &pool,
         "pgexplain",
-        r#"SELECT DISTINCT r.id, r.registration
+        r#"SELECT r.id, r.registration
              FROM csource_registrations r
-             JOIN csource_index x
-               ON x.tenant_id = r.tenant_id AND x.registration_id = r.id
             WHERE r.tenant_id = 'pgexplain'
-              AND (x.entity_id IS NULL OR x.id_pattern IS NOT NULL
-                   OR x.entity_id = ANY(ARRAY['urn:e:1']))
+              AND EXISTS (SELECT 1 FROM csource_index x
+                           WHERE x.tenant_id = r.tenant_id AND x.registration_id = r.id
+                             AND (x.entity_id IS NULL OR x.id_pattern IS NOT NULL
+                                  OR x.entity_id = ANY(ARRAY['urn:e:1'])))
             ORDER BY r.id LIMIT 10000"#,
     )
     .await;
