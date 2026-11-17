@@ -131,10 +131,8 @@ pub(crate) fn task_panics() -> u64 {
     TASK_PANICS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Entity-level members that are NOT Attributes. Table 5.2.12-1 scopes
-/// watchedAttributes to "Properties or Relationships", so the entity's own
-/// system members (including 4.22 `expiresAt` and `deletedAt`) must never be
-/// diffed as attribute-level changes.
+/// What one change did to one Attribute (5.2.12 attributeCreated,
+/// attributeUpdated, attributeDeleted).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ChangeClass {
     Created,

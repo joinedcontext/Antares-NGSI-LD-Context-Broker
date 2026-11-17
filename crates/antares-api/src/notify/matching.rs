@@ -575,12 +575,6 @@ pub(super) fn selector_ids(sub: &Value) -> Option<Vec<String>> {
     (!ids.is_empty()).then_some(ids)
 }
 
-/// A store read on a delivery path has no caller to fail: the sweep is a
-/// timer, the fan-out is spawned, and both answer `()`. Silence is what makes
-/// a failure dangerous here — a subscription that stops firing because the
-/// store could not be read looks exactly like one with nothing to send — so
-/// the failure is named and the path continues on the empty set it would
-/// have continued on anyway.
 /// Every document of `kind` in `tenant` that `keep` accepts, read a page
 /// at a time: the whole-tenant `list` carries the client-query
 /// row ceiling (5.5.6), and past it a notification path would read nothing
@@ -602,6 +596,12 @@ pub(crate) async fn docs_where(
     Ok(out)
 }
 
+/// A store read on a delivery path has no caller to fail: the sweep is a
+/// timer, the fan-out is spawned, and both answer `()`. Silence is what makes
+/// a failure dangerous here — a subscription that stops firing because the
+/// store could not be read looks exactly like one with nothing to send — so
+/// the failure is named and the path continues on the empty set it would
+/// have continued on anyway.
 pub(super) fn read_or_warn<T>(res: Result<Vec<T>, antares_model::NgsiError>, what: &str) -> Vec<T> {
     res.unwrap_or_else(|e| {
         tracing::warn!("notification path: reading {what} failed: {e}");

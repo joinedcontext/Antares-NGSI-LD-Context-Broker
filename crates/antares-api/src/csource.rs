@@ -1359,7 +1359,6 @@ pub(crate) async fn walk_docs(
     Ok(())
 }
 
-/// Every registration of one tenant that `keep` accepts.
 /// Every registration of one tenant that `keep` accepts, up to `ceiling`.
 ///
 /// 5.10.2.4 filters before it pages, so the page cannot be pushed into the
