@@ -869,33 +869,8 @@ pub(crate) async fn mirror_delete_attr(
                     .to_owned();
                 let mut inst = Map::new();
                 inst.insert("type".into(), Value::String(atype.clone()));
-                let null = Value::String("urn:ngsi-ld:null".into());
-                match atype.as_str() {
-                    "Relationship" => {
-                        inst.insert("object".into(), null);
-                    }
-                    "LanguageProperty" => {
-                        inst.insert(
-                            "languageMap".into(),
-                            serde_json::json!({"@none": "urn:ngsi-ld:null"}),
-                        );
-                    }
-                    "JsonProperty" => {
-                        inst.insert("json".into(), null);
-                    }
-                    "VocabProperty" => {
-                        inst.insert("vocab".into(), null);
-                    }
-                    "ListProperty" => {
-                        inst.insert("valueList".into(), null);
-                    }
-                    "ListRelationship" => {
-                        inst.insert("objectList".into(), null);
-                    }
-                    _ => {
-                        inst.insert("value".into(), null);
-                    }
-                }
+                let (member, null, _) = crate::notify::null_members(&atype);
+                inst.insert(member.into(), null);
                 if let Some(ds) = dataset_id {
                     inst.insert("datasetId".into(), Value::String(ds.to_owned()));
                 }

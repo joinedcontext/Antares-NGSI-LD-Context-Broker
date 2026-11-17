@@ -3,11 +3,24 @@
 
 use super::*;
 
-/// Per-type NGSI-LD-null member and its showChanges previous-member (5.8.6).
-pub(super) fn null_members(atype: &str) -> (&'static str, Value, &'static str) {
+/// Per-type NGSI-LD-null member and its showChanges previous-member (5.8.6),
+/// for a notification and for the instance history records at a deletion.
+/// A list is deleted as an array of one NGSI-LD Null (4.5.21.2, 4.5.22.2:
+/// "in notifications and in temporal evolutions").
+pub(crate) fn null_members(atype: &str) -> (&'static str, Value, &'static str) {
     let null = Value::String("urn:ngsi-ld:null".into());
     match atype {
         "Relationship" => ("object", null, "previousObject"),
+        "ListProperty" => (
+            "valueList",
+            json!(["urn:ngsi-ld:null"]),
+            "previousValueList",
+        ),
+        "ListRelationship" => (
+            "objectList",
+            json!(["urn:ngsi-ld:null"]),
+            "previousObjectList",
+        ),
         "LanguageProperty" => (
             "languageMap",
             json!({"@none": "urn:ngsi-ld:null"}),

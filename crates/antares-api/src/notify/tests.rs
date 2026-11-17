@@ -1258,6 +1258,13 @@ mod clause_5_8_6_deletion_payload {
             ),
             ("JsonProperty", "json", json!("urn:ngsi-ld:null")),
             ("VocabProperty", "vocab", json!("urn:ngsi-ld:null")),
+            ("ListProperty", "valueList", json!(["urn:ngsi-ld:null"])),
+            // normalized objectList entries are {"object": …} (4.5.22.2)
+            (
+                "ListRelationship",
+                "objectList",
+                json!([{"object": "urn:ngsi-ld:null"}]),
+            ),
         ];
         for (atype, member, null_value) in cases {
             let before = json!({
