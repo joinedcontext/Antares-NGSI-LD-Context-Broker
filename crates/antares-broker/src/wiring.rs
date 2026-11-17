@@ -473,6 +473,10 @@ pub async fn wire_nats(
             let store = state.store.clone();
             let bus_for_drain = bus.clone();
             tokio::spawn(async move {
+                // publishes failed in a row: paces the retry of the row at
+                // the head, which an error that returns at once would
+                // otherwise turn into a hot loop of reads and warn lines
+                let mut failures = 0u32;
                 loop {
                     let rows = match store.outbox_peek(64).await {
                         Ok(r) => r,
@@ -501,6 +505,7 @@ pub async fn wire_nats(
                     // what it references. Kept, not deleted, and taken out of
                     // the next page by the same stamp.
                     let mut retained: Vec<(TenantId, i64)> = Vec::new();
+                    let mut failed = false;
                     for (seq, _tenant, event) in rows {
                         match serde_json::from_value::<ChangeEvent>(event) {
                             Ok(mut ev) => {
@@ -511,6 +516,7 @@ pub async fn wire_nats(
                                     Ok(()) => acked.push(seq),
                                     Err(e) => {
                                         tracing::warn!("outbox publish of seq {seq} failed: {e}");
+                                        failed = true;
                                         break; // retry from here next round
                                     }
                                 }
@@ -538,6 +544,14 @@ pub async fn wire_nats(
                         if let Err(e) = store.outbox_ack(&acked).await {
                             tracing::warn!("outbox ack {acked:?} failed: {e}");
                         }
+                    }
+                    failures = if failed {
+                        failures.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if failed {
+                        tokio::time::sleep(drain_retry_backoff(failures)).await;
                     }
                 }
             });
@@ -876,6 +890,15 @@ fn mirror_sync_backoff(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(200u64 << attempt.min(4))
 }
 
+/// The pause before the outbox drain retries after `failures` publishes in
+/// a row failed: 0.2 s doubling to a 5 s ceiling, so a bus that refuses at
+/// once costs a few reads a second, and a recovered one is caught within
+/// seconds.
+fn drain_retry_backoff(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(100u64 << failures.min(6))
+        .min(std::time::Duration::from_secs(5))
+}
+
 /// Apply one `{tenant, id, doc|null, csub}` delta to a mirror. A Context
 /// Source Registration Subscription carries no document into the mirror: it
 /// is matched against registrations rather than entities, so the delta only
@@ -1032,6 +1055,17 @@ mod tests {
             7,
             nats::MAX_DELIVER
         ));
+    }
+
+    /// A failed outbox publish is retried after a pause that grows with each
+    /// failure in a row and stays capped, never at once.
+    #[test]
+    fn the_drain_backs_off_after_a_failed_publish() {
+        let ladder: Vec<_> = (1..=12).map(drain_retry_backoff).collect();
+        assert_eq!(ladder[0], std::time::Duration::from_millis(200));
+        assert!(ladder.windows(2).all(|w| w[0] <= w[1]), "{ladder:?}");
+        assert_eq!(ladder[11], std::time::Duration::from_secs(5), "capped");
+        assert!(ladder.iter().all(|d| !d.is_zero()));
     }
 
     /// A panic inside one iteration ends that iteration, not the loop: the
