@@ -1191,6 +1191,17 @@ async fn set_attr_value_inner(
     antares_model::EntityId::new(id)?;
     check_attr_name(attr)?;
     check_params(params, &["datasetId", "observedAt", "local", "type"])?;
+    // 6.3.4: the body is application/json or application/ld+json, as on
+    // every other write; an absent header reads as JSON (039_05)
+    match crate::negotiate::content_type(headers)?.as_str() {
+        "application/json" | "application/ld+json" => {}
+        "" if !headers.contains_key(axum::http::header::CONTENT_TYPE) => {}
+        _ => {
+            return Err(ApiError::Bare(
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ))
+        }
+    }
     let ctx = request_context(&st.loader, headers).await?;
     let attr_iri = antares_jsonld::expand_attr_name(attr, &ctx)?;
     if attr == "scope" || attr_iri == SCOPE_IRI {
