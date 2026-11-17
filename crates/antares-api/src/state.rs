@@ -495,7 +495,8 @@ pub struct Shared {
     /// Retry chains of failed notifications running at once
     /// (`notify::RETRY_CHAINS`): each holds its payload for the policy's
     /// whole age, so a fast-failing endpoint under a write stream could
-    /// otherwise grow them without limit.
+    /// otherwise grow them without limit. Native only: wasm32 sends once.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) retry_slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -804,6 +805,7 @@ impl AppState {
                 public_url,
                 snapshot_cap: 1024,
                 delivery: antares_notifier::DeliveryPolicy::default(),
+                #[cfg(not(target_arch = "wasm32"))]
                 retry_slots: Arc::new(tokio::sync::Semaphore::new(crate::notify::RETRY_CHAINS)),
             }),
         }
