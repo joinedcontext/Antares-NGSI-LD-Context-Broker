@@ -1429,7 +1429,18 @@ async fn pg_change_hook_fires_in_commit_order_per_entity() {
             .await
             .expect("writer 2");
     });
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // writer 1 stays in its hook until writer 2's hook has run: a fixed
+    // pause measured the host, and a loaded one ran out of it first
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline
+        && !seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(v, _)| *v == 2)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     released.store(true, Ordering::SeqCst);
     w1.await.expect("writer 1");
     w2.await.expect("writer 2");
