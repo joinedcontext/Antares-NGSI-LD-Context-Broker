@@ -306,8 +306,20 @@ async fn append_attrs_inner(
                     updated.push("scope".into());
                 }
             }
+            // 4.22: an Entity member; noOverwrite keeps the one stored
+            if let Some(v) = frag.get("expiresAt") {
+                if no_overwrite && target.contains_key("expiresAt") {
+                    not_updated.push((
+                        "expiresAt".into(),
+                        "expiresAt already set (noOverwrite)".into(),
+                    ));
+                } else {
+                    crate::entities::set_expires_at(target, v);
+                    updated.push("expiresAt".into());
+                }
+            }
             for (k, v) in frag {
-                if is_fragment_meta(k) {
+                if antares_model::is_meta(k) {
                     continue;
                 }
                 let mut incoming = v.clone();
@@ -372,8 +384,13 @@ async fn update_attrs_inner(
                     updated.push("scope".into());
                 }
             }
+            // 4.22: an Entity member, set or removed as merge sets it
+            if let Some(v) = frag.get("expiresAt") {
+                crate::entities::set_expires_at(target, v);
+                updated.push("expiresAt".into());
+            }
             for (k, v) in frag {
-                if is_fragment_meta(k) {
+                if antares_model::is_meta(k) {
                     continue;
                 }
                 let mut incoming = v.clone();
@@ -405,12 +422,6 @@ async fn update_attrs_inner(
         },
     )
     .await
-}
-
-/// The Entity Fragment members that are not Attributes: handled by the
-/// write itself (`id`, `type`, `scope`) or server-generated (4.8).
-fn is_fragment_meta(k: &str) -> bool {
-    matches!(k, "id" | "type" | "scope" | "createdAt" | "modifiedAt")
 }
 
 /// Shared federation plan for attribute writes: the matching non-aux

@@ -2798,6 +2798,17 @@ pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
 /// 5.6.9 Update (5.6.3 per Entity): as [`merge_into`], but an instance the
 /// fragment names replaces the stored one whole (its `createdAt` kept), so a
 /// member the update leaves out (`unitCode`) is gone, never merged over.
+/// 4.22: `expiresAt` in a Fragment sets the Entity's storage expiry (5.2.4,
+/// not in the read-only Table 5.2.2-1); an NGSI-LD Null removes it (5.5.12).
+/// It is an Entity member, never an Attribute.
+pub(crate) fn set_expires_at(target: &mut Map<String, Value>, v: &Value) {
+    if is_ngsi_null(v) {
+        target.remove("expiresAt");
+    } else {
+        target.insert("expiresAt".into(), v.clone());
+    }
+}
+
 pub fn update_into(doc: &mut Value, fragment: &Value, ts: &str) {
     merge_with(doc, fragment, ts, true);
 }
@@ -2843,13 +2854,7 @@ fn merge_with(doc: &mut Value, fragment: &Value, ts: &str, replace: bool) {
             // an NGSI-LD Null removes it (5.5.12). Without this arm it fell
             // through to the attribute path, where a bare string has no
             // instances and the member was silently dropped.
-            "expiresAt" => {
-                if is_ngsi_null(v) {
-                    target.remove("expiresAt");
-                } else {
-                    target.insert("expiresAt".into(), v.clone());
-                }
-            }
+            "expiresAt" => set_expires_at(target, v),
             _ => {
                 let frag_instances = v.as_array().cloned().unwrap_or_default();
                 let mut cur: Vec<Value> = target

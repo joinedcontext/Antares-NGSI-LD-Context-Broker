@@ -82,3 +82,95 @@ async fn entity_page_links_carry_the_negotiated_media_type() {
         }
     }
 }
+
+async fn get_entity(st: &AppState, id: &str) -> Value {
+    let req = Request::get(format!("/ngsi-ld/v1/entities/{id}?options=sysAttrs"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = send(st, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    json_of(resp).await
+}
+
+/// 4.22: `expiresAt` is an Entity member, not an Attribute: an attribute
+/// write sets it, the NGSI-LD Null removes it, and `noOverwrite` keeps the
+/// one already stored.
+#[tokio::test]
+async fn attribute_writes_set_expires_at_as_an_entity_member() {
+    let st = state();
+    let id = "urn:ngsi-ld:T:exp";
+    create(
+        &st,
+        &format!(r#"{{"id":"{id}","type":"T","expiresAt":"2030-01-01T00:00:00Z"}}"#),
+    )
+    .await;
+    let attrs = format!("/ngsi-ld/v1/entities/{id}/attrs");
+    let write = |method: &'static str, uri: String, body: &'static str| {
+        with_body(method, &uri, "application/json", body)
+    };
+    let resp = send(
+        &st,
+        write(
+            "PATCH",
+            attrs.clone(),
+            r#"{"expiresAt":"2031-01-01T00:00:00Z"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_entity(&st, id).await["expiresAt"],
+        "2031-01-01T00:00:00Z"
+    );
+    let resp = send(
+        &st,
+        write(
+            "POST",
+            attrs.clone(),
+            r#"{"expiresAt":"2032-01-01T00:00:00Z"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_entity(&st, id).await["expiresAt"],
+        "2032-01-01T00:00:00Z"
+    );
+    let resp = send(
+        &st,
+        write(
+            "POST",
+            format!("{attrs}?options=noOverwrite"),
+            r#"{"expiresAt":"2033-01-01T00:00:00Z"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+    assert_eq!(
+        get_entity(&st, id).await["expiresAt"],
+        "2032-01-01T00:00:00Z"
+    );
+    let batch = format!(r#"[{{"id":"{id}","type":"T","expiresAt":"2034-01-01T00:00:00Z"}}]"#);
+    let resp = send(
+        &st,
+        with_body(
+            "POST",
+            "/ngsi-ld/v1/entityOperations/update?options=noOverwrite",
+            "application/json",
+            &batch,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+    assert_eq!(
+        get_entity(&st, id).await["expiresAt"],
+        "2032-01-01T00:00:00Z"
+    );
+    let resp = send(
+        &st,
+        write("PATCH", attrs, r#"{"expiresAt":"urn:ngsi-ld:null"}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(get_entity(&st, id).await.get("expiresAt").is_none());
+}
