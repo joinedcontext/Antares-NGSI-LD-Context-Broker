@@ -432,6 +432,35 @@ async fn replace_attribute_stamps_its_sub_attributes() {
     assert!(doc["speed"]["accuracy"]["modifiedAt"].is_string(), "{doc}");
 }
 
+/// 4.8: a merge (5.6.17) stamps the sub-Attributes it brings, on a new
+/// Attribute and on one merged into a stored instance.
+#[tokio::test]
+async fn merge_entity_stamps_its_sub_attributes() {
+    let st = state();
+    create(
+        &st,
+        r#"{"id":"urn:ngsi-ld:T:m","type":"T","speed":{"type":"Property","value":1}}"#,
+    )
+    .await;
+    let resp = send(
+        &st,
+        with_body(
+            "PATCH",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:T:m",
+            "application/json",
+            r#"{"brand":{"type":"Property","value":"x","origin":{"type":"Property","value":"y"}},
+                "speed":{"type":"Property","value":2,"accuracy":{"type":"Property","value":4}}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let doc = get_entity(&st, "urn:ngsi-ld:T:m").await;
+    for sub in [&doc["brand"]["origin"], &doc["speed"]["accuracy"]] {
+        assert!(sub["createdAt"].is_string(), "{doc}");
+        assert!(sub["modifiedAt"].is_string(), "{doc}");
+    }
+}
+
 /// 6.3.2 / RFC 9110 15.5.6: the 405 for a path with an empty segment carries
 /// an Allow header (empty: no method applies).
 #[tokio::test]
