@@ -209,13 +209,7 @@ impl EntityId {
         // id has them); only "." and ".." as whole segments are refused, in
         // their percent-encoded spellings too, since the peer decodes the path
         // it receives. RFC 3986 clause 3.3.
-        let no_dot_segment = {
-            let decoded = raw
-                .to_ascii_lowercase()
-                .replace("%2e", ".")
-                .replace("%2f", "/");
-            !decoded.split('/').any(|seg| seg == "." || seg == "..")
-        };
+        let no_dot_segment = !crate::has_dot_segment(raw);
         let scheme_ok = no_illegal
             && no_dot_segment
             && raw.split_once(':').is_some_and(|(s, rest)| {
