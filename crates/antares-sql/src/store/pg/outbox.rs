@@ -59,7 +59,8 @@ pub async fn enqueue_many(
     }
     sqlx::query(ENQUEUE_MANY_SQL)
         .bind(tenant.as_str())
-        .bind(Value::Array(events.to_vec()))
+        // serialized from the borrowed slice: no copy of every document
+        .bind(sqlx::types::Json(events))
         .execute(tx)
         .await
         .map(|_| ())

@@ -2122,7 +2122,7 @@ impl PgTemporalStore {
                     )))
                     .bind(tenant.as_str())
                     .bind(id)
-                    .bind(Value::Array(deletes.clone()))
+                    .bind(sqlx::types::Json(&deletes))
                     .execute(&mut *tx)
                     .await?;
                     for sql in [
@@ -2140,7 +2140,7 @@ impl PgTemporalStore {
                         sqlx::query(sql)
                             .bind(tenant.as_str())
                             .bind(id)
-                            .bind(Value::Array(deletes.clone()))
+                            .bind(sqlx::types::Json(&deletes))
                             .execute(&mut *tx)
                             .await?;
                     }
