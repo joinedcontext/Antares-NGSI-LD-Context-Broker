@@ -238,13 +238,20 @@ fn is_instance_list(items: &[Value]) -> bool {
 /// rather than the 203 that marks an altered Entity. They are recognised by
 /// their reserved clause 5.2 data-type name.
 fn is_reserved_resource(o: &serde_json::Map<String, Value>) -> bool {
-    const RESERVED: [&str; 6] = [
+    const RESERVED: [&str; 12] = [
         "Subscription",
         "ContextSourceRegistration",
         "CSourceRegistration",
         "Notification",
         "EntityMap",
         "Snapshot",
+        // 5.2.24-5.2.27 / 5.2.40: the type and attribute discovery bodies
+        "EntityTypeList",
+        "EntityType",
+        "EntityTypeInfo",
+        "AttributeList",
+        "Attribute",
+        "ContextSourceIdentity",
     ];
     o.get("type")
         .and_then(Value::as_str)
@@ -899,5 +906,26 @@ mod prefer_layer {
             doc["a"],
             serde_json::json!({"type": "Property", "value": 2})
         );
+    }
+
+    /// Type and attribute discovery bodies carry id + type but are no
+    /// Entities: they pass through a 1.0 preference untouched.
+    #[test]
+    fn discovery_bodies_are_not_amended_as_entities() {
+        for mut doc in [
+            serde_json::json!({"id": "urn:ngsi-ld:EntityTypeList:1", "type": "EntityTypeList",
+                               "typeList": ["A", "B"]}),
+            serde_json::json!({"id": "urn:ngsi-ld:AttributeList:1", "type": "AttributeList",
+                               "attributeList": ["a", "b"]}),
+            serde_json::json!({"id": "urn:ngsi-ld:EntityTypeInfo:T", "type": "EntityTypeInfo",
+                               "typeName": "T", "entityCount": 2,
+                               "attributeDetails": [{"id": "a", "type": "Attribute",
+                                                     "attributeName": "a",
+                                                     "attributeTypes": ["Property", "Relationship"]}]}),
+        ] {
+            let before = doc.clone();
+            assert!(!amend_payload(&mut doc, (1, 0)), "{before}");
+            assert_eq!(doc, before);
+        }
     }
 }
