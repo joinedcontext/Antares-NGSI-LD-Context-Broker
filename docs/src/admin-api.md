@@ -149,6 +149,7 @@ Prometheus text with the `antares_` prefix:
 | `antares_notification_lane_dropped_total` | Entities a subscription's full delivery lane dropped: that subscriber is slower than its changes (the log line names tenant and subscription). |
 | `antares_claim_check_unresolved_total` | Changes too big for the bus whose kept outbox row was already reaped: the before-image is gone and the change notifies nobody. Non-zero means a matcher lagged past the retention window. |
 | `antares_notification_task_panics_total` | Delivery tasks that panicked (a bug, never expected). |
+| `antares_background_panics_total` | Iterations of a background loop that panicked, by `task` (`matcher`, `interval`, `sweep`, `maintenance`): a bug, never expected. The loop goes on with its next iteration; a matcher change whose matching panicked is redelivered. |
 | `antares_change_lag_seconds` | Age of the change a notifier is handling. |
 | `antares_change_final_delivery_total` | `ANTARES_BUS=nats`: change messages handed to the matcher on their last allowed delivery (10); one that then fails is dropped by the server, and the error log line names its subject and stream sequence. Non-zero means changes were redelivered repeatedly. |
 | `antares_policy_failures_total` | Decisions the policy seam had to make itself because the engine did not, by reason (`panic`, `timeout`). Always zero under the built-in `allow-all` engine. |

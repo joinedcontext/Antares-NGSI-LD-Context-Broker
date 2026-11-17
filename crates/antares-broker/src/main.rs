@@ -1245,17 +1245,20 @@ async fn run(
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
         loop {
             tick.tick().await;
-            let n = sweeper.sweep_expired().await;
-            if n > 0 {
-                tracing::debug!("4.22 sweep reaped {n} expired entities");
-            }
-            // Registrations, Snapshots and EntityMaps carry their own
-            // expiry, and every read already refuses one that has passed;
-            // this is what frees the row behind it.
-            let n = antares_api::sweep_expired_docs(&doc_sweeper).await;
-            if n > 0 {
-                tracing::debug!("expiry sweep reaped {n} expired documents");
-            }
+            wiring::contained("sweep", async {
+                let n = sweeper.sweep_expired().await;
+                if n > 0 {
+                    tracing::debug!("4.22 sweep reaped {n} expired entities");
+                }
+                // Registrations, Snapshots and EntityMaps carry their own
+                // expiry, and every read already refuses one that has passed;
+                // this is what frees the row behind it.
+                let n = antares_api::sweep_expired_docs(&doc_sweeper).await;
+                if n > 0 {
+                    tracing::debug!("expiry sweep reaped {n} expired documents");
+                }
+            })
+            .await;
         }
     });
     // Temporal maintenance — plain-mode partition pre-creation and the
@@ -1287,13 +1290,17 @@ async fn run(
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
                 loop {
                     tick.tick().await; // first tick is immediate: partitions at boot
-                    match antares_sql::store::pg::maintenance::temporal_maintenance(
-                        &pool, backend, retention,
+                    match wiring::contained(
+                        "maintenance",
+                        antares_sql::store::pg::maintenance::temporal_maintenance(
+                            &pool, backend, retention,
+                        ),
                     )
                     .await
                     {
-                        Ok(msg) => tracing::debug!("temporal maintenance: {msg}"),
-                        Err(e) => tracing::warn!("temporal maintenance failed: {e}"),
+                        Some(Ok(msg)) => tracing::debug!("temporal maintenance: {msg}"),
+                        Some(Err(e)) => tracing::warn!("temporal maintenance failed: {e}"),
+                        None => {}
                     }
                 }
             });

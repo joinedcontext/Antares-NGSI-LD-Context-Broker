@@ -99,6 +99,29 @@ pub fn outbox_drain_enabled() -> Result<bool, String> {
     }
 }
 
+/// One iteration of a background loop with a panic in it contained: the
+/// panic is logged and counted (`antares_background_panics_total`, by
+/// task) and the loop goes on with its next iteration. Uncontained, it ended
+/// the spawned loop for the life of the process while the pod stayed ready.
+/// `None` when the iteration panicked.
+pub async fn contained<T>(
+    task: &'static str,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::error!(
+                task,
+                "a background loop iteration panicked; the loop goes on"
+            );
+            metrics::counter!("antares_background_panics_total", "task" => task).increment(1);
+            None
+        }
+    }
+}
+
 /// Whether this pod's shutdown waits for the shared outbox to empty: only a
 /// pod that runs the drain, which is an api pod on the nats bus with the
 /// drain on. Any other pod would wait on rows it never publishes, under
@@ -610,16 +633,19 @@ pub async fn wire_nats(
                     async move {
                         let Some(ev) = ev else { return true };
                         match resolve_payloads(&st, &ev).await {
-                            Ok((before, after)) => {
+                            // a panic in the matching is contained: this
+                            // loop goes on, and the change is retried
+                            Ok((before, after)) => contained(
+                                "matcher",
                                 antares_api::notify::process_change(
                                     &st,
                                     ev.tenant.as_str(),
                                     before,
                                     after,
-                                )
-                                .await;
-                                true
-                            }
+                                ),
+                            )
+                            .await
+                            .is_some(),
                             // the store did not answer: the change stays on
                             // the stream for another attempt
                             Err(e) => {
@@ -651,7 +677,7 @@ pub async fn wire_nats(
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 tick.tick().await;
-                antares_api::notify::interval_tick(&st).await;
+                contained("interval", antares_api::notify::interval_tick(&st)).await;
             }
         });
     }
@@ -1006,6 +1032,22 @@ mod tests {
             7,
             nats::MAX_DELIVER
         ));
+    }
+
+    /// A panic inside one iteration ends that iteration, not the loop: the
+    /// next one runs, and the value of a good iteration comes through.
+    #[tokio::test]
+    async fn a_panicking_iteration_does_not_end_the_loop() {
+        let mut ran = Vec::new();
+        for i in 0..3u8 {
+            let out = contained("test", async move {
+                assert!(i != 1, "a bug in iteration 1");
+                i
+            })
+            .await;
+            ran.push(out);
+        }
+        assert_eq!(ran, [Some(0), None, Some(2)]);
     }
 
     #[test]

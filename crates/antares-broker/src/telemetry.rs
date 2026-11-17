@@ -216,6 +216,11 @@ fn describe() {
         "change messages handed to the matcher on their last allowed delivery; one that then fails is dropped by the server"
     );
     describe_counter!(
+        "antares_background_panics_total",
+        Unit::Count,
+        "background loop iterations that panicked and were contained, by task"
+    );
+    describe_counter!(
         "antares_policy_failures_total",
         Unit::Count,
         "policy decisions the seam had to make itself because the engine did not, by reason"
