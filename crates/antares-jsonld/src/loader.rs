@@ -4,8 +4,8 @@
 
 use crate::context::Context;
 use crate::pinned::{
-    check_depth, check_url_count, core_context, merge_context_value, merge_document_object, pinned,
-    CORE_CONTEXT, MAX_CONTEXT_BYTES,
+    check_depth, check_url_count, core_context, is_pinned, merge_context_value,
+    merge_document_object, pinned, CORE_CONTEXT, MAX_CONTEXT_BYTES,
 };
 use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
@@ -1425,7 +1425,7 @@ impl Loader {
 
     /// Is `url` one of the built-in (pinned) core context URLs?
     pub fn is_pinned_core(url: &str) -> bool {
-        pinned(url).is_some()
+        is_pinned(url)
     }
 
     /// Fetch a remote context document, returning its `@context` member.
@@ -1435,7 +1435,7 @@ impl Loader {
     /// merged-context cache.
     async fn fetch(&self, url: &str, tenant: Option<&TenantId>) -> Result<Arc<Value>, NgsiError> {
         if let Some(v) = pinned(url) {
-            return Ok(Arc::new(v));
+            return Ok(v);
         }
         let err = |m: String| NgsiError::LdContextNotAvailable(m);
         let mut stale_value: Option<Arc<Value>> = None;

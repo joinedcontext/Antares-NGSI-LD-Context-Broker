@@ -94,10 +94,27 @@ pub fn core_context_url(version: &str) -> Option<&'static str> {
 /// does not parse or carries no `@context` is a build defect rather than
 /// anything a request can cause —
 /// `every_pinned_context_parses_and_carries_an_at_context` fails on it.
-pub(crate) fn pinned(url: &str) -> Option<Value> {
-    let (_, body) = PINNED.iter().find(|(u, _)| *u == url)?;
-    let doc: Value = serde_json::from_str(body).ok()?;
-    doc.get("@context").cloned()
+///
+/// Each body is parsed once per process and shared: a resolution, a core
+/// fetch and `core_context` all ask for one.
+pub(crate) fn pinned(url: &str) -> Option<std::sync::Arc<Value>> {
+    static PARSED: std::sync::LazyLock<
+        std::collections::HashMap<&'static str, std::sync::Arc<Value>>,
+    > = std::sync::LazyLock::new(|| {
+        PINNED
+            .iter()
+            .filter_map(|(u, body)| {
+                let doc: Value = serde_json::from_str(body).ok()?;
+                Some((*u, std::sync::Arc::new(doc.get("@context")?.clone())))
+            })
+            .collect()
+    });
+    PARSED.get(url).cloned()
+}
+
+/// Is `url` one of the pinned documents? A table lookup, nothing parsed.
+pub(crate) fn is_pinned(url: &str) -> bool {
+    PINNED.iter().any(|(u, _)| *u == url)
 }
 
 /// Merge a pre-parsed Core @context value (4.4: merged last, so it wins).
@@ -151,7 +168,7 @@ pub(crate) fn merge_document_object(
     base: Option<&str>,
 ) -> Result<(), NgsiError> {
     match base {
-        Some(b) if pinned(b).is_some() => ctx.merge_core_object(obj),
+        Some(b) if is_pinned(b) => ctx.merge_core_object(obj),
         _ => ctx.merge_object(obj),
     }
 }
@@ -215,17 +232,23 @@ fn merge_entry(
                 }
                 _ => url.clone(),
             };
-            let doc = pinned(&resolved)
-                .or_else(|| loader.load(&resolved))
-                .ok_or_else(|| {
-                    NgsiError::LdContextNotAvailable(format!(
-                        "@context {resolved} is not available"
-                    ))
-                })?;
+            let shared = pinned(&resolved);
+            let loaded;
+            let doc: &Value = match &shared {
+                Some(d) => d,
+                None => {
+                    loaded = loader.load(&resolved).ok_or_else(|| {
+                        NgsiError::LdContextNotAvailable(format!(
+                            "@context {resolved} is not available"
+                        ))
+                    })?;
+                    &loaded
+                }
+            };
             merge_entry(
                 loader,
                 ctx,
-                &doc,
+                doc,
                 depth.saturating_add(1),
                 urls,
                 Some(&resolved),
@@ -402,7 +425,7 @@ mod tests {
         }
         let core = pinned(CORE_CONTEXT).expect("the Core @context is pinned");
         assert!(
-            matches!(core, Value::Object(_) | Value::Array(_) | Value::String(_)),
+            matches!(*core, Value::Object(_) | Value::Array(_) | Value::String(_)),
             "the Core @context is not a usable @context value: {core}"
         );
         assert!(
