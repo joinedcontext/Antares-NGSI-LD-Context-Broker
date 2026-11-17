@@ -489,6 +489,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_deref(),
     )?;
     let max_connections = max_connections()?;
+    // a trust bundle that widens nothing fails the start, not every
+    // private-CA egress after it
+    antares_jsonld::check_extra_ca_file()?;
 
     runtime()?.block_on(async {
         let drivers = build_drivers(&store_name, history).await?;
