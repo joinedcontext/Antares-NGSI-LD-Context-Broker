@@ -1302,6 +1302,22 @@ pub(crate) fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String,
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
 
+/// Whether a type selector is a 4.17 expression beyond a plain comma list:
+/// `|` and `,` are OR, `;` AND, brackets group, and `*` (Table 6.4.3.2-1)
+/// selects every type. Such a selector is evaluated as written, never
+/// expanded as one term. A reader that splits a plain list itself asks this.
+pub(crate) fn is_type_expression(t: &str) -> bool {
+    t.contains(['|', ';', '(', ')', '*'])
+}
+
+/// Whether a type selector is anything other than one plain type: a 4.17
+/// expression or a comma list. The readers that compare one type IRI ask
+/// this; an expanded IRI that happens to carry one of the characters is
+/// then evaluated as an expression, which only ever widens what they hold.
+pub(crate) fn is_type_selection(t: &str) -> bool {
+    is_type_expression(t) || t.contains(',')
+}
+
 /// Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
 /// Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
 /// at all. Expanding it as a term yields an IRI nothing matches, which is

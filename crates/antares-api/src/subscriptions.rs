@@ -65,7 +65,7 @@ fn norm_entity_selectors(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
                     // Entities" — is not a term either: expanded,
                     // it becomes an IRI no entity carries and the
                     // subscription notifies nothing.
-                    if t == "*" || t.contains(['|', ',', ';', '(']) {
+                    if crate::entities::is_type_selection(t) {
                         ne.insert("type".into(), ev.clone());
                     } else {
                         ne.insert("type".into(), Value::String(ctx.expand_key(t)));

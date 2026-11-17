@@ -736,7 +736,7 @@ fn intersect_selectors(own: &[Value], reg: &[&Value], ctx: &antares_jsonld::Cont
         };
         for mut s in selectors {
             match s.get("type").and_then(Value::as_str) {
-                Some(t) if t.contains(['|', ';', '(', ')']) => {}
+                Some(t) if crate::entities::is_type_selection(t) => {}
                 Some(t) => {
                     if !r_types.is_empty() && !r_types.iter().any(|r| *r == ctx.expand_key(t)) {
                         continue;
@@ -1313,6 +1313,30 @@ mod tests {
             "information": [{"entities": [{"type": ["Vehicle"], "id": "urn:ngsi-ld:Vehicle:8"}]}],
         });
         assert!(reduced_copy(&st, &sub, &one, "urn:x:r3", &st.loader.core()).is_none());
+    }
+
+    /// A 4.17 selection is kept as written in the copy whatever its form: a
+    /// comma list is one as much as an expression is, and expanded as one
+    /// term it named no type the registration admits, so no copy was sent.
+    #[test]
+    fn a_reduced_copy_keeps_a_type_list_as_written() {
+        let st = AppState::new("antares-ds-list".into());
+        let mut sub = sub_doc();
+        if let Some(o) = sub.as_object_mut() {
+            o.insert("entities".into(), json!([{"type": "Vehicle,Bike"}]));
+        }
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:r4",
+            "endpoint": "http://source.example.org",
+            "information": [{"entities": [{"type": ["Vehicle"]}]}],
+        });
+        let copy = reduced_copy(&st, &sub, &reg, "urn:x:r4", &st.loader.core())
+            .expect("a copy for the listed type the registration covers");
+        assert_eq!(
+            copy["entities"],
+            json!([{"type": "Vehicle,Bike"}]),
+            "{copy}"
+        );
     }
 
     /// a periodic Subscription that watches everything gets no
