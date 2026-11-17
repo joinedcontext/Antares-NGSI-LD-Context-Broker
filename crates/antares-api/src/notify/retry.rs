@@ -11,6 +11,12 @@ pub(crate) fn dead_letters_written() -> u64 {
     DEAD_LETTERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Retry chains one broker runs at once. A failed notification past them
+/// is settled at once: its dead letter is written instead of a chain that
+/// would hold its payload for the policy's age (ADR-0015 parks what the
+/// policy cannot deliver; this parks what the broker cannot hold).
+pub(crate) const RETRY_CHAINS: usize = 256;
+
 /// The retries the delivery policy grants after a failed first attempt,
 /// then the settlement: lastSuccess/status ok on success, a dead letter
 /// when the policy is exhausted.
@@ -35,7 +41,15 @@ pub(super) async fn retry_and_settle(
     let first_at = now_iso();
     let mut made = 1u32;
     let mut last_err = first_err.clone();
-    while let Some(delay) = policy.next_delay(made, started.elapsed()) {
+    let slot = st.retry_slots.try_acquire();
+    if slot.is_err() {
+        last_err = "no retry slot free; settled after the first attempt".into();
+    }
+    while let Some(delay) = slot
+        .is_ok()
+        .then(|| policy.next_delay(made, started.elapsed()))
+        .flatten()
+    {
         tokio::time::sleep(delay).await;
         // the subscription may have gone, or its endpoint may have tripped
         // the breaker meanwhile — a retry is still one more attempt
@@ -50,6 +64,11 @@ pub(super) async fn retry_and_settle(
             return;
         }
         made = made.saturating_add(1);
+        // an open breaker sends nothing: the attempt fails as the first did
+        if st.egress.is_open(tenant.as_str(), uri) {
+            last_err = "circuit open".into();
+            continue;
+        }
         match send_outbound(st, tenant, uri, timeout_ms, &outbound).await {
             Ok(()) => {
                 st.egress.record_success(tenant.as_str(), uri);

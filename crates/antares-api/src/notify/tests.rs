@@ -2099,6 +2099,27 @@ mod delivery_policy_tests {
         assert_eq!(n["status"], json!("failed"));
     }
 
+    /// The retry chains are bounded: past the free slots a failed
+    /// notification is settled at once, its dead letter written after the
+    /// first attempt instead of a chain holding the payload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_past_the_retry_slots_is_dead_lettered_at_once() {
+        let (mut st, t) = state(policy(3, 20_000));
+        st.retry_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let (uri, hits) = flaky_endpoint(usize::MAX).await;
+        let sub = subscribe(&st, &t, SUB_ID, &uri).await;
+        send(&st, &t, &sub).await;
+        wait_until(
+            || async { !letters(&st, &t).await.is_empty() },
+            "dead letter",
+        )
+        .await;
+        let l = letters(&st, &t).await;
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(l[0]["attempts"], json!(1), "no retry was made");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_default_policy_never_retries_and_never_dead_letters() {
         let (st, t) = state(DeliveryPolicy::default());
