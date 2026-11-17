@@ -11,7 +11,9 @@
 //! matching is SQL over `csource_index`, never a scan of a tenant's
 //! registrations; a forwarded query is narrowed to the registration's scope
 //! (4.3.6.1 — spec-mandated, not a bug to be fixed away); and fan-out is
-//! bounded, by a semaphore, a per-source timeout and an aggregate deadline.
+//! bounded, by a semaphore and a per-source timeout. There is no aggregate
+//! deadline: n slow sources hold a request for ceil(n / ANTARES_FED_FANOUT)
+//! source timeouts at worst.
 
 use crate::negotiate::*;
 use crate::paging::pct_encode;
