@@ -944,7 +944,17 @@ async fn resolve_payloads(
     // Past the retention window, or a deployment whose store keeps no outbox.
     // The after-image is still recoverable; the before-image is not, and a
     // guess in its place is a notification that reports a change that did not
-    // happen.
+    // happen. No before-image is a guess too: the matcher reads a change
+    // without one as the entity's creation, so the change notifies nobody.
+    if ev.prev_payload_ref.is_some() {
+        metrics::counter!("antares_claim_check_unresolved_total").increment(1);
+        tracing::warn!(
+            "claim-check row for seq {} is gone: the change to {} notifies nobody",
+            ev.seq,
+            ev.entity_id.as_str()
+        );
+        return (None, None);
+    }
     let after = match ev.payload.clone() {
         Some(v) => Some(v),
         None => match ev.payload_ref.as_ref() {
@@ -957,14 +967,6 @@ async fn resolve_payloads(
             None => None,
         },
     };
-    if ev.prev_payload_ref.is_some() {
-        metrics::counter!("antares_claim_check_unresolved_total").increment(1);
-        tracing::warn!(
-            "claim-check row for seq {} is gone: the change to {} notifies nobody",
-            ev.seq,
-            ev.entity_id.as_str()
-        );
-    }
     (ev.prev_payload.clone(), after)
 }
 
@@ -1192,6 +1194,31 @@ mod tests {
 
         let (before, after) = resolve_payloads(&st, &event(None, None)).await;
         assert!(before.is_none() && after.is_none(), "no payload, no fetch");
+    }
+
+    /// A before-image that was claim-checked and whose kept row is gone
+    /// cannot be recovered. Handing the matcher the after-image alone reads
+    /// as the entity's creation (an `entityCreated` notification for an
+    /// update), so neither half is handed on.
+    #[tokio::test]
+    async fn an_unresolved_before_image_notifies_nobody() {
+        let st = state_with(Some(json!({"id": "urn:ngsi-ld:T:1", "type": "T"}))).await;
+        let r = PayloadRef {
+            entity_id: EntityId::new("urn:ngsi-ld:T:1").expect("id"),
+            version: 1,
+        };
+        for after in [Some(json!({"id": "urn:ngsi-ld:T:1", "type": "T"})), None] {
+            let mut ev = event(after.clone(), after.is_none().then(|| r.clone()));
+            ev.prev_payload_ref = Some(r.clone());
+            let (before, after) = resolve_payloads(&st, &ev).await;
+            assert_eq!((before.as_ref(), after.as_ref()), (None, None), "{ev:?}");
+        }
+        // negative: an inline before-image is no reference and is handed on
+        let mut ev = event(Some(json!({"after": 1})), None);
+        ev.prev_payload = Some(json!({"before": 1}));
+        let (before, after) = resolve_payloads(&st, &ev).await;
+        assert_eq!(before, Some(json!({"before": 1})));
+        assert_eq!(after, Some(json!({"after": 1})));
     }
 
     /// A claim-check fetch is scoped to the EVENT's tenant: a reference must
