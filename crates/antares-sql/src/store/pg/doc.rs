@@ -143,6 +143,122 @@ fn mode_code(reg: &Value) -> i16 {
 /// an absurd registration; OOM loses the process.
 pub const MAX_INDEX_ROWS: usize = 10_000;
 
+/// Ceiling on the text one registration's index rows carry, the companion
+/// of [`MAX_INDEX_ROWS`]: the rows repeat each entity selector once per name
+/// and each name once per selector, so a registration with long selectors
+/// and names multiplies its own size. Rows past it are truncated like rows
+/// past the count ceiling, and a registration-level dimension (`location`,
+/// `scopes`) that would pass it once copied into every row is left NULL,
+/// which the matching read treats as unconstrained.
+pub const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
+
+/// One `csource_index` row: the entity selector and the name it is keyed on,
+/// borrowed from the registration. The registration-level columns are the
+/// same for every row and live in [`IndexShared`], bound once per write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexRow<'a> {
+    pub entity_id: Option<&'a str>,
+    pub id_pattern: Option<&'a str>,
+    pub entity_type: Option<&'a str>,
+    pub property_name: Option<&'a str>,
+    pub relationship_name: Option<&'a str>,
+}
+
+impl IndexRow<'_> {
+    fn bytes(&self) -> usize {
+        [
+            self.entity_id,
+            self.id_pattern,
+            self.entity_type,
+            self.property_name,
+            self.relationship_name,
+        ]
+        .iter()
+        .map(|c| c.map_or(0, str::len))
+        .sum()
+    }
+}
+
+/// The columns every `csource_index` row of one registration shares.
+#[derive(Debug, PartialEq)]
+pub struct IndexShared<'a> {
+    /// A registration carries its geo scope as a RAW GeoJSON geometry under
+    /// `location` (not instance-wrapped like an entity attribute) — see
+    /// antares_api::csource::csr_matches_subscription, which hands exactly
+    /// this value to `matches_geometry`.
+    pub location: Option<String>,
+    pub scopes: Option<Vec<&'a str>>,
+    /// 4.6.3 comma fraction: cast with a bare `::timestamptz` in the INSERT.
+    pub expires_at: Option<String>,
+    pub endpoint: &'a str,
+    pub mode: i16,
+    pub ops: i64,
+    pub tenant_at_peer: Option<&'a str>,
+    pub headers: Option<&'a Value>,
+    /// Table 5.2.9-1 names this member `contextSourceAlias` — the peer's
+    /// tenant-specific loop pseudonym. (`hostAlias` is the prose spelling
+    /// 6.3.18 uses and the csource_index column name; it is not a payload
+    /// member and was never sent by any client.)
+    pub host_alias: Option<&'a str>,
+}
+
+/// The registration members the index is derived from: a write that moves
+/// none of them leaves the index rows as they are.
+const INDEXED_MEMBERS: [&str; 10] = [
+    "information",
+    "endpoint",
+    "location",
+    "scope",
+    "expiresAt",
+    "mode",
+    "operations",
+    "tenant",
+    "contextSourceInfo",
+    "contextSourceAlias",
+];
+
+fn indexed_members(reg: &Value) -> Vec<Option<&Value>> {
+    INDEXED_MEMBERS.iter().map(|k| reg.get(*k)).collect()
+}
+
+/// The registration-level columns of `reg`'s index rows, `rows` of them.
+pub fn index_shared(reg: &Value, rows: usize) -> IndexShared<'_> {
+    let location = reg
+        .get("location")
+        .filter(|g| g.get("type").is_some())
+        .map(Value::to_string);
+    let scopes: Option<Vec<&str>> = reg.get("scope").map(|s| match s {
+        Value::String(one) => vec![one.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => vec![],
+    });
+    // Copied into every row: a dimension that would pass the ceiling there is
+    // left NULL, which the matching read treats as unconstrained.
+    let fits = |bytes: usize| bytes.saturating_mul(rows.max(1)) <= MAX_INDEX_BYTES;
+    let location = location.filter(|g| fits(g.len()));
+    let scopes = scopes.filter(|s| fits(s.iter().map(|x| x.len().saturating_add(1)).sum()));
+    let headers = reg
+        .get("contextSourceInfo")
+        .filter(|h| fits(serde_json::to_vec(h).map_or(usize::MAX, |b| b.len())));
+    IndexShared {
+        location,
+        scopes,
+        expires_at: reg
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .map(|s| antares_store::filter::canonical_datetime(s).into_owned()),
+        endpoint: reg
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        mode: mode_code(reg),
+        ops: ops_mask(reg),
+        tenant_at_peer: reg.get("tenant").and_then(Value::as_str),
+        headers,
+        host_alias: reg.get("contextSourceAlias").and_then(Value::as_str),
+    }
+}
+
 /// Explode one registration document into csource_index rows: each
 /// RegistrationInfo element yields entities × (propertyNames ∪
 /// relationshipNames) rows, with NULL placeholders when a dimension is
@@ -152,61 +268,21 @@ pub const MAX_INDEX_ROWS: usize = 10_000;
 /// NGSI-LD 2.0 readiness: when propertyNames/relationshipNames
 /// merge into attributeNames, the migration is a coalesce of the two name
 /// columns into one attribute_name column — no reshape.
-pub fn index_rows(reg: &Value) -> Vec<Value> {
-    let endpoint = reg
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let common = |entity: Option<&Value>, prop: Option<&str>, rel: Option<&str>| {
-        serde_json::json!({
-            "entity_id": entity.and_then(|e| e.get("id")).and_then(Value::as_str),
-            "id_pattern": entity.and_then(|e| e.get("idPattern")).and_then(Value::as_str),
-            "entity_type": entity.and_then(|e| e.get("type")).and_then(Value::as_str),
-            "property_name": prop,
-            "relationship_name": rel,
-            // A registration carries its geo scope as a RAW GeoJSON
-            // geometry under `location` (not instance-wrapped like an entity
-            // attribute) — see antares_api::csource::csr_matches_subscription,
-            // which hands exactly this value to `matches_geometry`.
-            "location": reg.get("location").filter(|g| g.get("type").is_some())
-                           .map(|g| g.to_string()),
-            "scopes": reg.get("scope").map(|s| match s {
-                Value::String(one) => vec![one.clone()],
-                Value::Array(a) => a.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
-                _ => vec![],
-            }),
-            // 4.6.3 comma fraction: this row's `expires_at` is cast with a
-            // bare `::timestamptz` in the INSERT below.
-            "expires_at": reg.get("expiresAt").and_then(Value::as_str)
-                             .map(antares_store::filter::canonical_datetime),
-            "endpoint": endpoint,
-            "mode": mode_code(reg),
-            "ops": ops_mask(reg),
-            "tenant_at_peer": reg.get("tenant").and_then(Value::as_str),
-            "headers": reg.get("contextSourceInfo"),
-            // Table 5.2.9-1 names this member `contextSourceAlias` — the
-            // peer's tenant-specific loop pseudonym. (`hostAlias` is the
-            // prose spelling 6.3.18 uses and the csource_index column name;
-            // it is not a payload member and was never sent by any client.)
-            "host_alias": reg.get("contextSourceAlias").and_then(Value::as_str),
-        })
-    };
+pub fn index_rows(reg: &Value) -> Vec<IndexRow<'_>> {
     let mut rows = Vec::new();
-    let infos = reg
+    let mut bytes = 0usize;
+    let Some(infos) = reg
         .get("information")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for info in &infos {
-        let names = |k: &str| -> Vec<String> {
+        .filter(|a| !a.is_empty())
+    else {
+        return vec![IndexRow::default()];
+    };
+    for info in infos {
+        let names = |k: &str| -> Vec<&str> {
             info.get(k)
                 .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default()
         };
         // TS 104 175 9.4.2: attributeNames, else the deprecated pair. The
@@ -222,27 +298,34 @@ pub fn index_rows(reg: &Value) -> Vec<Value> {
             _ => vec![None],
         };
         for ent in entities {
+            let field = |k: &str| ent.and_then(|e| e.get(k)).and_then(Value::as_str);
             // Checked per ROW, not per entity: one `information` element with
             // one entity and a million propertyNames never reaches a
             // per-entity check twice, so the vector grew unbounded — the OOM
             // this ceiling exists to prevent.
             for (p, r) in std::iter::once((None, None))
                 .filter(|_| props.is_empty() && rels.is_empty())
-                .chain(props.iter().map(|p| (Some(p.as_str()), None)))
-                .chain(rels.iter().map(|r| (None, Some(r.as_str()))))
+                .chain(props.iter().map(|p| (Some(*p), None)))
+                .chain(rels.iter().map(|r| (None, Some(*r))))
             {
-                if rows.len() >= MAX_INDEX_ROWS {
+                let row = IndexRow {
+                    entity_id: field("id"),
+                    id_pattern: field("idPattern"),
+                    entity_type: field("type"),
+                    property_name: p,
+                    relationship_name: r,
+                };
+                bytes = bytes.saturating_add(row.bytes());
+                if rows.len() >= MAX_INDEX_ROWS || bytes > MAX_INDEX_BYTES {
                     tracing::warn!(
-                        "registration explodes past {MAX_INDEX_ROWS} index rows; truncating"
+                        "registration explodes past the index ceiling \
+                         ({MAX_INDEX_ROWS} rows, {MAX_INDEX_BYTES} bytes); truncating"
                     );
                     return rows;
                 }
-                rows.push(common(ent, p, r));
+                rows.push(row);
             }
         }
-    }
-    if infos.is_empty() {
-        rows.push(common(None, None, None));
     }
     rows
 }
@@ -252,6 +335,8 @@ pub fn index_rows(reg: &Value) -> Vec<Value> {
 /// never a version behind the document. Shared by `upsert` and `mutate` —
 /// the row lock lives in here, so no caller can do it atomically itself.
 ///
+/// The per-row columns are bound as parallel arrays and the shared ones once,
+/// so the statement carries each registration-level member a single time.
 /// The geometry goes through `try_geomfromgeojson` (0001_init.sql): a
 /// location PostGIS cannot parse leaves the column NULL instead of aborting
 /// the write.
@@ -266,25 +351,45 @@ async fn rebuild_csource_index(
         .bind(id)
         .execute(&mut **tx)
         .await?;
+    let rows = index_rows(doc);
+    let shared = index_shared(doc, rows.len());
+    fn column<'a>(
+        rows: &[IndexRow<'a>],
+        f: fn(&IndexRow<'a>) -> Option<&'a str>,
+    ) -> Vec<Option<&'a str>> {
+        rows.iter().map(f).collect()
+    }
     sqlx::query(
-        "INSERT INTO csource_index
+        "WITH g AS (
+           SELECT CASE WHEN ST_IsValid(try_geomfromgeojson($8))
+                       THEN try_geomfromgeojson($8) END AS location)
+         INSERT INTO csource_index
            (tenant_id, registration_id, entity_id, id_pattern, entity_type,
             property_name, relationship_name, scopes, expires_at, endpoint,
             mode, ops, tenant_at_peer, headers, host_alias, location)
-         SELECT $1, $2, e->>'entity_id', e->>'id_pattern', e->>'entity_type',
-                e->>'property_name', e->>'relationship_name',
-                CASE WHEN e->'scopes' = 'null'::jsonb THEN NULL
-                     ELSE ARRAY(SELECT jsonb_array_elements_text(e->'scopes')) END,
-                (e->>'expires_at')::timestamptz, e->>'endpoint',
-                (e->>'mode')::smallint, (e->>'ops')::bigint,
-                e->>'tenant_at_peer', e->'headers', e->>'host_alias',
-                CASE WHEN ST_IsValid(try_geomfromgeojson(e->>'location'))
-                     THEN try_geomfromgeojson(e->>'location') END
-         FROM jsonb_array_elements($3::jsonb) AS e",
+         SELECT $1, $2, e.entity_id, e.id_pattern, e.entity_type,
+                e.property_name, e.relationship_name,
+                $9, $10::timestamptz, $11, $12, $13, $14, $15, $16, g.location
+         FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[])
+                AS e(entity_id, id_pattern, entity_type, property_name, relationship_name),
+              g",
     )
     .bind(tenant.as_str())
     .bind(id)
-    .bind(Value::Array(index_rows(doc)))
+    .bind(column(&rows, |r| r.entity_id))
+    .bind(column(&rows, |r| r.id_pattern))
+    .bind(column(&rows, |r| r.entity_type))
+    .bind(column(&rows, |r| r.property_name))
+    .bind(column(&rows, |r| r.relationship_name))
+    .bind(shared.location.as_deref())
+    .bind(shared.scopes.as_deref())
+    .bind(shared.expires_at.as_deref())
+    .bind(shared.endpoint)
+    .bind(shared.mode)
+    .bind(shared.ops)
+    .bind(shared.tenant_at_peer)
+    .bind(shared.headers)
+    .bind(shared.host_alias)
     .execute(&mut **tx)
     .await
     .map(|_| ())
@@ -653,10 +758,16 @@ impl PgDocStore {
                 return Ok(None);
             };
             let mut doc = self.opened(kind, tenant, id, row.get(0))?;
-            // The match rows are a pure function of the document, so the
-            // rows this write would produce can be compared with the ones
-            // already stored before deciding to touch them.
-            let index_before = matches!(kind, DocKind::Registration).then(|| index_rows(&doc));
+            // The match rows are a pure function of the members they are
+            // derived from, so comparing those members before and after the
+            // write decides whether to touch the rows, without building them.
+            let index_before: Option<Vec<Option<Value>>> = matches!(kind, DocKind::Registration)
+                .then(|| {
+                    indexed_members(&doc)
+                        .into_iter()
+                        .map(|m| m.cloned())
+                        .collect()
+                });
             match f(&mut doc) {
                 Ok(t) => {
                     let context = doc
@@ -690,7 +801,9 @@ impl PgDocStore {
                     // those would drag along rewrites the whole index of a
                     // busy registration for a document the matcher reads
                     // identically.
-                    if index_before.is_some_and(|before| before != index_rows(&doc)) {
+                    if index_before.is_some_and(|before| {
+                        !before.iter().map(Option::as_ref).eq(indexed_members(&doc))
+                    }) {
                         rebuild_csource_index(&mut tx, tenant, id, &doc).await?;
                     }
                     tx.commit().await?;
@@ -1289,6 +1402,46 @@ mod tests {
         assert_eq!(index_rows(&reg).len(), MAX_INDEX_ROWS);
     }
 
+    /// A registration's index costs a bounded multiple of the document: the
+    /// registration-level members are bound once, not copied into each row,
+    /// and the text the rows repeat is capped like their count.
+    #[test]
+    fn the_index_is_bounded_by_the_registration_not_its_product() {
+        let names: Vec<String> = (0..128).map(|i| format!("https://e.org/p{i}")).collect();
+        let entities: Vec<Value> = (0..8)
+            .map(|i| json!({"id": format!("urn:ngsi-ld:V:{i}"), "type": "https://e.org/V"}))
+            .collect();
+        let csi: Vec<Value> = (0..64)
+            .map(|i| json!({"key": format!("x-k{i}"), "value": "v".repeat(1000)}))
+            .collect();
+        let reg = json!({"endpoint": "http://cs:1",
+                         "location": {"type": "Point", "coordinates": [1, 2], "pad": "p".repeat(64_000)},
+                         "information": [{"entities": entities, "propertyNames": names}],
+                         "contextSourceInfo": csi});
+        let doc_bytes = serde_json::to_vec(&reg).expect("json").len();
+        let rows = index_rows(&reg);
+        assert_eq!(rows.len(), 8 * 128);
+        let row_bytes: usize = rows.iter().map(IndexRow::bytes).sum();
+        assert!(
+            row_bytes <= 2 * doc_bytes,
+            "rows carry {row_bytes} B for a {doc_bytes} B registration"
+        );
+        // a member that every row would repeat past the ceiling is left out
+        // (NULL = unconstrained); a small one is kept
+        let shared = index_shared(&reg, MAX_INDEX_ROWS);
+        assert!(shared.location.is_none() && shared.headers.is_none());
+        assert!(index_shared(&reg, 1).location.is_some());
+        // long selectors and names are truncated by bytes, not only by count
+        let long: Vec<String> = (0..100)
+            .map(|i| format!("{i}{}", "n".repeat(500_000)))
+            .collect();
+        let reg = json!({"endpoint": "e", "information": [
+            {"entities": [{"type": "T"}, {"type": "U"}], "propertyNames": long}]});
+        let rows = index_rows(&reg);
+        assert!(rows.iter().map(IndexRow::bytes).sum::<usize>() <= MAX_INDEX_BYTES);
+        assert!(rows.len() < 200);
+    }
+
     #[test]
     fn index_rows_explode_information() {
         // 2 entities × (1 property + 1 relationship) = 4 rows
@@ -1307,22 +1460,23 @@ mod tests {
         });
         let rows = index_rows(&reg);
         assert_eq!(rows.len(), 4);
+        let shared = index_shared(&reg, rows.len());
+        assert_eq!(shared.endpoint, "http://cs.example:9090");
+        assert_eq!(shared.mode, 3);
+        assert_eq!(shared.expires_at.as_deref(), Some("2030-01-01T00:00:00Z"));
         assert!(rows
             .iter()
-            .all(|r| r["endpoint"] == "http://cs.example:9090"
-                && r["mode"] == 3
-                && r["expires_at"] == "2030-01-01T00:00:00Z"));
+            .any(|r| r.entity_id == Some("urn:a") && r.property_name == Some("speed")));
         assert!(rows
             .iter()
-            .any(|r| r["entity_id"] == "urn:a" && r["property_name"] == "speed"));
-        assert!(rows
-            .iter()
-            .any(|r| r["id_pattern"] == "urn:.*" && r["relationship_name"] == "isParked"));
+            .any(|r| r.id_pattern == Some("urn:.*") && r.relationship_name == Some("isParked")));
         // attribute-less info: one row per entity, both attr columns NULL
         let bare = json!({"endpoint": "e", "information": [{"entities": [{"type": "T"}]}]});
         let rows = index_rows(&bare);
         assert_eq!(rows.len(), 1);
-        assert!(rows[0]["property_name"].is_null() && rows[0]["relationship_name"].is_null());
+        assert!(rows[0].property_name.is_none() && rows[0].relationship_name.is_none());
+        // no information at all: one unconstrained row
+        assert_eq!(index_rows(&json!({"endpoint": "e"})), [IndexRow::default()]);
     }
 
     /// TS 104 175 9.4.2: `attributeNames` scopes the rows, and the
@@ -1336,10 +1490,7 @@ mod tests {
                              "propertyNames": ["brand"]}]
         });
         let rows = index_rows(&reg);
-        let mut names: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| r["property_name"].as_str())
-            .collect();
+        let mut names: Vec<&str> = rows.iter().filter_map(|r| r.property_name).collect();
         names.sort_unstable();
         assert_eq!(names, ["owner", "speed"]);
     }
