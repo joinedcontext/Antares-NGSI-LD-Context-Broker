@@ -1339,6 +1339,34 @@ mod tests {
         );
     }
 
+    /// 5.2.8 keeps a typeless EntityInfo registrable (the IOP fixture
+    /// context-source-registration-exclusive-1 registers one), and the copy
+    /// a source receives still never carries a selector without a type: the
+    /// subscriber's type is kept, the EntityInfo's id narrows it.
+    #[test]
+    fn a_typeless_entity_info_yields_only_typed_selectors() {
+        let st = AppState::new("antares-ds-typeless".into());
+        let mut sub = sub_doc();
+        if let Some(o) = sub.as_object_mut() {
+            o.insert(
+                "entities".into(),
+                json!([{"type": format!("{DC}OffStreetParking")}]),
+            );
+        }
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:r5",
+            "endpoint": "http://source.example.org",
+            "information": [{"entities": [{"id": "urn:ngsi-ld:OffStreetParking:2"}]}],
+        });
+        let copy = reduced_copy(&st, &sub, &reg, "urn:x:r5", &st.loader.core())
+            .expect("a copy for the registered id");
+        assert_eq!(
+            copy["entities"],
+            json!([{"type": format!("{DC}OffStreetParking"), "id": "urn:ngsi-ld:OffStreetParking:2"}]),
+            "{copy}"
+        );
+    }
+
     /// a periodic Subscription that watches everything gets no
     /// watchedAttributes in its copy: 5.2.12 forbids the pair with
     /// timeInterval, so the source refused every such copy.
