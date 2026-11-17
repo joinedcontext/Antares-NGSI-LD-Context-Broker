@@ -738,8 +738,10 @@ impl AppState {
         // 6.3.8 is the mandatory binding; clause 7's MQTT one is optional and
         // registers only when compiled in. Both go through the registry, so
         // notification delivery never names a transport.
+        // it sends POSTs only (notifications, snapshot pushes): it follows
+        // no redirect that would turn one into a GET
         let http = outbound_client(
-            egress_policy,
+            antares_jsonld::post_client_builder(egress_policy),
             std::time::Duration::from_secs(slow_factor().saturating_mul(5)),
         );
         let mut sinks = antares_notifier::SinkRegistry::default();
@@ -764,7 +766,7 @@ impl AppState {
                 max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
                 http: http.clone(),
                 fed_http: outbound_client(
-                    egress_policy,
+                    antares_jsonld::client_builder(egress_policy),
                     std::time::Duration::from_secs(slow_factor().saturating_mul(8)),
                 ),
                 sinks: Arc::new(sinks),
@@ -1137,11 +1139,11 @@ pub fn slow_factor() -> u64 {
 }
 
 fn outbound_client(
-    policy: antares_jsonld::EgressPolicy,
+    builder: reqwest::ClientBuilder,
     total: std::time::Duration,
 ) -> antares_jsonld::HttpClient {
     let b = antares_jsonld::with_timeouts(
-        antares_jsonld::client_builder(policy),
+        builder,
         std::time::Duration::from_secs(slow_factor().saturating_mul(2)),
         total,
     );

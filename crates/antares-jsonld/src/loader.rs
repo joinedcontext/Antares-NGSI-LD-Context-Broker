@@ -474,6 +474,21 @@ pub fn install_crypto_provider() {}
 /// Read once per builder call — the wiring constructs clients at startup.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn client_builder(policy: EgressPolicy) -> reqwest::ClientBuilder {
+    policed_builder(policy, false)
+}
+
+/// [`client_builder`] for a client that sends POSTs (notifications,
+/// snapshot pushes): it follows only the redirects that keep the method
+/// and the body, 307 and 308. A 301, 302 or 303 would turn the POST into a
+/// body-less GET, whose 2xx says nothing about the payload, so that answer
+/// is handed back to the caller as it is, a non-2xx it books as a failure.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn post_client_builder(policy: EgressPolicy) -> reqwest::ClientBuilder {
+    policed_builder(policy, true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn policed_builder(policy: EgressPolicy, keep_method: bool) -> reqwest::ClientBuilder {
     // SSRF: `PolicyResolver` only fires for HOSTNAME targets — reqwest
     // dials IP-LITERAL URLs directly, so a `302 Location: http://169.254.169.254/`
     // would skip the egress check on every hop. The custom redirect policy
@@ -486,6 +501,14 @@ pub fn client_builder(policy: EgressPolicy) -> reqwest::ClientBuilder {
         if attempt.previous().len() > MAX_REDIRECTS {
             // same shape as Policy::limited: a redirect error, is_redirect()==true
             return attempt.error(format!("exceeded {MAX_REDIRECTS} redirects"));
+        }
+        if keep_method
+            && !matches!(
+                attempt.status(),
+                reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::PERMANENT_REDIRECT
+            )
+        {
+            return attempt.stop();
         }
         // `Url` hands back an IPv6 host bracketed (`[::1]`), which
         // `IpAddr::from_str` rejects — trim as `check_host` does, or every
@@ -542,6 +565,12 @@ pub fn client_builder(policy: EgressPolicy) -> reqwest::ClientBuilder {
 #[cfg(target_arch = "wasm32")]
 pub fn client_builder(_policy: EgressPolicy) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(missing_docs)] // documented on the native arm above
+pub fn post_client_builder(policy: EgressPolicy) -> reqwest::ClientBuilder {
+    client_builder(policy)
 }
 
 /// Client timeouts are native knobs; the browser's fetch has no
@@ -1916,6 +1945,82 @@ mod tests {
             MAX_REDIRECTS + 1,
             "one initial request plus MAX_REDIRECTS hops"
         );
+    }
+
+    /// A POST that meets a 302 must not be re-sent as a body-less GET and
+    /// reported by its 2xx: the POST client hands the 302 back, while a 307
+    /// (which keeps the method and the body) is still followed. The GET
+    /// client follows both, as an @context fetch needs.
+    #[tokio::test]
+    async fn post_client_follows_only_method_keeping_redirects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = head.lines().next().unwrap_or_default().to_owned();
+                let resp = if line.contains("/found") {
+                    format!("HTTP/1.1 302 Found\r\nLocation: http://{addr}/target\r\nContent-Length: 0\r\n\r\n")
+                } else if line.contains("/temporary") {
+                    format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr}/target\r\nContent-Length: 0\r\n\r\n")
+                } else {
+                    // the target answers 200 to any method, naming it
+                    let method = line.split(' ').next().unwrap_or_default().to_owned();
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{method}",
+                        method.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let policy = EgressPolicy {
+            allow_private: true,
+            private_hosts: &[],
+        };
+        let post = post_client_builder(policy)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let r = post
+            .post(format!("http://{addr}/found"))
+            .body("payload")
+            .send()
+            .await
+            .expect("answer");
+        assert_eq!(
+            r.status().as_u16(),
+            302,
+            "a 302 is handed back, not followed"
+        );
+        let r = post
+            .post(format!("http://{addr}/temporary"))
+            .body("payload")
+            .send()
+            .await
+            .expect("answer");
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(r.text().await.expect("body"), "POST", "307 keeps the POST");
+        // negative: the GET client still follows a 302
+        let get = client_builder(policy)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let r = get
+            .get(format!("http://{addr}/found"))
+            .send()
+            .await
+            .expect("answer");
+        assert_eq!(r.status().as_u16(), 200, "a GET follows a 302");
     }
 
     // SSRF: a redirect to a private IP LITERAL is refused per hop even
