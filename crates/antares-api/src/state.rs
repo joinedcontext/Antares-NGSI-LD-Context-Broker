@@ -492,6 +492,11 @@ pub struct Shared {
     /// How a notification is delivered: attempts, backoff, age ceiling.
     /// Default = one attempt (5.8.6 as written).
     pub delivery: antares_notifier::DeliveryPolicy,
+    /// Retry chains of failed notifications running at once
+    /// (`notify::RETRY_CHAINS`): each holds its payload for the policy's
+    /// whole age, so a fast-failing endpoint under a write stream could
+    /// otherwise grow them without limit.
+    pub(crate) retry_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::ops::Deref for AppState {
@@ -799,6 +804,7 @@ impl AppState {
                 public_url,
                 snapshot_cap: 1024,
                 delivery: antares_notifier::DeliveryPolicy::default(),
+                retry_slots: Arc::new(tokio::sync::Semaphore::new(crate::notify::RETRY_CHAINS)),
             }),
         }
     }
