@@ -1737,3 +1737,46 @@ async fn a_snapshot_listing_that_fails_is_not_read_as_empty() {
     .await;
     assert!(!status.is_success(), "{status}: {body}");
 }
+
+/// 5.16.3 / 6.3.22: a snapshot the store cannot read right now is an error,
+/// not one that does not exist: a 404 would tell the client to create it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_16_3_an_unreadable_snapshot_is_not_reported_missing() {
+    use antares_store::Kind;
+    use std::sync::Arc;
+
+    let mut st = state().await;
+    let snap = json!({"type": "Snapshot",
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, headers, body) =
+        send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let loc = headers
+        .get("Location")
+        .and_then(|v| v.to_str().ok())
+        .expect("Location header")
+        .to_owned();
+    let ready = wait_ready(&st, &loc).await;
+    let sid = ready["id"].as_str().expect("id").to_owned();
+    st.store = Arc::new(common::Double::refusing_doc(
+        st.store.clone(),
+        Kind::Snapshot,
+        &sid,
+    ));
+    let (status, _, body) = send_h(&st, "GET", &loc, None, &[]).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_ne!(
+        body["type"],
+        "https://uri.etsi.org/ngsi-ld/errors/ResourceNotFound"
+    );
+    let (status, _, body) = send_h(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Vehicle",
+        None,
+        &[("NGSILD-Snapshot", &sid)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}

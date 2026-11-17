@@ -103,13 +103,19 @@ fn is_snapshot(meta: &Value) -> bool {
 /// the sweep tick, not by the request that found the expiry. Snapshot docs
 /// live in the store (Kind::Snapshot) so restarts keep them on persistent
 /// store modes.
-pub(crate) async fn snap_get(st: &AppState, tenant: &TenantId, id: &str) -> Option<Value> {
-    st.store
+/// A store that cannot answer is an error, never "no such snapshot": read as
+/// absent, one failed read mid-fill purged the copy as if the snapshot had
+/// been deleted, and a read answered 404 for a snapshot that exists.
+pub(crate) async fn snap_get(
+    st: &AppState,
+    tenant: &TenantId,
+    id: &str,
+) -> Result<Option<Value>, NgsiError> {
+    Ok(st
+        .store
         .get(tenant, Kind::Snapshot, id)
-        .await
-        .ok()
-        .flatten()
-        .filter(|meta| is_snapshot(meta) && !expired(meta))
+        .await?
+        .filter(|meta| is_snapshot(meta) && !expired(meta)))
 }
 
 /// 5.16.1.4: "If the NGSI-LD endpoint already knows about this Snapshot …
@@ -707,8 +713,14 @@ pub async fn create_snapshot(
 /// 5.16.1.4 background fill: execute every (temporal) query, store the
 /// results under the synthetic tenant, derive the status, notify.
 async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
-    let Some(meta) = snap_get(st, tenant, id).await else {
-        return;
+    let meta = match snap_get(st, tenant, id).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("snapshot {id} unreadable at fill start: {e}");
+            finish(st, tenant, id, "failure", None).await;
+            return;
+        }
     };
     let Some(synth) = synth_tenant(&meta) else {
         return;
@@ -974,7 +986,7 @@ async fn run_temporal_query(
     loop {
         // a snapshot deleted (or evicted) mid-fill stops the paging; what is
         // already copied is reaped by the caller
-        if snap_get(st, tenant, id).await.is_none() {
+        if matches!(snap_get(st, tenant, id).await, Ok(None)) {
             break;
         }
         vp.insert("limit".into(), st.max_limit.to_string());
@@ -1089,8 +1101,13 @@ async fn finish(
     status: &str,
     details: Option<(Vec<Value>, Vec<Value>)>,
 ) {
-    let Some(mut meta) = snap_get(st, tenant, id).await else {
-        return;
+    let mut meta = match snap_get(st, tenant, id).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("snapshot {id} unreadable, status {status} not written: {e}");
+            return;
+        }
     };
     if let Some(o) = meta.as_object_mut() {
         o.insert("snapshotStatus".into(), Value::String(status.into()));
@@ -1266,7 +1283,7 @@ pub async fn retrieve_snapshot(
         gate!(st, &tenant, &headers, "5.16.3", ids: &[&id]).await?;
         let accept = parse_accept(&headers)?;
         let meta = snap_get(&st, &tenant, &id)
-            .await
+            .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
         let ctx = st.loader.core();
         Ok::<_, ApiError>(respond(
@@ -1298,7 +1315,7 @@ pub async fn update_snapshot(
             .value;
         let mut frag = validate(&v, Mode::Update)?;
         let mut meta = snap_get(&st, &tenant, &id)
-            .await
+            .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
         if let Some(o) = meta.as_object_mut() {
             keep_receiver_info(&mut frag, o)?;
@@ -1358,7 +1375,7 @@ pub async fn delete_snapshot(
         let tenant = open_snapshot(&params, &headers, &id)?;
         gate!(st, &tenant, &headers, "5.16.5", ids: &[&id]).await?;
         let meta = snap_get(&st, &tenant, &id)
-            .await
+            .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
         snap_remove(&st, &tenant, &id, &meta).await;
         Ok::<_, ApiError>(no_content(&tenant))
@@ -1379,7 +1396,7 @@ pub async fn clone_snapshot(
         let tenant = open_snapshot(&params, &headers, &id)?;
         gate!(st, &tenant, &headers, "5.16.2", ids: &[&id]).await?;
         let src = snap_get(&st, &tenant, &id)
-            .await
+            .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
         // 5.16.2.3 makes the clone body optional; a body that IS sent obeys
         // the 6.3.5 @context rules
@@ -1422,14 +1439,21 @@ pub async fn clone_snapshot(
 /// copy stops at the same ceiling a fill does (5.5.6).
 async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str) {
     let src = loop {
-        let Some(src) = snap_get(st, tenant, src_id).await else {
-            finish(st, tenant, new_id, "failure", None).await;
-            return;
-        };
-        if src.get("snapshotStatus").and_then(Value::as_str) != Some("preparing") {
-            break src;
+        match snap_get(st, tenant, src_id).await {
+            Ok(None) => {
+                finish(st, tenant, new_id, "failure", None).await;
+                return;
+            }
+            Ok(Some(src))
+                if src.get("snapshotStatus").and_then(Value::as_str) != Some("preparing") =>
+            {
+                break src;
+            }
+            Ok(Some(_)) => {}
+            // a read that failed says nothing about the source: look again
+            Err(e) => tracing::warn!("snapshot {src_id} unreadable while cloned: {e}"),
         }
-        if snap_get(st, tenant, new_id).await.is_none() {
+        if matches!(snap_get(st, tenant, new_id).await, Ok(None)) {
             return;
         }
         // the browser's own timer on wasm32 (tokio time has no reactor there)
@@ -1442,6 +1466,8 @@ async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str
         synth_tenant(&src),
         snap_get(st, tenant, new_id)
             .await
+            .ok()
+            .flatten()
             .as_ref()
             .and_then(synth_tenant),
     ) else {
@@ -1569,11 +1595,15 @@ async fn scoped(
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    let Some(meta) = snap_get(st, &tenant, sid).await else {
-        return ApiError::from(NgsiError::ResourceNotFound(format!(
-            "snapshot {sid} not found"
-        )))
-        .into_response();
+    let meta = match snap_get(st, &tenant, sid).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            return ApiError::from(NgsiError::ResourceNotFound(format!(
+                "snapshot {sid} not found"
+            )))
+            .into_response()
+        }
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let Some(synth) = synth_tenant(&meta) else {
         return ApiError::from(NgsiError::InternalError("snapshot without tenant".into()))
@@ -1610,7 +1640,8 @@ fn fill_cap(st: &AppState) -> usize {
 /// document, so a fill whose snapshot was deleted (or evicted under resource
 /// pressure) must stop and free what it already copied.
 async fn fill_cancelled(st: &AppState, tenant: &TenantId, id: &str, synth: &TenantId) -> bool {
-    if snap_get(st, tenant, id).await.is_some() {
+    // only a snapshot known to be gone cancels: a failed read does not
+    if !matches!(snap_get(st, tenant, id).await, Ok(None)) {
         return false;
     }
     purge_synth(st, synth).await;
@@ -1684,7 +1715,10 @@ mod clause_5_16 {
             .await
             .expect("seed index");
 
-        assert!(snap_get(&st, &t, id).await.is_none(), "5.16: not served");
+        assert!(
+            snap_get(&st, &t, id).await.expect("read").is_none(),
+            "5.16: not served"
+        );
         assert!(
             st.store
                 .get(&t, Kind::Snapshot, id)
@@ -1750,7 +1784,10 @@ mod clause_5_16 {
             .expect("seed marker");
 
         assert_eq!(sweep_expired_snapshots(&st, &t).await, 0);
-        assert!(snap_get(&st, &t, live).await.is_some(), "live one survives");
+        assert!(
+            snap_get(&st, &t, live).await.expect("read").is_some(),
+            "live one survives"
+        );
         assert!(
             st.store
                 .get(&t, Kind::Snapshot, "snap-default-marker")
@@ -2564,7 +2601,7 @@ mod clause_5_16 {
         let t = TenantId::default();
         let sid = "urn:ngsi-ld:Snapshot:race";
         seeded_snapshot(&st, sid, "preparing").await;
-        let mut read_by_fill = snap_get(&st, &t, sid).await.expect("meta");
+        let mut read_by_fill = snap_get(&st, &t, sid).await.expect("read").expect("meta");
         let (status, _, b) = send(
             &st,
             "PATCH",
