@@ -43,14 +43,34 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// Every predicate at once: active, entities selector (5.2.33), `q` /
-/// `scopeQ` / `geoQ` conditions, throttling window. `lookup` resolves 4.9
-/// linked-entity terms (`attr{…}`); `&|_| None` when no store is at hand.
+/// Every predicate at once: active, entities selector (5.2.33) or, without
+/// one, `watchedAttributes`, `q` / `scopeQ` / `geoQ` conditions, throttling
+/// window. `lookup` resolves 4.9 linked-entity terms (`attr{…}`); `&|_| None`
+/// when no store is at hand.
 pub fn would_notify(sub: &Value, doc: &Value, ctx: &Context, lookup: EntityLookup) -> bool {
     is_active(sub)
         && selector_match(sub, doc, ctx)
+        && watched_match(sub, doc)
         && conditions_match(sub, doc, ctx, lookup)
         && !throttled(sub)
+}
+
+/// 5.8.1.4: "If no subscribed entities have been specified, all entities
+/// with attributes matching at least one member of watchedAttributes are
+/// subscribed to." A subscription with an `entities` selector, or without
+/// `watchedAttributes`, is not narrowed here. The names are the stored
+/// (expanded) IRIs, as the entity's attribute keys are.
+pub fn watched_match(sub: &Value, doc: &Value) -> bool {
+    if sub.get("entities").is_some() {
+        return true;
+    }
+    let Some(watched) = sub.get("watchedAttributes").and_then(Value::as_array) else {
+        return true;
+    };
+    watched
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|a| doc.get(a).is_some())
 }
 
 /// 5.8.1.4 / 5.2.12: `isActive` false or an `expiresAt` in the past means
@@ -222,6 +242,24 @@ mod tests {
     use std::sync::Arc;
 
     const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context";
+
+    /// 5.8.1.4: without `entities`, a subscription takes the entities that
+    /// carry at least one watched attribute, and only those.
+    #[test]
+    fn watched_attributes_alone_subscribe_only_entities_that_carry_one() {
+        let sub = json!({"type": "Subscription",
+                         "watchedAttributes": [format!("{DC}/speed")]});
+        let with = json!({"id": "urn:a", "type": [format!("{DC}/V")],
+                          format!("{DC}/speed"): [{"type": "Property", "value": 1}]});
+        let without = json!({"id": "urn:b", "type": [format!("{DC}/V")],
+                             format!("{DC}/brand"): [{"type": "Property", "value": "x"}]});
+        assert!(would_notify(&sub, &with, &ctx(), &|_| None));
+        assert!(!would_notify(&sub, &without, &ctx(), &|_| None));
+        // a selector decides the entity set itself
+        let selected = json!({"type": "Subscription", "entities": [{"type": format!("{DC}/V")}],
+                              "watchedAttributes": [format!("{DC}/speed")]});
+        assert!(would_notify(&selected, &without, &ctx(), &|_| None));
+    }
 
     /// The core context once per process, with no loader behind it: the
     /// interpreter-run of these tests (Miri) must not pay for a cache and an

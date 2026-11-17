@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Holds every ETSI NGSI-LD test suite Subscription fixture against the suite's Building and
-//! Vehicle Entities and prints which of the two each would notify for. The selector types are
-//! expanded first, as a broker stores them; a `q`, `geoQ` or `watchedAttributes` applies as-is.
+//! Vehicle Entities and prints which of the two each would notify for. The selector types and
+//! the `watchedAttributes` names are expanded first, as a broker stores them; a `q` or `geoQ`
+//! applies as-is.
 //!
 //!     cargo run -p ngsild-matcher --example suite_subscriptions [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
@@ -55,6 +56,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|t| ctx.expand_key(t))
                 {
                     sel.insert("type".into(), t.into());
+                }
+            }
+        }
+        if let Some(Value::Array(names)) = sub.get_mut("watchedAttributes") {
+            for name in names.iter_mut() {
+                if let Some(n) = name.as_str().map(|n| ctx.expand_key(n)) {
+                    *name = n.into();
                 }
             }
         }

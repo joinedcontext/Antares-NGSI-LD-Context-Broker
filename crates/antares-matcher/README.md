@@ -10,6 +10,7 @@ semantics (published as `ngsild-matcher` once released).
 | `would_notify`: every predicate below at once | 5.8.6 |
 | `is_active`: `isActive` and `expiresAt` | 5.8.1.4, 5.2.12 |
 | `selector_match`: the `entities` selector, `id`, `idPattern`, `type` and its selection language | 5.2.33, 4.17 |
+| `watched_match`: without `entities`, the Entity carries a `watchedAttributes` member | 5.8.1.4 |
 | `conditions_match`: `q`, `scopeQ` and `geoQ` together | 4.9, 4.19, 4.10 |
 | `geo_params`: a Subscription's `geoQ` in the 4.10 parameter shape | Table 5.2.13-1 |
 | `throttled`: the `throttling` window since the last notification | 5.2.12 |
