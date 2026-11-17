@@ -448,10 +448,14 @@ async fn retrieve_entity_inner(
             ));
         }
     }
-    let payload = if accept == Accept::GeoJson {
-        to_geojson_feature(payload, params.get("geometryProperty"))
-    } else {
-        payload
+    // join=flat answers an array (the Entity and the ones it links), which
+    // geo+json serves as a FeatureCollection, one Feature per Entity
+    let payload = match (accept, payload) {
+        (Accept::GeoJson, Value::Array(all)) => {
+            crate::repr::to_geojson_collection(all, params.get("geometryProperty"))
+        }
+        (Accept::GeoJson, one) => to_geojson_feature(one, params.get("geometryProperty")),
+        (_, payload) => payload,
     };
     let mut resp = respond_prefer(StatusCode::OK, payload, &ctx, accept, &tenant, headers);
     attach_warnings(&mut resp, &warnings);
