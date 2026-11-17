@@ -57,3 +57,55 @@ async fn erase_before_reads_the_instance_instant_and_drops_emptied_attributes() 
     assert!(left.get("https://e.org/a").is_none(), "{left}");
     assert!(left.get("https://e.org/b").is_some(), "{left}");
 }
+
+/// A temporal query is narrowed by its ids, types and attrs before the
+/// memory arm clones a document, as the Postgres arm's WHERE narrows it:
+/// what comes back is the matching history, not the tenant's.
+#[tokio::test]
+async fn temporal_query_clones_only_the_matching_history() {
+    let s = AnyStore::Mem(Store::default());
+    let t = TenantId::default();
+    for (id, ty, attr) in [
+        ("urn:x:t1", "https://e.org/A", "https://e.org/a"),
+        ("urn:x:t2", "https://e.org/B", "https://e.org/a"),
+        ("urn:x:t3", "https://e.org/A", "https://e.org/b"),
+    ] {
+        let doc = json!({"id": id, "type": [ty],
+                         attr: [{"type": "Property", "value": 1, "instanceId": format!("{id}:i"),
+                                 "observedAt": "2026-01-01T00:00:00Z"}]});
+        assert!(s.create(&t, Kind::Temporal, id, doc).await.expect("create"));
+    }
+    let ids = ["urn:x:t1", "urn:x:t2"];
+    let types = ["https://e.org/A".to_owned()];
+    let attrs = ["https://e.org/a".to_owned()];
+    let by_ids = antares_store::filter::TemporalFilter {
+        ids: Some(&ids),
+        ..Default::default()
+    };
+    assert_eq!(ids_of(&s, &t, &by_ids).await, ["urn:x:t1", "urn:x:t2"]);
+    let by_type_and_attr = antares_store::filter::TemporalFilter {
+        types: Some(&types),
+        attrs: Some(&attrs),
+        ..Default::default()
+    };
+    assert_eq!(ids_of(&s, &t, &by_type_and_attr).await, ["urn:x:t1"]);
+    let all = antares_store::filter::TemporalFilter::default();
+    assert_eq!(ids_of(&s, &t, &all).await.len(), 3);
+}
+
+async fn ids_of(
+    s: &AnyStore,
+    t: &TenantId,
+    f: &antares_store::filter::TemporalFilter<'_>,
+) -> Vec<String> {
+    let mut got: Vec<String> = s
+        .query_temporal(t, f)
+        .await
+        .expect("query")
+        .rows
+        .iter()
+        .filter_map(|d| d["id"].as_str().map(str::to_owned))
+        .collect();
+    got.sort();
+    got
+}
