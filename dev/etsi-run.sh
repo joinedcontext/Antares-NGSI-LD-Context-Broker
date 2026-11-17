@@ -9,6 +9,17 @@
 #   SUITES         robot suite dirs, default: the Scorpio serial order
 #   STOP_ON_ERROR  default 1 (local loop: stop at the FIRST failing TP);
 #                  CI sets 0 to run the whole suite and report everything
+#   TESTSUITE      ours (default) | etsi | both. etsi = the official suite,
+#                  fetched fresh (dev/etsi-upstream.sh, ETSI_REF) into a temp
+#                  dir with its own venv, both deleted on exit; both = ours,
+#                  then etsi into ETSI_RESULTS_DIR (default $RESULTS_DIR-etsi)
+#   ETSI_SUITE     an already fetched official tree to run instead (the
+#                  pipeline passes its own; the caller owns and deletes it)
+#   ETSI_VENV      venv for that tree (default: next to it)
+#   ETSI_SUITES    robot dirs of the official copy for TESTSUITE=both
+#                  (default: every TP/NGSI-LD/*/* dir of that copy)
+#   ETSI_STOP_ON_ERROR  the official copy's STOP_ON_ERROR under both (default
+#                  0: its gate, dev/etsi-baseline.py, judges a whole run)
 # -e stays off: a failing TP is a result to report, not an abort.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -18,6 +29,80 @@ SUITE="${SUITE:-./ngsi-ld-test-suite}"
 STOP_ON_ERROR="${STOP_ON_ERROR:-1}"
 CALLBACK_HOST="${CALLBACK_HOST:-localhost}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
+
+# Which copy of the suite: ours (default, ./ngsi-ld-test-suite), etsi (the
+# official suite, fetched fresh by dev/etsi-upstream.sh — never stored here),
+# or both, one after the other, each with its own results dir and venv.
+case "${TESTSUITE:-ours}" in
+  ours) ;;
+  both)
+    TESTSUITE=ours dev/etsi-run.sh; ours_status=$?
+    [ "$ours_status" != 0 ] && [ "$STOP_ON_ERROR" = 1 ] && exit "$ours_status"
+    TESTSUITE=etsi SUITES="${ETSI_SUITES:-}" STOP_ON_ERROR="${ETSI_STOP_ON_ERROR:-0}" \
+      RESULTS_DIR="${ETSI_RESULTS_DIR:-$RESULTS_DIR-etsi}" dev/etsi-run.sh; etsi_status=$?
+    exit $(( ours_status || etsi_status )) ;;
+  etsi)
+    # The official copy, run as published: no file in it is touched. What
+    # our copy gets by sed on variables.py it gets as robot --variable.
+    # ETSI_SUITE given = a tree the caller fetched (and deletes); unset = fetch one
+    # for this run into a temp dir, removed on exit with its venv.
+    if [ -z "${ETSI_SUITE:-}" ]; then
+      ETSI_TMP=$(mktemp -d)
+      trap 'rm -rf "$ETSI_TMP"' EXIT
+      mkdir -p "$RESULTS_DIR"
+      if ! dev/etsi-upstream.sh fetch "$ETSI_TMP" >/dev/null; then
+        cp "$ETSI_TMP/etsi-upstream.txt" "$RESULTS_DIR/"
+        echo "ETSI upstream suite skipped: $(sed -n 's/^status=//p' "$RESULTS_DIR/etsi-upstream.txt")"
+        exit 0
+      fi
+      cp "$ETSI_TMP/etsi-upstream.txt" "$RESULTS_DIR/"
+      ETSI_SUITE="$ETSI_TMP/ngsi-ld-test-suite"
+    fi
+    VENV="${ETSI_VENV:-$(dirname "$ETSI_SUITE")/venv}"
+    # its own venv from its own requirements.txt (they may pin other versions
+    # than ours); HttpCtrl is an editable install out of the fetched tree, so
+    # a venv that outlived its tree is rebuilt
+    { [ -x "$VENV/bin/robot" ] && "$VENV/bin/python" -c "import HttpCtrl" >/dev/null 2>&1; } \
+      || { rm -rf "$VENV"; dev/etsi-upstream.sh venv "$ETSI_SUITE" "$VENV"; } \
+      || { echo "venv for the ETSI copy failed"; exit 1; }
+    SUITES="${SUITES:-$(dev/etsi-upstream.sh suites "$ETSI_SUITE")}"
+    # a copy whose own `url` names no /ngsi-ld/v1 adds the path itself
+    api_url=$BROKER_URL
+    grep -q "^url = '.*/ngsi-ld/v1/\?'" "$ETSI_SUITE/resources/variables.py" \
+      || api_url=${BROKER_URL%/ngsi-ld/v1}
+    hostpath="${BROKER_URL#*://}"
+    root_path=""
+    [ "$hostpath" = "${hostpath#*/}" ] || root_path="/${hostpath#*/}"
+    # Same values as our copy's sed lines. Not set: the suite @context and the
+    # MQTT host, which stay the copy's own (its context from forge, its own
+    # mosquitto on 127.0.0.1 — the brokers are host-networked).
+    EXTRA=(--variable "url:$api_url" --variable "temporal_api_url:$api_url"
+           --variable "notification_server_host:$CALLBACK_HOST"
+           --variable "context_source_host:$CALLBACK_HOST"
+           --variable "context_server_host:$CALLBACK_HOST"
+           --variable "entities_path:${root_path%/}/entities"
+           --exclude config_no_temporal)
+    [ "$STOP_ON_ERROR" = 1 ] && EXTRA+=(--exitonfailure)
+    [ "${MQTT:-1}" = 1 ] || EXTRA+=(--exclude '*mqtt*')
+    mkdir -p "$RESULTS_DIR"
+    out=$(cd "$RESULTS_DIR" && pwd)
+    status=0
+    for s in $SUITES; do
+      [ -d "$ETSI_SUITE/TP/NGSI-LD/$s" ] || { echo "ETSI copy has no TP/NGSI-LD/$s"; status=1; continue; }
+      name="${s//\//_}"
+      echo "=== ETSI upstream: $s ==="
+      [ -n "${PHASE_FILE:-}" ] && echo "$name" > "$PHASE_FILE"
+      bash dev/reset-broker.sh "$BROKER_URL"
+      (cd "$ETSI_SUITE" && "$VENV/bin/robot" \
+          --outputdir "$out/$name" \
+          "${EXTRA[@]}" \
+          "TP/NGSI-LD/$s") 2>&1 | tee "$out/$name-console.log" \
+        || { status=$?; [ "$STOP_ON_ERROR" = 1 ] && break; }
+    done
+    exit $status ;;
+  *) echo "unknown TESTSUITE=${TESTSUITE} (ours|etsi|both)"; exit 2 ;;
+esac
+
 . dev/etsi-suites.sh
 SUITES="${SUITES:-$SERIAL_ALL}"
 

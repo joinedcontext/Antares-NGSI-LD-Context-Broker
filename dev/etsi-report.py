@@ -263,7 +263,8 @@ def spikes(key, unit, n=10):
 
 
 with open(f"{RESULTS}/run-summary.md", "w") as out:
-    out.write(f"## ETSI results — store: `{STORE}`\n\n")
+    label = os.environ.get("SUITE_LABEL")  # the official copy: which commit ran
+    out.write(f"## ETSI results — store: `{STORE}`" + (f" — {label}" if label else "") + "\n\n")
     out.write(f"**{total_pass} passed, {total_fail} failed/skipped — gate {gate}** · "
               f"image {IMAGE_MB:.0f} MB · peak RSS limit {LIMIT:.0f} MiB · "
               f"{len(rows)} resource samples @1 Hz\n\n")
