@@ -2264,16 +2264,7 @@ async fn purge_inner(
     // never sufficient on their own: "it is not possible to purge a set of
     // entities by only specifying desired Entity identifiers". Listing them
     // here is how `DELETE /entities?idPattern=.*` became a tenant wipe.
-    let attrs_qualify = params.get("attrs").is_some_and(|a| {
-        a.split(',')
-            .any(|n| antares_ql::is_non_system_attr(n.trim()))
-    });
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
-    let q_qualifies = q_ast.as_ref().is_some_and(|ast| {
-        ast.attribute_paths()
-            .iter()
-            .any(|h| antares_ql::is_non_system_attr(h))
-    });
     // 5.6.21.4: Linked Entity retrieval in the projection attributes, or
     // Linked Entity attributes in the filter conditions → BadRequestData.
     if q_ast
@@ -2298,12 +2289,7 @@ async fn purge_inner(
     if let Some(csf) = params.get("csf") {
         parse_q(csf)?;
     }
-    let has_filter = params.contains_key("type")
-        || attrs_qualify
-        || q_qualifies
-        || params.contains_key("georel")
-        || params.get("local").map(String::as_str) == Some("true");
-    if !has_filter {
+    if !qualifies_non_wide(params, q_ast.as_ref()) {
         return Err(NgsiError::BadRequestData(
             "purge needs at least one of: type, attrs or q naming a non-system \
              Attribute, georel, or local=true (5.6.21.4 — too wide query)"
