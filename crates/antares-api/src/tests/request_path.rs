@@ -250,3 +250,33 @@ async fn order_by_scope_orders_by_the_scope_member() {
         ["urn:ngsi-ld:T:s2", "urn:ngsi-ld:T:s3", "urn:ngsi-ld:T:s1"]
     );
 }
+
+/// 6.3.6: a json answer to a POST temporal query compacted with an inline
+/// @context links that @context, never the core one.
+#[tokio::test]
+async fn a_temporal_post_query_links_its_inline_context() {
+    let st = state();
+    let body = r#"{"@context":[{"speed":"https://example.org/speed"},
+        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"],
+        "type":"Query","entities":[{"type":"T"}],
+        "temporalQ":{"timerel":"after","timeAt":"2020-01-01T00:00:00Z"}}"#;
+    let mut req = with_body(
+        "POST",
+        "/ngsi-ld/v1/temporal/entityOperations/query",
+        "application/ld+json",
+        body,
+    );
+    req.headers_mut()
+        .insert("accept", "application/json".parse().expect("accept"));
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let l = links(&resp);
+    let ctx_link = l
+        .iter()
+        .find(|l| l.contains("ld#context"))
+        .unwrap_or_else(|| panic!("no @context Link: {l:?}"));
+    assert!(
+        !ctx_link.contains(antares_jsonld::CORE_CONTEXT),
+        "{ctx_link}"
+    );
+}
