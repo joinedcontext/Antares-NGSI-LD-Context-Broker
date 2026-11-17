@@ -926,16 +926,6 @@ pub(crate) fn problem_value(e: &NgsiError) -> Value {
     })
 }
 
-/// 5.2.12 `jsonldContext`: the @context a Notification of this Subscription
-/// is compacted against, so the member is dereferenced here rather than at
-/// first delivery — a shape that is not a URL or an array of URLs is 400,
-/// one that does not resolve is 504.
-///
-/// Resolution is Tenant-scoped (5.5.10): a Hosted @context belongs to the
-/// Tenant that stored it (5.13.1), and resolving the URL outside that Tenant
-/// would compact every Notification of this Subscription against another
-/// Tenant's term mappings. For any other Tenant the URL is as absent as one
-/// that never existed.
 /// RFC 7230 `field-name`: a `token`, one or more `tchar`.
 pub(crate) fn is_field_name(s: &str) -> bool {
     !s.is_empty()
