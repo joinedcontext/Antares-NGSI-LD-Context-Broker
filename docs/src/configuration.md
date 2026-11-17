@@ -17,7 +17,7 @@ here).
 | `ANTARES_ROLES` | `all` | Comma list of roles this process runs: `api`, `matcher`, `notifier`, `temporal`, `registry` — the role-split fleet shape (`ANTARES_BUS=nats`; `local` takes `all` only). `api` serves the NGSI-LD API, records history in the write path, drains the outbox and keeps the registration mirror. `matcher` and `notifier` name one consumer: either runs the subscription matching and the deliveries. `temporal` and `registry` are accepted and wire nothing of their own today, since their work runs on api pods; temporal maintenance runs on every pod with a Postgres store. |
 | `ANTARES_BUS` | `local` | Change-event bus: `local` (in-process, single node) or `nats` (JetStream, multi-pod). Unknown value = fatal. |
 | `ANTARES_HOST_ALIAS` | `antares` | This broker's name in federation `Via` chains (CIM 009 6.3.18) — loop detection identity. Two LB'd replicas of one logical broker share one alias. |
-| `ANTARES_PUBLIC_URL` | `http://{host_alias}:{port}` | The URL peers can reach this broker at: forwarded subscription copies notify `{ANTARES_PUBLIC_URL}/ex/v1/remote-notify` (5.8.1.4). Set it whenever the default is not routable from peers. |
+| `ANTARES_PUBLIC_URL` | `http://{host_alias}:{port}` | The URL peers can reach this broker at: forwarded subscription copies notify `{ANTARES_PUBLIC_URL}/ex/v1/remote-notify` (5.8.1.4), and the URLs of the `@context`s this broker hosts (5.13) are built on it. The request's `Host` header is never used for either. Set it whenever the default is not routable from peers or clients. |
 
 ## Store backends
 

@@ -154,7 +154,7 @@ async fn batch_query_inner(
         Value::Array(payload)
     };
     // 6.3.6: the json answer's Link names the @context it was compacted in
-    let served = crate::contexts::linkable(st, &tenant, headers, &parsed.ctx, accept).await?;
+    let served = crate::contexts::linkable(st, &tenant, &parsed.ctx, accept).await?;
     let mut resp = respond_prefer(StatusCode::OK, out, &served, accept, &tenant, headers);
     attach_paging(&mut resp, count_hdr, &links);
     // 6.4.3.2: entityMap=true — the EntityMap for this Query is created, as

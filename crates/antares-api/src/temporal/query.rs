@@ -1232,7 +1232,7 @@ pub async fn batch_temporal_query(
         // the body's own @context, not the Link header's
         // the body's own @context, not the Link header's; a json answer
         // links that @context, hosted when it is inline (6.3.6)
-        let ctx = crate::contexts::linkable(&st, &tenant, &headers, &parsed.ctx, accept).await?;
+        let ctx = crate::contexts::linkable(&st, &tenant, &parsed.ctx, accept).await?;
         query_temporal_collected(&st, &vp, &headers, &filter, None, Some(ctx)).await
     };
     go.await.unwrap_or_else(|e| e.into_response())
