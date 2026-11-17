@@ -763,11 +763,17 @@ fn replacement(src: &Value, doc: &Value, ts: &str) -> Value {
 fn append_new_instances(doc: &mut Value, expanded: &Value, ts: &str) -> Result<bool, NgsiError> {
     let mut skipped = false;
     let target = antares_store::stored_object(doc)?;
-    for (k, v) in antares_jsonld::expanded_object(expanded)? {
-        if matches!(
-            k.as_str(),
-            "id" | "type" | "scope" | "createdAt" | "modifiedAt"
-        ) {
+    let members = antares_jsonld::expanded_object(expanded)?;
+    // 4.22: an Entity member; noOverwrite keeps the one stored
+    if let Some(v) = members.get("expiresAt") {
+        if target.contains_key("expiresAt") {
+            skipped = true;
+        } else {
+            crate::entities::set_expires_at(target, v);
+        }
+    }
+    for (k, v) in members {
+        if antares_model::is_meta(k) {
             continue;
         }
         // stamped as every other write path stamps a new instance
