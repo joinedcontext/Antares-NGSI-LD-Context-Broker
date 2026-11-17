@@ -1878,8 +1878,14 @@ impl PgTemporalStore {
         // `paged` is set only inside `if f.page.is_some()`, so binding the
         // two together says that in the type system instead of in a comment.
         if let (true, Some(page)) = (paged, f.page.as_ref()) {
-            select_total = ", count(*) OVER () AS total".into();
-            binds.push(B::Num(page.limit));
+            // count=true: the window count; otherwise one row past the page
+            // answers "is there a next page" without qualifying every match
+            if page.count {
+                select_total = ", count(*) OVER () AS total".into();
+                binds.push(B::Num(page.limit));
+            } else {
+                binds.push(B::Num(page.limit.saturating_add(1)));
+            }
             tail.push_str(&format!(" LIMIT ${}", binds.len()));
             binds.push(B::Num(page.offset));
             tail.push_str(&format!(" OFFSET ${}", binds.len()));
@@ -1908,11 +1914,17 @@ impl PgTemporalStore {
                     B::Float(x) => qy.bind(x),
                 };
             }
-            let rows = qy.fetch_all(&mut *tx).await?;
-            let mut total = if paged {
-                rows.first().map(|r| r.get::<i64, _>(1))
-            } else {
-                None
+            let mut rows = qy.fetch_all(&mut *tx).await?;
+            let uncounted = f.page.as_ref().filter(|p| paged && !p.count);
+            let mut total = match uncounted {
+                Some(page) => {
+                    let limit = usize::try_from(page.limit).unwrap_or(usize::MAX);
+                    let more = rows.len() > limit;
+                    rows.truncate(limit);
+                    super::entity::page_total(page, rows.len(), more)
+                }
+                None if paged => rows.first().map(|r| r.get::<i64, _>(1)),
+                None => None,
             };
             if paged && total.is_none() {
                 // offset past the end: the window function came back with the

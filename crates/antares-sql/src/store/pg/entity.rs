@@ -679,7 +679,7 @@ fn query_sql(
 /// can tell it. Uncounted, the smallest total consistent with "a next page
 /// exists", enough for the next/prev links and never shown as a count;
 /// counted, a last page that holds rows (or the first, empty one).
-fn page_total(p: &Page, rows: usize, more: bool) -> Option<i64> {
+pub(super) fn page_total(p: &Page, rows: usize, more: bool) -> Option<i64> {
     let seen = p.offset.saturating_add(rows as i64);
     match (p.count, more) {
         (false, _) => Some(seen.saturating_add(i64::from(more))),
