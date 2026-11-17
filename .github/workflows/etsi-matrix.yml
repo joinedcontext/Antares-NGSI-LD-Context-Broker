@@ -12,6 +12,11 @@ name: etsi-matrix
 # Each cell runs ALL 11 suites through the one pipeline, folded into the
 # per-cell summary tables + one bundle (quick bundles are named
 # ETSI-quick-results so the Pages fold only ever renders full runs).
+# Beside every cell, etsi-upstream-cell runs the OFFICIAL ETSI suite on the
+# same image and store: cloned fresh from forge.etsi.org (develop) by the
+# pipeline, run as published, gated by its baseline of known failures
+# (conformance/etsi-baseline/<cell>.txt, dev/etsi-baseline.py). Forge
+# unreachable skips it without gating; our copy gates as before.
 
 on:
   workflow_call:
@@ -175,6 +180,114 @@ jobs:
           echo "gate(${{ matrix.cell }}) = $gate"
           [ "$gate" = PASS ]
 
+  etsi-upstream-cell:
+    # The official suite runs code this repository does not control (its
+    # Robot files, Python libraries and requirements.txt, fetched at run
+    # time), so it gets its own job: read-only token, no secrets in its env,
+    # checkout without persisted credentials. Same cells, same image
+    # artifact as etsi-cell; it adds runners, not wall-clock.
+    name: ${{ matrix.cell }} (official ETSI suite)
+    needs: [build, build-wasm]
+    if: >-
+      !cancelled() && needs.build.result == 'success' &&
+      (needs['build-wasm'].result == 'success' || needs['build-wasm'].result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        # the same cells as etsi-cell, both presets
+        include: >-
+          ${{ inputs.preset == 'quick'
+          && fromJSON('[
+               { "cell": "file",      "store": "file" },
+               { "cell": "postgres",  "store": "postgres" },
+               { "cell": "timescale", "store": "timescale" }
+             ]')
+          || fromJSON('[
+               { "cell": "memory",    "store": "memory" },
+               { "cell": "file",      "store": "file" },
+               { "cell": "postgres",  "store": "postgres" },
+               { "cell": "timescale", "store": "timescale" },
+               { "cell": "postgres-nats",  "store": "postgres",  "roles": "1" },
+               { "cell": "timescale-nats", "store": "timescale", "roles": "1" },
+               { "cell": "wasm-file", "store": "file", "wasm": "1" }
+             ]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.roles && 120 || 90 }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Load the image built once for all stores
+        if: ${{ !matrix.wasm }}
+        uses: actions/download-artifact@v8
+        with:
+          name: antares-image
+
+      - if: ${{ !matrix.wasm }}
+        run: docker load < antares-image.tgz
+
+      - name: Fetch the wasm bundle built once for this run
+        if: ${{ matrix.wasm }}
+        uses: actions/download-artifact@v8
+        with:
+          name: antares-wasm-pkg
+          path: www/pkg
+      - name: Build the shim image (wasm cell)
+        if: ${{ matrix.wasm }}
+        run: docker build -f Dockerfile.wasm -t antares-wasm-local:latest .
+
+      - name: Run the official suite through the ONE pipeline
+        # Clones develop's HEAD into a temp dir (removed at the end) and
+        # installs its requirements under a 7-day release cooldown.
+        env:
+          TESTSUITE: etsi
+          ETSI_RESULTS_DIR: results/upstream-${{ matrix.cell }}
+          ETSI_BASELINE_CELL: ${{ matrix.cell }}
+          PIP_UPLOADED_PRIOR_TO: P7D
+          STORE: ${{ matrix.store }}
+          ROLES_SPLIT: ${{ matrix.roles || '0' }}
+          ROLL_DURING_RUN: ${{ matrix.roles || '0' }}
+          WASM: ${{ matrix.wasm || '0' }}
+          WASM_DOCKER: ${{ matrix.wasm || '0' }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+        run: ./dev/etsi-pipeline.sh || true
+
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ETSI-upstream-cell-${{ matrix.cell }}
+          path: |
+            results/upstream-${{ matrix.cell }}/run-summary.md
+            results/upstream-${{ matrix.cell }}/gate-status.txt
+            results/upstream-${{ matrix.cell }}/baseline-*
+            results/upstream-${{ matrix.cell }}/etsi-upstream.txt
+            results/upstream-${{ matrix.cell }}/upstream-changed.*
+            results/upstream-${{ matrix.cell }}/tp-status.csv
+            results/upstream-${{ matrix.cell }}/failures.csv
+            results/upstream-${{ matrix.cell }}/resource-samples.csv
+            results/upstream-${{ matrix.cell }}/resource-by-test.csv
+            results/upstream-${{ matrix.cell }}/roll-loop.log
+            results/upstream-${{ matrix.cell }}/*-console.log
+            results/upstream-${{ matrix.cell }}/**/log.html
+            results/upstream-${{ matrix.cell }}/**/report.html
+          retention-days: 7
+
+      - name: Gate — no regression against the baseline
+        # PASS is green; SKIPPED (forge unreachable), NOBASELINE (no baseline
+        # file for this cell yet) and STALE (the baseline commit is gone
+        # upstream) report without gating; FAIL or no status is red.
+        run: |
+          gate=$(cat "results/upstream-${{ matrix.cell }}/baseline-status.txt" 2>/dev/null || echo MISSING)
+          echo "baseline gate(${{ matrix.cell }}) = $gate"
+          cat "results/upstream-${{ matrix.cell }}/baseline-report.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          case "$gate" in PASS|SKIPPED|NOBASELINE|STALE) ;; *) exit 1 ;; esac
+
   etsi-aggregate:
     # Fold the store results into ONE downloadable bundle + ONE report: per-store
     # tables (pass/fail/skip + RSS/CPU rollups), the combined per-second
@@ -182,7 +295,7 @@ jobs:
     # list. The single required status check; any red/missing cell fails it.
     name: Matrix summary
     if: always()
-    needs: etsi-cell
+    needs: [etsi-cell, etsi-upstream-cell]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -191,15 +304,17 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Download all cell results
+        # both suites: ETSI-cell-* (ours) and ETSI-upstream-cell-* (official)
         uses: actions/download-artifact@v8
         with:
-          pattern: ETSI-cell-*
+          pattern: ETSI-*cell-*
           path: cells
 
       - name: Fold the cells into the combined bundle + report
         # Gate result captured, not enforced here — the bundle must upload
         # and the summary must render even when cells are red.
         env:
+          TESTSUITE: both
           STORES: >-
             ${{ inputs.preset == 'quick'
             && 'file postgres timescale'
@@ -234,7 +349,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-            --paginate -q '.artifacts[] | select(.name | startswith("ETSI-cell-")) | .id' |
+            --paginate -q '.artifacts[] | select(.name | startswith("ETSI-cell-") or startswith("ETSI-upstream-cell-")) | .id' |
           while read -r id; do
             gh api --method DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
           done

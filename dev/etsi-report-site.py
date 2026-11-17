@@ -17,6 +17,12 @@ Writes <out-dir>/:
   badge.json      shields.io endpoint schema ("ETSI 6×1652 green" / red)
   badge-<cell>.json  one endpoint badge PER CELL ("1652/1652")
   <store>/<suite>/report.html|log.html   copied from the bundle
+  upstream/<store>/<suite>/report.html|log.html   the official ETSI suite's
+                  run per cell (ETSI-upstream-cell-<store>/), listed below
+                  ours with the upstream commit it ran and its baseline gate
+
+The AntaresSpecificTests row is shown but not counted in a cell's ETSI
+total or badge: it is not ETSI-derived.
 """
 import glob
 import html
@@ -46,18 +52,17 @@ else:
         STORES = ["file", "postgres", "timescale"]
 
 
+OWN = "AntaresSpecificTests"
+
+
 def find(d, name):
     hits = sorted(glob.glob(f"{d}/**/{name}", recursive=True))
     return hits[0] if hits else None
 
 
-stores = []
-for st in STORES:
-    d = f"{cells}/ETSI-cell-{st}"
-    gate = "MISSING"
-    p = find(d, "gate-status.txt")
-    if p:
-        gate = open(p).read().strip()
+def read_suites(d, prefix):
+    """per-suite rows of one cell's run-summary.md, Robot pages copied to
+    <out>/<prefix>/<suite>/"""
     suites = []
     p = find(d, "run-summary.md")
     summary_dir = os.path.dirname(p) if p else d
@@ -70,16 +75,43 @@ for st in STORES:
             for f in ("report.html", "log.html"):
                 src = find(os.path.join(summary_dir, name), f)
                 if src:
-                    dst = os.path.join(out, st, name, f)
+                    dst = os.path.join(out, prefix, name, f)
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copyfile(src, dst)
                     if link is None:
-                        link = f"{st}/{name}/{f}"
+                        link = f"{prefix}/{name}/{f}"
             suites.append((name, int(ok), int(fail), int(skip), link))
-    stores.append((st, gate, suites))
+    return suites
+
+
+def etsi_rows(suites):
+    return [r for r in suites if r[0] != OWN]
+
+
+stores = []
+for st in STORES:
+    d = f"{cells}/ETSI-cell-{st}"
+    gate = "MISSING"
+    p = find(d, "gate-status.txt")
+    if p:
+        gate = open(p).read().strip()
+    stores.append((st, gate, read_suites(d, st)))
+
+# The official ETSI suite, one cell per store that ran it (auto-discovered:
+# a bundle from before the two-suite matrix simply has none).
+found = [os.path.basename(d)[len("ETSI-upstream-cell-"):]
+         for d in glob.glob(f"{cells}/ETSI-upstream-cell-*") if os.path.isdir(d)]
+upstream = []
+for st in [s for s in PREFERRED + ["wasm-file"] if s in found] + sorted(
+    s for s in found if s not in PREFERRED + ["wasm-file"]
+):
+    d = f"{cells}/ETSI-upstream-cell-{st}"
+    p = find(d, "baseline-result.json")
+    result = json.load(open(p)) if p else {"status": "MISSING", "upstream": {}}
+    upstream.append((st, result, read_suites(d, f"upstream/{st}")))
 
 all_green = bool(stores) and all(g == "PASS" for _, g, _ in stores)
-totals = [sum(ok + f + sk for _, ok, f, sk, _ in su) for _, _, su in stores]
+totals = [sum(ok + f + sk for _, ok, f, sk, _ in etsi_rows(su)) for _, _, su in stores]
 if all_green and totals and len(set(totals)) == 1:
     message = f"{len(stores)}×{totals[0]} green"
 elif all_green:
@@ -100,8 +132,8 @@ json.dump(
 # One shields endpoint badge PER CELL next to the combined one — the
 # README's live "file 1652/1652" row reads these.
 for st, gate, suites in stores:
-    ok = sum(o for _, o, _, _, _ in suites)
-    tot = sum(o + f + sk for _, o, f, sk, _ in suites)
+    ok = sum(o for _, o, _, _, _ in etsi_rows(suites))
+    tot = sum(o + f + sk for _, o, f, sk, _ in etsi_rows(suites))
     green = gate == "PASS"
     json.dump(
         {
@@ -115,11 +147,13 @@ for st, gate, suites in stores:
 
 rows = []
 for st, gate, suites in stores:
-    ok = sum(o for _, o, _, _, _ in suites)
-    tot = sum(o + f + sk for _, o, f, sk, _ in suites)
+    ok = sum(o for _, o, _, _, _ in etsi_rows(suites))
+    tot = sum(o + f + sk for _, o, f, sk, _ in etsi_rows(suites))
+    own = [(o, o + f + sk) for n, o, f, sk, _ in suites if n == OWN]
+    own_txt = "".join(f", Antares-specific {o}/{t}" for o, t in own)
     mark = "✅" if gate == "PASS" else "❌"
     rows.append(
-        f'<section><h2>{mark} {html.escape(st)} — {ok}/{tot} '
+        f'<section><h2>{mark} {html.escape(st)} — {ok}/{tot}{own_txt} '
         f"(gate {html.escape(gate)})</h2><table>"
         "<tr><th>Suite</th><th>Pass</th><th>Fail</th><th>Skip</th><th>Robot</th></tr>"
     )
@@ -130,6 +164,45 @@ for st, gate, suites in stores:
             f"<tr{cls}><td>{html.escape(name)}</td><td>{o}</td>"
             f"<td>{f}</td><td>{sk}</td><td>{robot}</td></tr>"
         )
+    rows.append("</table></section>")
+
+if upstream:
+    rows.append(
+        "<h2>The official ETSI suite</h2><p>The same cells, running the ETSI "
+        "test suite as published (forge.etsi.org, fetched fresh for each run, "
+        "nothing edited). Gated by a baseline of known failures "
+        "(<code>conformance/etsi-baseline/</code>): a regression or a baseline "
+        "entry that now passes is red; a failing TP that changed upstream is "
+        "listed for review.</p>"
+    )
+for st, result, suites in upstream:
+    up = result.get("upstream") or {}
+    gate = result.get("status", "MISSING")
+    mark = {"PASS": "✅", "FAIL": "❌", "MISSING": "❌"}.get(gate, "⚠️")
+    ok = sum(o for _, o, _, _, _ in suites)
+    tot = sum(o + f + sk for _, o, f, sk, _ in suites)
+    commit = (up.get("commit") or "")[:12]
+    ran = (f"ETSI suite {html.escape(up.get('ref') or 'develop')} @ "
+           f"<code>{html.escape(commit)}</code>, {html.escape(up.get('date') or '?')}"
+           if commit else html.escape(up.get("status") or "did not run"))
+    rows.append(
+        f"<section><h3>{mark} {html.escape(st)} — {ok}/{tot} "
+        f"(baseline gate {html.escape(gate)})</h3><p>{ran}</p>"
+    )
+    for key, title in (
+        ("regressions", "Regressions (passed at the baseline commit, file unchanged)"),
+        ("shrink", "Baseline entries that pass now"),
+        ("review", "Upstream change, review and baseline"),
+    ):
+        items = result.get(key) or []
+        if items:
+            rows.append(f"<p><b>{title}</b> ({len(items)}): "
+                        + ", ".join(html.escape(i) for i in items) + "</p>")
+    rows.append("<table><tr><th>Suite</th><th>Pass</th><th>Fail</th><th>Skip</th><th>Robot</th></tr>")
+    for name, o, f, sk, link in suites:
+        robot = f'<a href="{html.escape(link)}">report</a>' if link else "—"
+        rows.append(f"<tr><td>{html.escape(name)}</td><td>{o}</td>"
+                    f"<td>{f}</td><td>{sk}</td><td>{robot}</td></tr>")
     rows.append("</table></section>")
 
 banner = "All stores green" if all_green else "RED cells — see below"
