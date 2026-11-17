@@ -39,6 +39,8 @@ pub struct Double {
     /// The change hook the API installed, so a test can call it the way a
     /// driver would.
     hook: std::sync::Mutex<Option<antares_store::ChangeHook>>,
+    /// A count-only windowed read (`list_slice` with limit 0) fails.
+    refuse_count: bool,
 }
 
 impl Double {
@@ -68,6 +70,16 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
+        }
+    }
+
+    /// A count of a kind (`list_slice` asking for no rows) fails as a lost
+    /// connection does; every other read behaves.
+    pub fn refusing_count(inner: Arc<dyn CurrentStateDriver>) -> Self {
+        Self {
+            refuse_count: true,
+            ..Self::flaky_list(inner, 0)
         }
     }
 
@@ -93,6 +105,7 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
         }
     }
 
@@ -118,6 +131,7 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
         }
     }
 
@@ -145,6 +159,7 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
         }
     }
 
@@ -196,6 +211,7 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
         }
     }
 
@@ -221,6 +237,7 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
         }
     }
 
@@ -248,6 +265,7 @@ impl Double {
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             hook: std::sync::Mutex::new(None),
+            refuse_count: false,
         }
     }
 
@@ -366,6 +384,9 @@ impl CurrentStateDriver for Double {
         limit: usize,
     ) -> Result<(Vec<Value>, usize), NgsiError> {
         self.pool_wall()?;
+        if self.refuse_count && limit == 0 {
+            return Err(NgsiError::InternalError("count refused".into()));
+        }
         self.inner.list_slice(tenant, kind, offset, limit).await
     }
 

@@ -174,7 +174,8 @@ async fn an_unreadable_map_is_not_missing_for_an_update() {
 async fn a_map_the_broker_cannot_bound_is_not_created() {
     let mut st = AppState::new("me".into());
     create_entity(&st, "urn:ngsi-ld:Vehicle:one").await;
-    st.store = Arc::new(Double::flaky_list(st.store.clone(), usize::MAX));
+    // the ceiling is counted, not listed: the count is what fails
+    st.store = Arc::new(Double::refusing_count(st.store.clone()));
     let (status, body, _) =
         send(&st, "GET", "/ngsi-ld/v1/entityMaps?type=Vehicle&local=true").await;
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);

@@ -171,33 +171,42 @@ pub(crate) async fn map_put(
     // the store refuses leaves the ceiling unenforceable, and an unbounded
     // buffer is not the safer half of that choice: the write is refused.
     if st.store.get(tenant, Kind::EntityMap, &id).await?.is_none() {
-        let existing = st.store.list(tenant, Kind::EntityMap).await?;
-        if existing.len() >= MAX_MAPS_PER_TENANT {
-            // eviction order is a heuristic — earliest expiresAt string wins
-            if let Some(victim) = existing
-                .iter()
-                .min_by(|a, b| {
-                    a["expiresAt"]
-                        .as_str()
-                        .unwrap_or("")
-                        .cmp(b["expiresAt"].as_str().unwrap_or(""))
-                })
-                .and_then(|d| d.get("id").and_then(Value::as_str))
-            {
-                st.store.delete(tenant, Kind::EntityMap, victim).await?;
-            }
+        // the count alone, without reading a map
+        let (_, held) = st.store.list_slice(tenant, Kind::EntityMap, 0, 0).await?;
+        if held >= MAX_MAPS_PER_TENANT {
+            evict_one_map(st, tenant, &doc).await?;
         }
     }
-    let updated = st
-        .store
-        .mutate(tenant, Kind::EntityMap, &id, |d| {
-            *d = doc.clone();
-            Ok::<_, std::convert::Infallible>(())
-        })
-        .await?
-        .is_some();
-    if !updated {
-        st.store.create(tenant, Kind::EntityMap, &id, doc).await?;
+    st.store.upsert(tenant, Kind::EntityMap, &id, doc).await?;
+    Ok(())
+}
+
+/// Make room for `new` in a Tenant at its ceiling: the map of `new`'s own
+/// subject that expires first goes, and only a subject holding none takes
+/// the Tenant's earliest. One subject filling the ceiling then recycles its
+/// own maps instead of ending the transactions of every other subject.
+async fn evict_one_map(st: &AppState, tenant: &TenantId, new: &Value) -> Result<(), NgsiError> {
+    let subject = new.get(crate::policy::SUBJECT_MEMBER);
+    let mut own: Option<(Option<chrono::DateTime<chrono::Utc>>, String)> = None;
+    let mut any: Option<(Option<chrono::DateTime<chrono::Utc>>, String)> = None;
+    crate::csource::walk_docs(st, tenant, Kind::EntityMap, |d| {
+        let Some(id) = d.get("id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        // an unreadable expiry sorts first: no read serves that map
+        let at = d.get("expiresAt").and_then(Value::as_str).and_then(dt);
+        let earlier = |held: &Option<(Option<_>, String)>| held.as_ref().is_none_or(|h| at < h.0);
+        if earlier(&any) {
+            any = Some((at, id.to_owned()));
+        }
+        if d.get(crate::policy::SUBJECT_MEMBER) == subject && earlier(&own) {
+            own = Some((at, id.to_owned()));
+        }
+        Ok(())
+    })
+    .await?;
+    if let Some((_, victim)) = own.or(any) {
+        st.store.delete(tenant, Kind::EntityMap, &victim).await?;
     }
     Ok(())
 }
@@ -922,6 +931,53 @@ mod tests {
                 .len(),
             before
         );
+    }
+
+    /// At the ceiling a new map evicts the earliest map of its own subject,
+    /// not another subject's that happens to expire first.
+    #[tokio::test]
+    async fn a_full_registry_evicts_the_creating_subjects_map_first() {
+        let st = AppState::new("antares-em-evict".into());
+        let t = TenantId::default();
+        // inside the lifetime ceiling, so the stored expiries stay apart
+        let at = |m: u32| {
+            (chrono::Utc::now() + chrono::Duration::minutes(i64::from(m) + 1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let with = |id: &str, who: &str, m: u32| {
+            let mut doc = live_map(id);
+            doc["expiresAt"] = json!(at(m));
+            doc[crate::policy::SUBJECT_MEMBER] = json!({"x-user": who});
+            doc
+        };
+        // another subject's map expires first of all
+        map_put(&st, &t, with("urn:ngsi-ld:entitymap:b", "b", 0))
+            .await
+            .expect("stored");
+        for i in 1..MAX_MAPS_PER_TENANT {
+            let id = format!("urn:ngsi-ld:entitymap:a{i:04}");
+            let m = u32::try_from(i % 50).expect("small") + 1;
+            map_put(&st, &t, with(&id, "a", m)).await.expect("stored");
+        }
+        map_put(&st, &t, with("urn:ngsi-ld:entitymap:new", "a", 59))
+            .await
+            .expect("stored");
+        let held = |id: &'static str| {
+            let st = st.clone();
+            let t = t.clone();
+            async move { st.store.get(&t, Kind::EntityMap, id).await.expect("get") }
+        };
+        assert!(
+            held("urn:ngsi-ld:entitymap:b").await.is_some(),
+            "another subject's map was evicted"
+        );
+        assert!(held("urn:ngsi-ld:entitymap:new").await.is_some());
+        let (_, n) = st
+            .store
+            .list_slice(&t, Kind::EntityMap, 0, 0)
+            .await
+            .expect("count");
+        assert_eq!(n, MAX_MAPS_PER_TENANT);
     }
 
     /// 5.5.14 + Table 6.4.3.2-1: "the actual expiresAt time of the EntityMap
