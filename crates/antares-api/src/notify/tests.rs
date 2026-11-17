@@ -2120,6 +2120,38 @@ mod delivery_policy_tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// A tenant holding its whole share of the retry chains has its next
+    /// failure settled at once, while the broker still has chains free.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_past_the_tenants_retry_share_is_dead_lettered_at_once() {
+        let (st, _) = state(policy(3, 20_000));
+        // a Tenant of its own: the share is per Tenant and process-wide
+        let t = TenantId::new("retry-share").expect("tenant");
+        let share = super::retry::RETRY_SHARES.of(&t);
+        let held = share
+            .clone()
+            .try_acquire_many_owned(
+                u32::try_from(super::retry::RETRY_CHAINS_PER_TENANT).expect("small"),
+            )
+            .expect("the tenant's whole share");
+        let (uri, hits) = flaky_endpoint(usize::MAX).await;
+        let sub = subscribe(&st, &t, SUB_ID, &uri).await;
+        send(&st, &t, &sub).await;
+        wait_until(
+            || async { !letters(&st, &t).await.is_empty() },
+            "dead letter",
+        )
+        .await;
+        let l = letters(&st, &t).await;
+        assert_eq!(l[0]["attempts"], json!(1), "no retry was made");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(
+            st.retry_slots.available_permits() > 0,
+            "the broker had chains free"
+        );
+        drop(held);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn the_default_policy_never_retries_and_never_dead_letters() {
         let (st, t) = state(DeliveryPolicy::default());

@@ -18,6 +18,16 @@ pub(crate) fn dead_letters_written() -> u64 {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) const RETRY_CHAINS: usize = 256;
 
+/// Of [`RETRY_CHAINS`], what one tenant may hold: a tenant whose endpoints
+/// all fail cannot take every chain and leave the others' failures settled
+/// at once.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const RETRY_CHAINS_PER_TENANT: usize = RETRY_CHAINS / 8;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) static RETRY_SHARES: std::sync::LazyLock<super::throttle::TenantShares> =
+    std::sync::LazyLock::new(|| super::throttle::TenantShares::new(RETRY_CHAINS_PER_TENANT));
+
 /// The retries the delivery policy grants after a failed first attempt,
 /// then the settlement: lastSuccess/status ok on success, a dead letter
 /// when the policy is exhausted.
@@ -42,12 +52,17 @@ pub(super) async fn retry_and_settle(
     let first_at = now_iso();
     let mut made = 1u32;
     let mut last_err = first_err.clone();
-    let slot = st.retry_slots.try_acquire();
-    if slot.is_err() {
+    // the tenant's share first, then one of the broker's chains
+    let slot = RETRY_SHARES
+        .of(tenant)
+        .try_acquire_owned()
+        .ok()
+        .and_then(|share| Some((share, st.retry_slots.try_acquire().ok()?)));
+    if slot.is_none() {
         last_err = "no retry slot free; settled after the first attempt".into();
     }
     while let Some(delay) = slot
-        .is_ok()
+        .is_some()
         .then(|| policy.next_delay(made, started.elapsed()))
         .flatten()
     {
