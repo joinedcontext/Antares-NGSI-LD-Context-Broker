@@ -213,7 +213,8 @@ impl EntityId {
         let scheme_ok = no_illegal
             && no_dot_segment
             && raw.split_once(':').is_some_and(|(s, rest)| {
-                !s.is_empty()
+                // RFC 3986 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+                s.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
                     && !rest.is_empty()
                     && s.chars()
                         .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
