@@ -377,6 +377,10 @@ pub(super) fn content_range(
     // of the complete representation the client asked for — the requested
     // firstN or lastN, or "*" when the window leaves it unknown.
     let size = page.n.map_or_else(|| "*".to_owned(), |n| n.to_string());
+    // The unit is spelled as the ETSI conformance suite asserts it
+    // (021_15, 021_16, 020_13: `date-time`). 6.3.10 writes "shall be equal
+    // to "DateTime""; where the clause and the suite disagree the broker
+    // answers what clients are tested against.
     Some(format!("date-time {start}-{end}/{size}"))
 }
 
