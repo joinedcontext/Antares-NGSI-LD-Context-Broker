@@ -174,3 +174,56 @@ async fn a_source_past_the_ceiling_is_cut_with_a_warning() {
         "a cut source is reported: {warns:?}"
     );
 }
+
+/// A Context Source answering `[]` that keeps the request line of every
+/// request it got.
+fn recording_source() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+    let recorder = seen.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            if let Ok(mut v) = recorder.lock() {
+                v.push(head.lines().next().unwrap_or_default().to_owned());
+            }
+            let _ = s.write_all(
+                b"HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 2
+Connection: close
+
+[]",
+            );
+        }
+    });
+    (port, seen)
+}
+
+/// 4.3.6.1: a source is asked only about the types it registered: of a
+/// multi-type selector the registered ones, and its own types when the
+/// query names none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_source_is_asked_only_for_its_registered_types() {
+    antares_jsonld::allow_private_egress(true);
+    let st = AppState::new("antares1".into());
+    let (port, seen) = recording_source();
+    register(&st, port).await;
+    let (status, text, _) = call(&st, "GET", "/ngsi-ld/v1/entities?type=Vehicle,Bike", None).await;
+    assert_eq!(status, 200, "{text}");
+    let (status, text, _) = call(&st, "GET", "/ngsi-ld/v1/entities?attrs=speed", None).await;
+    assert_eq!(status, 200, "{text}");
+    let lines = seen.lock().expect("lock").clone();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for line in &lines {
+        assert!(line.contains("type=Vehicle"), "{line}");
+        assert!(
+            !line.contains("Bike"),
+            "an unregistered type was asked: {line}"
+        );
+    }
+}
