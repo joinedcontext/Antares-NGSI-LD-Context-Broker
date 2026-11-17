@@ -644,17 +644,10 @@ fn combine_attr_parts(
         && !any_fed_ok
         && fed_parts.iter().any(|p| p.conflict)
     {
-        let mut resp = (
-            axum::http::StatusCode::CONFLICT,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            axum::Json(serde_json::json!({
-                "type": "https://uri.etsi.org/ngsi-ld/errors/Conflict",
-                "title": "Conflict",
-                "detail": "registration does not accept the operation",
-                "status": 409,
-            })),
-        )
-            .into_response();
+        let mut resp = ApiError::from(NgsiError::Conflict(
+            "registration does not accept the operation".into(),
+        ))
+        .into_response();
         crate::negotiate::echo_tenant(tenant, &mut resp);
         return resp;
     }
