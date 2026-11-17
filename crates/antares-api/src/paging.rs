@@ -275,6 +275,45 @@ pub(crate) fn link_media_type(accept: Accept) -> &'static str {
     }
 }
 
+/// The next/prev Links of an entity list page (4.12, 6.3.10): every
+/// parameter of the request but the offset and the keyset cursor, sorted (the
+/// suite string-compares links, 031_02), typed with the negotiated media
+/// type. `more`: a page follows this one.
+pub(crate) fn page_links(
+    params: &HashMap<String, String>,
+    path: &str,
+    accept: Accept,
+    offset: usize,
+    limit: usize,
+    more: bool,
+) -> Vec<String> {
+    let mk = |off: usize, rel: &str| {
+        let mut qp: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "offset" | CURSOR))
+            .map(|(k, v)| format!("{k}={}", query_value(v)))
+            .collect();
+        qp.push(format!("offset={off}"));
+        qp.sort();
+        // 6.3.10: "At least, the type Link Target Attribute shall be included
+        // ... and its value shall be exactly equal to the media type resulting
+        // from the original request" — for EVERY media type.
+        format!(
+            "<{path}?{}>; rel=\"{rel}\";type=\"{}\"",
+            qp.join("&"),
+            link_media_type(accept)
+        )
+    };
+    let mut links = Vec::new();
+    if more {
+        links.push(mk(offset.saturating_add(limit), "next"));
+    }
+    if offset > 0 {
+        links.push(mk(offset.saturating_sub(limit.max(1)), "prev"));
+    }
+    links
+}
+
 fn paginate_impl(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -290,42 +329,33 @@ fn paginate_impl(
         Some(_) => matches, // already exactly the page (store pushdown)
         None => matches.into_iter().skip(offset).take(limit).collect(),
     };
+    let more = offset.saturating_add(limit) < total && limit > 0;
+    if !csource_style {
+        let links = page_links(params, path, accept, offset, limit, more);
+        return Ok((page, count.then_some(total), links));
+    }
     let mut links = Vec::new();
     // csource resources: the suite string-compares links against
-    // `?other…&limit=N&offset=M` order (037_11, 041_03); entity lists keep
-    // sorted params (031_02). The type suffix follows Accept for both.
+    // `?other…&limit=N&offset=M` order (037_11, 041_03). The type suffix
+    // follows Accept.
     let mut mk = |off: usize, rel: &str| {
-        let mut qp: Vec<String>;
-        if csource_style {
-            qp = params
-                .iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "offset" | "limit"))
-                .map(|(k, v)| format!("{k}={}", query_value(v)))
-                .collect();
-            qp.sort();
-            if let Some(l) = params.get("limit") {
-                qp.push(format!("limit={l}"));
-            }
-            qp.push(format!("offset={off}"));
-        } else {
-            qp = params
-                .iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "offset" | CURSOR))
-                .map(|(k, v)| format!("{k}={}", query_value(v)))
-                .collect();
-            qp.push(format!("offset={off}"));
-            qp.sort(); // deterministic order — the suite string-compares links
+        let mut qp: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "offset" | "limit"))
+            .map(|(k, v)| format!("{k}={}", query_value(v)))
+            .collect();
+        qp.sort();
+        if let Some(l) = params.get("limit") {
+            qp.push(format!("limit={l}"));
         }
-        // 6.3.10: "At least, the type Link Target Attribute shall be included
-        // ... and its value shall be exactly equal to the media type resulting
-        // from the original request" — for EVERY media type, not just ld+json.
+        qp.push(format!("offset={off}"));
         let ty = link_media_type(accept);
         links.push(format!(
             "<{path}?{}>; rel=\"{rel}\";type=\"{ty}\"",
             qp.join("&")
         ));
     };
-    if offset.saturating_add(limit) < total && limit > 0 {
+    if more {
         mk(offset.saturating_add(limit), "next");
     }
     if offset > 0 {
