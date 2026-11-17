@@ -123,3 +123,21 @@ async fn the_default_composition_is_not_refused() {
     let (status, _) = req(&st, "GET", "/ngsi-ld/v1/temporal/entities/urn:x:1", None).await;
     assert_ne!(status, 422);
 }
+
+/// 5.6.11 without a temporal store: the write is refused with the spec
+/// error, never answered 201 for history that was not stored (nor retried
+/// into a 500 as a create race it can never win).
+#[tokio::test]
+async fn temporal_writes_answer_operation_not_supported() {
+    let st = state_without_temporal();
+    let (status, body) = req(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/temporal/entities",
+        Some(json!({"id": "urn:x:2", "type": "T",
+                    "speed": [{"type": "Property", "value": 3,
+                               "observedAt": "2020-08-01T12:00:00Z"}]})),
+    )
+    .await;
+    assert_unsupported(status, &body);
+}

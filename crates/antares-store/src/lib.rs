@@ -1504,11 +1504,14 @@ impl TemporalDriver for NoTemporal {
     async fn get(&self, _tenant: &TenantId, _id: &str) -> Result<Option<Value>, NgsiError> {
         Ok(None)
     }
+    // A write of history is a client's request (5.6.11, a temporal
+    // snapshot): Ok(false) would read as "created", or as a lost race the
+    // caller retries, for history that was never stored.
     async fn create(&self, _tenant: &TenantId, _id: &str, _doc: Value) -> Result<bool, NgsiError> {
-        Ok(false)
+        Err(unsupported())
     }
     async fn upsert(&self, _tenant: &TenantId, _id: &str, _doc: Value) -> Result<bool, NgsiError> {
-        Ok(false)
+        Err(unsupported())
     }
     async fn delete(&self, _tenant: &TenantId, _id: &str) -> Result<bool, NgsiError> {
         Ok(false)
@@ -2144,6 +2147,14 @@ mod tests {
         };
         assert_eq!(e.status(), 422);
         assert_eq!(e.kind(), "OperationNotSupported");
+        // client-facing writes of history: the same error, never a
+        // "created" for nothing stored
+        for e in [
+            d.create(&t, "x", Value::Null).await.expect_err("create"),
+            d.upsert(&t, "x", Value::Null).await.expect_err("upsert"),
+        ] {
+            assert_eq!(e.kind(), "OperationNotSupported");
+        }
         // internal bookkeeping: benign no-ops
         assert!(d
             .temporal_append(&t, "x", &Value::Null, &Value::Null)
