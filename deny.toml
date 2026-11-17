@@ -21,6 +21,8 @@ yanked = "deny"
 ignore = [
     # paste: unmaintained proc-macro, build-time only, via tikv-jemalloc-ctl.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time proc-macro via tikv-jemalloc-ctl; no runtime code" },
+    # chrono: unmaintained, no fixed release; migration to `time` tracked in #83.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (maintenance advisory, no vulnerability); migration to time tracked in #83" },
 ]
 
 [bans]
