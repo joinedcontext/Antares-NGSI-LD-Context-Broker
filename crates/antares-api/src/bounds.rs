@@ -120,6 +120,12 @@ pub static FED_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
 // run concurrently; this bounds how many at once per request.
 pub static MAX_FED_FANOUT: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| env_count("ANTARES_FED_FANOUT", 8, usize::MAX));
+/// The whole fan-out of one distributed request, in milliseconds: three
+/// rounds of the 8 s per-source ceiling. A source not answered by then is
+/// reported as timed out (Table 6.3.17-1 warning 199), so registrations
+/// past ANTARES_FED_FANOUT cannot hold one client request for a source
+/// timeout per round without end.
+pub const FED_REQUEST_DEADLINE_MS: usize = 24_000;
 /// 6.3.17: `NGSILD-Warning` values relayed from ONE Context Source. The
 /// clause makes a peer's warnings part of this broker's answer (4.3.6.4 puts
 /// a deeper hop's abnormality on the response that survived it), so the list
@@ -448,6 +454,7 @@ impl LimitStats {
             "maxFedResponseBytes": *MAX_FED_RESPONSE_BYTES,
             "maxFedFanout": *MAX_FED_FANOUT,
             "maxFedInflight": *MAX_FED_INFLIGHT,
+            "fedRequestDeadlineMs": FED_REQUEST_DEADLINE_MS,
             "maxJoinLevel": MAX_JOIN_LEVEL,
             "maxInProcessCallDepth": MAX_IN_PROCESS_CALL_DEPTH,
             "maxPeerWarnings": MAX_PEER_WARNINGS,
@@ -711,6 +718,7 @@ mod tests {
                 "deliveryLaneBytes",
                 "deliveryWidth",
                 "deliveryWidthPerTenant",
+                "fedRequestDeadlineMs",
                 "maxAnswerBytes",
                 "maxBatchItems",
                 "maxBodyBytes",

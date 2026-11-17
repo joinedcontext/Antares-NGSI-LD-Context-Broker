@@ -11,9 +11,9 @@
 //! matching is SQL over `csource_index`, never a scan of a tenant's
 //! registrations; a forwarded query is narrowed to the registration's scope
 //! (4.3.6.1 — spec-mandated, not a bug to be fixed away); and fan-out is
-//! bounded, by a semaphore and a per-source timeout. There is no aggregate
-//! deadline: n slow sources hold a request for ceil(n / ANTARES_FED_FANOUT)
-//! source timeouts at worst.
+//! bounded, by a semaphore, a per-source timeout and a deadline on the
+//! whole fan-out (bounds::FED_REQUEST_DEADLINE_MS), past which an unanswered
+//! source is reported as a timeout (warning 199).
 
 use crate::negotiate::*;
 use crate::paging::pct_encode;
@@ -796,17 +796,80 @@ fn has_reg_context(reg: &FedReg) -> bool {
 /// `ordering` parameter is a 400 outside local scope, 5.7.2.4). Results
 /// return in registration order so warning and merge processing stay
 /// deterministic. Concurrency per request is bounded by
-/// bounds::MAX_FED_FANOUT.
-async fn fan_out<I, T, F, Fut>(items: Vec<I>, per_item: F) -> Vec<T>
+/// bounds::MAX_FED_FANOUT, and the whole fan-out by
+/// bounds::FED_REQUEST_DEADLINE_MS: a source not answered by then is
+/// answered as a timed-out forward (Table 6.3.17-1 warning 199).
+async fn fan_out<T, F, Fut>(items: Vec<FedReg>, per_item: F) -> Vec<T>
 where
-    F: FnMut(I) -> Fut,
+    T: TimedOut,
+    F: FnMut(FedReg) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let budget = u64::try_from(crate::bounds::FED_REQUEST_DEADLINE_MS)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(crate::state::slow_factor());
+    fan_out_within(items, u32::try_from(budget).unwrap_or(u32::MAX), per_item).await
+}
+
+/// [`fan_out`] under a budget of `budget_ms` for the whole fan-out: each
+/// source gets what is left of it when its turn comes.
+async fn fan_out_within<T, F, Fut>(items: Vec<FedReg>, budget_ms: u32, mut per_item: F) -> Vec<T>
+where
+    T: TimedOut,
+    F: FnMut(FedReg) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
     use futures_util::StreamExt;
-    futures_util::stream::iter(items.into_iter().map(per_item))
-        .buffered(*crate::bounds::MAX_FED_FANOUT)
-        .collect()
-        .await
+    // Clock rule: std Instant panics on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
+    let started = std::time::Instant::now();
+    #[cfg(target_arch = "wasm32")]
+    let started = web_time::Instant::now();
+    futures_util::stream::iter(items.into_iter().map(move |reg| {
+        let kept = reg.clone();
+        let fut = per_item(reg);
+        async move {
+            let spent = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+            match within(budget_ms.saturating_sub(spent), fut).await {
+                Some(t) => t,
+                None => T::timed_out(kept),
+            }
+        }
+    }))
+    .buffered(*crate::bounds::MAX_FED_FANOUT)
+    .collect()
+    .await
+}
+
+/// A fan-out result for a source the request deadline cut: the answer of a
+/// forward that timed out (504, no body, no warnings of its own).
+trait TimedOut {
+    fn timed_out(reg: FedReg) -> Self;
+}
+
+impl TimedOut for (FedReg, u16, Value) {
+    fn timed_out(reg: FedReg) -> Self {
+        (reg, 504, Value::Null)
+    }
+}
+
+impl<A: Default> TimedOut for (FedReg, u16, Value, Vec<String>, A) {
+    fn timed_out(reg: FedReg) -> Self {
+        (reg, 504, Value::Null, Vec::new(), A::default())
+    }
+}
+
+impl<A: Default, B: Default> TimedOut for (FedReg, u16, Value, Vec<String>, A, B) {
+    fn timed_out(reg: FedReg) -> Self {
+        (
+            reg,
+            504,
+            Value::Null,
+            Vec::new(),
+            A::default(),
+            B::default(),
+        )
+    }
 }
 
 /// 6.6 Entity Attribute and 6.7 Entity Attribute Instance name one Attribute
@@ -1107,11 +1170,12 @@ pub(crate) async fn forward_in(
     ctx_url: &str,
     body: Option<Value>,
 ) -> (ForwardAnswer, Option<std::sync::Arc<Context>>) {
-    // Process-wide slot first (bounds::MAX_FED_INFLIGHT): the buffers and
-    // connections below exist only while a slot is held.
-    let _slot = crate::bounds::FED_INFLIGHT.acquire().await;
     let built = build_forward(st, method, url, query, headers, tenant, reg, ctx_url, body).await;
     let answered_in = built.answered_in.clone();
+    // Process-wide slot (bounds::MAX_FED_INFLIGHT) around the send only: the
+    // connection and the answer's buffer exist only while a slot is held,
+    // and building the forward (an @context resolution among it) holds none.
+    let _slot = crate::bounds::FED_INFLIGHT.acquire().await;
     if let Some(answer) = ask_transport(st, &built).await {
         return (answer, answered_in);
     }
@@ -3571,6 +3635,36 @@ pub fn strip_proxied(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The whole fan-out has one deadline: a source still unanswered when it
+    /// passes is reported as a timed-out forward (504, warning 199 for its
+    /// caller), and the answered ones keep their results and order.
+    #[tokio::test]
+    async fn a_source_past_the_fan_out_deadline_is_a_timeout() {
+        let reg = |id: &str| fed_reg_of(id, &json!({"endpoint": "http://peer:9090"}));
+        let regs = vec![reg("urn:x:fast"), reg("urn:x:slow"), reg("urn:x:fast2")];
+        let started = std::time::Instant::now();
+        let out: Vec<(FedReg, u16, Value)> = fan_out_within(regs, 200, |r| async move {
+            if r.reg_id == "urn:x:slow" {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            (r, 200, json!({}))
+        })
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let got: Vec<(&str, u16)> = out
+            .iter()
+            .map(|(r, s, _)| (r.reg_id.as_str(), *s))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("urn:x:fast", 200),
+                ("urn:x:slow", 504),
+                ("urn:x:fast2", 200)
+            ]
+        );
+    }
 
     /// An unscoped proxy covers every Attribute, never the Entity's own
     /// members: a local fragment keeps its expiresAt and deletedAt.
