@@ -23,6 +23,19 @@
 #                                    (dev/etsi-local.sh gives each serial
 #                                    matrix cell its own dir)
 #   SAMPLE_INTERVAL=1                seconds between CPU/RSS samples
+#   TESTSUITE=ours                   which copy of the ETSI suite runs:
+#                                    ours (./ngsi-ld-test-suite, the gate),
+#                                    etsi (the official suite, cloned fresh
+#                                    from forge.etsi.org for this run into a
+#                                    temp dir, deleted at the end; gated by
+#                                    its baseline, dev/etsi-baseline.py) or
+#                                    both (ours, then etsi, same stack)
+#   ETSI_REF=develop                 branch, tag or commit of the official suite
+#   ETSI_RESULTS_DIR=$RESULTS_DIR-etsi  where the official copy's results go
+#   ETSI_BASELINE=conformance/etsi-baseline/$STORE.txt  its known failures
+#                                    (ETSI_BASELINE_CELL names another cell's)
+#   ETSI_STOP_ON_ERROR=0             the official copy runs through by default:
+#                                    its baseline is judged on a whole run
 #   HA=1                             layer the HA overlay: haproxy owns 9090,
 #                                    two broker1 replicas behind it — the
 #                                    suite talks to the LB and cannot tell
@@ -147,7 +160,53 @@ else
   RESULTS="${RESULTS_DIR:-results/$STORE}"
 fi
 MEM_LIMIT_MB="${MEM_LIMIT_MB:-350}"
+TESTSUITE="${TESTSUITE:-ours}"
+case "$TESTSUITE" in
+  ours) RUN_OURS=1 RUN_ETSI=0 ;;
+  etsi) RUN_OURS=0 RUN_ETSI=1 ;;
+  both) RUN_OURS=1 RUN_ETSI=1 ;;
+  *) echo "unknown TESTSUITE=$TESTSUITE (ours|etsi|both)"; exit 2 ;;
+esac
+ETSI_RESULTS="${ETSI_RESULTS_DIR:-$RESULTS-etsi}"
+# the official copy alone: the run's own files (samples, shim and roll
+# logs) go to its results dir
+[ "$RUN_OURS" = 1 ] || RESULTS="$ETSI_RESULTS"
 mkdir -p "$RESULTS"
+
+# 0. The official suite, fetched for this run only (dev/etsi-upstream.sh):
+# a temp clone plus its own venv, removed on exit. Forge unreachable skips
+# that copy — reported, never gated; ours still runs and gates.
+ETSI_OK=0
+if [ "$RUN_ETSI" = 1 ]; then
+  ETSI_TMP=$(mktemp -d)
+  trap 'rm -rf "$ETSI_TMP"' EXIT
+  mkdir -p "$ETSI_RESULTS"
+  ETSI_BASELINE="${ETSI_BASELINE:-conformance/etsi-baseline/${ETSI_BASELINE_CELL:-$STORE}.txt}"
+  rm -f "$ETSI_RESULTS"/upstream-changed.*
+  if dev/etsi-upstream.sh fetch "$ETSI_TMP" >/dev/null; then
+    ETSI_SUITE="$ETSI_TMP/ngsi-ld-test-suite"
+    ETSI_VENV="$ETSI_TMP/venv"
+    # what changed upstream since the baseline was made: TPs in those files
+    # that fail are reported for review, not gated
+    base=$(sed -n 's/^commit: *//p' "$ETSI_BASELINE" 2>/dev/null | head -1)
+    if [ -n "$base" ]; then
+      dev/etsi-upstream.sh changed "$ETSI_SUITE" "$base" > "$ETSI_RESULTS/upstream-changed.txt" \
+        || { echo "$base" > "$ETSI_RESULTS/upstream-changed.unreachable"; rm -f "$ETSI_RESULTS/upstream-changed.txt"; }
+    fi
+    if dev/etsi-upstream.sh venv "$ETSI_SUITE" "$ETSI_VENV"; then
+      ETSI_OK=1
+    else
+      sed -i 's/^status=.*/status=error: venv for the official suite failed/' "$ETSI_TMP/etsi-upstream.txt"
+    fi
+  fi
+  cp "$ETSI_TMP/etsi-upstream.txt" "$ETSI_RESULTS/"
+  echo "ETSI upstream: $(tr '\n' ' ' < "$ETSI_RESULTS/etsi-upstream.txt")"
+  if [ "$ETSI_OK" = 0 ] && [ "$RUN_OURS" = 0 ]; then
+    # nothing to run against a stack: record the outcome and stop here
+    python3 dev/etsi-baseline.py check "$ETSI_RESULTS" --baseline "$ETSI_BASELINE"
+    exit $?
+  fi
+fi
 
 # 1. The artifact under test: the docker image — or, WASM=1, the browser
 # build (the exact bytes a page loads, served through the Node shim).
@@ -177,7 +236,9 @@ fi
 # --name ngsi-ld-test-suite-mosquitto-container scorpio-test-mosquitto`).
 # Provide the image (built from the suite's own confs — the single source) and
 # name resolution for the runner.
-if [ "${MQTT:-1}" = 1 ]; then
+# The official copy runs its own unmodified MqttUtils (a published port on
+# 127.0.0.1, which the host-networked brokers reach): nothing to prepare.
+if [ "${MQTT:-1}" = 1 ] && [ "$RUN_OURS" = 1 ]; then
   docker build -t scorpio-test-mosquitto:latest \
     -f compose-files/mosquitto/Dockerfile \
     ngsi-ld-test-suite/resources/mqttUtils/mosquitto
@@ -193,7 +254,7 @@ export MQTT="${MQTT:-1}"
 
 # Which suites this invocation runs (default: all serial + IOP).
 . dev/etsi-suites.sh
-check_suites_complete ngsi-ld-test-suite || exit 2
+[ "$RUN_OURS" = 0 ] || check_suites_complete ngsi-ld-test-suite || exit 2
 RUN_IOP=1
 SERIAL_SUITES="$SERIAL_ALL"
 if [ -n "${SUITES:-}" ]; then
@@ -206,8 +267,26 @@ if [ -n "${SUITES:-}" ]; then
     for _s in $SERIAL_ALL; do
       case "$_s" in *"$_p"*) SERIAL_SUITES="$SERIAL_SUITES $_s"; hit=1 ;; esac
     done
-    [ -n "$hit" ] || { echo "SUITES: '$_p' matches no suite (of: $SERIAL_ALL IOP)"; exit 2; }
+    [ -n "$hit" ] || [ "$RUN_OURS" = 0 ] || { echo "SUITES: '$_p' matches no suite (of: $SERIAL_ALL IOP)"; exit 2; }
   done
+fi
+# The official copy's robot dirs come from its own tree; SUITES filters them
+# the same way (a part matching none of them is only a note: names differ
+# between the copies).
+if [ "$ETSI_OK" = 1 ]; then
+  ETSI_ALL=$(dev/etsi-upstream.sh suites "$ETSI_SUITE")
+  ETSI_SERIAL="$ETSI_ALL"
+  if [ -n "${SUITES:-}" ]; then
+    ETSI_SERIAL=""
+    for _p in "${_parts[@]}"; do
+      [ "$_p" = "IOP" ] && continue
+      hit=""
+      for _s in $ETSI_ALL; do
+        case "$_s" in *"$_p"*) ETSI_SERIAL="$ETSI_SERIAL $_s"; hit=1 ;; esac
+      done
+      [ -n "$hit" ] || echo "SUITES: '$_p' matches no suite of the official copy"
+    done
+  fi
 fi
 
 # 3. The ONE stack (WASM=1: five node shims instead — same ports, same suite;
@@ -284,17 +363,21 @@ fi
 # the whole run. PHASE_FILE carries the suite currently under test so each
 # sample can be traced back to what caused it; the report step then joins the
 # samples to individual TPs on their Robot timestamps.
-PHASE_FILE="$RESULTS/.current-phase"
-echo "startup" > "$PHASE_FILE"
-export PHASE_FILE
-python3 dev/etsi-sampler.py \
-  --out "$RESULTS/resource-samples.csv" \
-  --phase-file "$PHASE_FILE" \
-  --interval "${SAMPLE_INTERVAL:-1}" &
-MONITOR_PID=$!
+start_sampler() { # $1 = results dir the samples belong to
+  PHASE_FILE="$1/.current-phase"
+  echo "startup" > "$PHASE_FILE"
+  export PHASE_FILE
+  python3 dev/etsi-sampler.py \
+    --out "$1/resource-samples.csv" \
+    --phase-file "$PHASE_FILE" \
+    --interval "${SAMPLE_INTERVAL:-1}" &
+  MONITOR_PID=$!
+}
+start_sampler "$RESULTS"
 
 teardown() {
   kill "$MONITOR_PID" 2>/dev/null || true
+  [ -n "${ETSI_TMP:-}" ] && rm -rf "$ETSI_TMP"
   [ -n "$ROLL_PID" ] && { kill "$ROLL_PID" 2>/dev/null || true; }
   rm -f "$PHASE_FILE"
   RESULTS="$RESULTS" dev/etsi-local-context.sh stop || true
@@ -327,7 +410,7 @@ trap teardown EXIT
 # names it in SUITE_CONTEXT, as etsi-run.sh allows: a second rewrite would
 # hand the broker one URL and the expectations another.
 local_context=0
-if [ -z "${SUITE_CONTEXT:-}" ]; then
+if [ "$RUN_OURS" = 1 ] && [ -z "${SUITE_CONTEXT:-}" ]; then
   SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
     || { echo "could not serve the suite context locally"; exit 1; }
   local_context=1
@@ -336,7 +419,8 @@ export SUITE_CONTEXT
 
 # 5. Serial suites against broker1 (STOP_ON_ERROR respected by etsi-run.sh).
 serial_status=0
-if [ -n "${SERIAL_SUITES// /}" ]; then
+if [ "$RUN_OURS" = 1 ] && [ -n "${SERIAL_SUITES// /}" ]; then
+  TESTSUITE=ours \
   BROKER_URL=http://localhost:9090/ngsi-ld/v1 \
   CALLBACK_HOST="${CALLBACK_HOST:-localhost}" \
   RESULTS_DIR="$RESULTS" \
@@ -353,7 +437,7 @@ fi
 # 6. IOP suite against all five brokers of the same stack. Configure
 # variables.py HERE — etsi-run.sh restores it on exit, so this step must
 # never rely on that sed surviving.
-if [ "$RUN_IOP" = 1 ]; then
+if [ "$RUN_OURS" = 1 ] && [ "$RUN_IOP" = 1 ]; then
 echo "IOP" > "$PHASE_FILE"
 # The venv bootstrap lives in etsi-run.sh, which an IOP-only invocation
 # (CI cell SUITES=IOP) never executes. Without this, ../.venv/bin/robot is
@@ -406,9 +490,63 @@ context_status=0
 # failure + sample CSVs, image size and the memory gate.
 kill "$MONITOR_PID" 2>/dev/null || true
 IMAGE_BYTES=$(docker image inspect antares-local:latest --format '{{.Size}}' 2>/dev/null || echo 0)
+ours_status=0
+if [ "$RUN_OURS" = 1 ]; then
 RESULTS="$RESULTS" STORE="$STORE" MEM_LIMIT_MB="$MEM_LIMIT_MB" IMAGE_BYTES="$IMAGE_BYTES" \
   python3 dev/etsi-report.py
 # the cell gate is this file (etsi-matrix.yml): a context fetched off-run fails it
 [ "$context_status" = 0 ] || echo FAIL > "$RESULTS/gate-status.txt"
 
-grep -q '^PASS$' "$RESULTS/gate-status.txt" && [ "$context_status" = 0 ]
+grep -q '^PASS$' "$RESULTS/gate-status.txt" && [ "$context_status" = 0 ] || ours_status=1
+fi
+
+# 8. The official suite, as published, on the same stack: serial dirs
+# against broker1, every *_TP tree against all five. Same broker URLs and
+# callback host as ours, given as robot --variable; its @context and MQTT
+# host stay its own. Gate: dev/etsi-baseline.py, not 100% green.
+etsi_status=0
+if [ "$RUN_ETSI" = 1 ]; then
+  if [ "$ETSI_OK" = 1 ]; then
+    if [ "$RUN_OURS" = 1 ]; then rm -f "$PHASE_FILE"; start_sampler "$ETSI_RESULTS"; fi
+    if [ -n "${ETSI_SERIAL// /}" ]; then
+      TESTSUITE=etsi ETSI_SUITE="$ETSI_SUITE" ETSI_VENV="$ETSI_VENV" \
+      BROKER_URL=http://localhost:9090/ngsi-ld/v1 \
+      CALLBACK_HOST="${CALLBACK_HOST:-localhost}" \
+      RESULTS_DIR="$ETSI_RESULTS" \
+      SUITES="$ETSI_SERIAL" \
+      STOP_ON_ERROR="${ETSI_STOP_ON_ERROR:-0}" \
+        ./dev/etsi-run.sh
+    fi
+    if [ "$RUN_IOP" = 1 ]; then
+      etsi_api=/ngsi-ld/v1
+      grep -q "^url = '.*/ngsi-ld/v1/\?'" "$ETSI_SUITE/resources/variables.py" || etsi_api=
+      etsi_out=$(cd "$ETSI_RESULTS" && pwd)
+      for tree in "$ETSI_SUITE"/*_TP; do
+        [ -d "$tree" ] || continue
+        name=$(basename "$tree"); name="${name%_TP}"
+        echo "$name" > "$PHASE_FILE"
+        echo "=== ETSI upstream: $name ==="
+        ( cd "$ETSI_SUITE" && "$ETSI_VENV/bin/robot" --outputdir "$etsi_out/$name" \
+            --variable "url:http://localhost:9090$etsi_api" \
+            --variable "temporal_api_url:http://localhost:9090$etsi_api" \
+            --variable "notification_server_host:${CALLBACK_HOST:-localhost}" \
+            --variable "context_source_host:${CALLBACK_HOST:-localhost}" \
+            --variable "context_server_host:${CALLBACK_HOST:-localhost}" \
+            --variable "b1_url:http://localhost:9090$etsi_api" \
+            --variable "b2_url:http://localhost:9091$etsi_api" \
+            --variable "b3_url:http://localhost:9092$etsi_api" \
+            --variable "b4_url:http://localhost:9093$etsi_api" \
+            --variable "b5_url:http://localhost:9094$etsi_api" \
+            "$(basename "$tree")" ) 2>&1 | tee "$etsi_out/$name-console.log" || true
+      done
+    fi
+    kill "$MONITOR_PID" 2>/dev/null || true
+    commit=$(sed -n 's/^commit=//p' "$ETSI_RESULTS/etsi-upstream.txt")
+    RESULTS="$ETSI_RESULTS" STORE="$STORE" MEM_LIMIT_MB="$MEM_LIMIT_MB" IMAGE_BYTES="$IMAGE_BYTES" \
+    SUITE_LABEL="ETSI suite ${ETSI_REF:-develop} @ ${commit:0:12}, $(sed -n 's/^date=//p' "$ETSI_RESULTS/etsi-upstream.txt")" \
+      python3 dev/etsi-report.py >/dev/null
+  fi
+  python3 dev/etsi-baseline.py check "$ETSI_RESULTS" --baseline "$ETSI_BASELINE" || etsi_status=1
+fi
+
+[ "$ours_status" = 0 ] && [ "$etsi_status" = 0 ]
