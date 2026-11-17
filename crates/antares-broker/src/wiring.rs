@@ -99,6 +99,14 @@ pub fn outbox_drain_enabled() -> Result<bool, String> {
     }
 }
 
+/// Whether this pod's shutdown waits for the shared outbox to empty: only a
+/// pod that runs the drain, which is an api pod on the nats bus with the
+/// drain on. Any other pod would wait on rows it never publishes, under
+/// sustained writes for the whole deadline.
+pub fn flushes_outbox_on_shutdown(roles: Roles, bus_nats: bool, drain_on: bool) -> bool {
+    roles.api && bus_nats && drain_on
+}
+
 /// KV key for one mirrored subscription: tenant verbatim (token-safe by
 /// construction), id hashed (URNs carry `:` — illegal in KV keys). The VALUE
 /// carries the real tenant/id, so the key only needs uniqueness. Kind-scoped:
@@ -1296,6 +1304,27 @@ mod tests {
 
         let _ = st.store.delete(&tenant, Kind::Entity, id).await;
         let _ = antares_sql::store::pg::outbox::reap_published(&pool, 0).await;
+    }
+
+    /// Only a pod that runs the outbox drain waits for the outbox at
+    /// shutdown: a matcher or notifier pod never publishes those rows.
+    #[test]
+    fn only_a_draining_pod_flushes_the_outbox_on_shutdown() {
+        let role = |spec: &str| Roles::parse(spec).expect("roles");
+        assert!(flushes_outbox_on_shutdown(role("api"), true, true));
+        assert!(flushes_outbox_on_shutdown(role("all"), true, true));
+        for (spec, nats, drain) in [
+            ("matcher", true, true),
+            ("notifier", true, true),
+            ("matcher,notifier", true, true),
+            ("api", true, false),
+            ("all", false, true),
+        ] {
+            assert!(
+                !flushes_outbox_on_shutdown(role(spec), nats, drain),
+                "{spec} nats={nats} drain={drain} runs no drain"
+            );
+        }
     }
 
     /// The outbox-drain switch is a config value like any other: the two

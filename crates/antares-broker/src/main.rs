@@ -1377,9 +1377,14 @@ async fn run(
     // before their creation). Under health-check polling that window is hit
     // constantly, which is exactly how the drain test caught it.
     let mut sigterm = std::pin::pin!(shutdown::signal());
-    // A pod whose drain is switched off publishes nothing, so waiting for the
-    // outbox to empty there would only burn the deadline.
-    let flush_outbox = wiring::outbox_drain_enabled()?;
+    // A pod that runs no drain (switched off, not an api pod, or not on the
+    // nats bus) publishes nothing, so waiting for the outbox to empty there
+    // would only burn the deadline.
+    let flush_outbox = wiring::flushes_outbox_on_shutdown(
+        roles,
+        bus_mode == "nats",
+        wiring::outbox_drain_enabled()?,
+    );
     // Manual serve loop: the ETSI suite reads response headers case-sensitively
     // ("Location"), so HTTP/1 responses are written with title-case headers.
     loop {
