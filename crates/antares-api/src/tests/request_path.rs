@@ -197,3 +197,29 @@ async fn a_purge_that_drops_an_attribute_moves_modified_at() {
     assert!(after.get("speed").is_none(), "{after}");
     assert_ne!(after["modifiedAt"], before, "{after}");
 }
+
+/// join=flat on Retrieve Entity answers an array; as geo+json that array is
+/// a FeatureCollection, each Entity a Feature.
+#[tokio::test]
+async fn a_flat_join_retrieve_as_geojson_keeps_every_entity() {
+    let st = state();
+    create(&st, r#"{"id":"urn:ngsi-ld:T:b","type":"T"}"#).await;
+    create(
+        &st,
+        r#"{"id":"urn:ngsi-ld:T:a","type":"T","rel":{"type":"Relationship","object":"urn:ngsi-ld:T:b"}}"#,
+    )
+    .await;
+    let req = Request::get("/ngsi-ld/v1/entities/urn:ngsi-ld:T:a?join=flat&joinLevel=1")
+        .header("accept", "application/geo+json")
+        .body(Body::empty())
+        .expect("req");
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json_of(resp).await;
+    assert_eq!(body["type"], "FeatureCollection", "{body}");
+    let ids: Vec<&str> = body["features"]
+        .as_array()
+        .map(|f| f.iter().filter_map(|x| x["id"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(ids, ["urn:ngsi-ld:T:a", "urn:ngsi-ld:T:b"], "{body}");
+}
