@@ -301,7 +301,7 @@ pub(crate) fn index_keys(doc: &Value) -> Keys {
                 // at match time — the index cannot prove them, so the whole
                 // sub goes broad (entries are OR-ed: one opaque entry taints
                 // the union).
-                Some(t) if !t.contains(['|', ',', ';', '(', ')', '*']) => {
+                Some(t) if !crate::entities::is_type_selection(t) => {
                     types.push(t.to_owned());
                 }
                 _ => return Keys::Broad,

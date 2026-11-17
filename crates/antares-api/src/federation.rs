@@ -422,10 +422,7 @@ async fn reg_docs(
     let types: Option<Vec<String>> = spec
         .types
         .as_ref()
-        .filter(|ts| {
-            !ts.iter()
-                .any(|t| t.contains([',', ';', '|', '(', ')', '*']))
-        })
+        .filter(|ts| !ts.iter().any(|t| crate::entities::is_type_selection(t)))
         .map(|ts| ts.iter().map(|t| ctx.expand_key(t)).collect());
     // The id dimension is dropped whenever the query ALSO carries an
     // idPattern: `entity_info_matches` lets a registration's own entity id
@@ -2385,7 +2382,7 @@ fn forward_types(reg: &FedReg, ctx: &Context, params: &HashMap<String, String>) 
         let own: Vec<String> = reg.ent_types.iter().map(|t| ctx.compact_iri(t)).collect();
         return Some(own.join(","));
     };
-    if sel.contains(['|', ';', '(', ')', '*']) {
+    if crate::entities::is_type_expression(sel) {
         return Some(sel.clone());
     }
     let keep: Vec<&str> = sel
