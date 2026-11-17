@@ -46,10 +46,10 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-matcher` | 530 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
 | `antares-store` | 4 500 | `CurrentStateDriver`, `TemporalDriver` (object-safe, `lib.rs:140`, `:385`), `Kind`, filters/paging (`filter.rs`) | pull a backend |
 | `antares-sql` | 16 300 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
-| `antares-bus` | 1 070 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
-| `antares-notifier` | 2 100 | `NotificationSink` (schemes, `parse_endpoint`, `deliver`, `network`) chosen from `SinkRegistry` by endpoint scheme: http (`http.rs`), mqtt behind the feature, delivery policy, `Outbound` | match or store |
+| `antares-bus` | 1 260 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
+| `antares-notifier` | 2 460 | `NotificationSink` (schemes, `parse_endpoint`, `deliver`, `network`) chosen from `SinkRegistry` by endpoint scheme: http (`http.rs`), mqtt behind the feature, delivery policy, `Outbound` | match or store |
 | `antares-api` | 66 600 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
-| `antares-broker` | 5 050 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
+| `antares-broker` | 5 870 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
 
 ## 3. Module map of `antares-api/src`
@@ -66,17 +66,17 @@ module's header comment.
 | `attrs.rs` | 2 400 | 5.6.2–5.6.5 attribute operations |
 | `batch/` | 3 000 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal/` | 6 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
-| `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
+| `temporalq.rs` | 218 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 1 800 | 5.7.5–5.7.10 `/types`, `/attributes` |
 | `subscriptions.rs` | 2 600 | 5.8, 5.11 `/subscriptions`, `/csourceSubscriptions` |
 | `notify/` | 7 500 | 5.8.6 notifications: `mod.rs` wiring, the change queue and temporal recording; `matching.rs` candidate evaluation; `payload.rs` the body; `throttle.rs` the drain, lanes and delivery slots; `interval.rs` periodic sweeps; `delivery.rs` one send (egress check, headers); `csource.rs` csource notifications; `retry.rs` retries and dead letters |
-| `distsub.rs` | 2 000 | 5.8.1.4 distributed subscriptions, consumer half |
+| `distsub.rs` | 2 350 | 5.8.1.4 distributed subscriptions, consumer half |
 | `csource.rs` | 2 500 | 5.9, 5.10 registrations, `csource_index` maintenance |
-| `registry.rs` | 600 | matching over a registration document: `CsrSpec`, the 4.3.6.1 information match, csf and scope filters, the temporal interval and expiry of a registration, the 5.11.2 subscription match; named by federation, notify, csource and every resource module that forwards |
+| `registry.rs` | 800 | matching over a registration document: `CsrSpec`, the 4.3.6.1 information match, csf and scope filters, the temporal interval and expiry of a registration, the 5.11.2 subscription match; named by federation, notify, csource and every resource module that forwards |
 | `federation.rs` | 4 800 | 4.3.6, 5.12, 6.3.17–6.3.19 forwarding, fan-out, result merge |
 | `entity_maps.rs` | 370 | 5.14 the `/entityMaps` resources (6.32, 6.34, 6.35): create from a query, retrieve, update, delete |
 | `entity_map.rs` | 960 | one EntityMap document (5.2.39): store it under its tenant with a lifetime, read it back while it lives, take a page's candidate ids from it, merge what a distributed query reached, and serve a retrieve through a presented map |
-| `snapshots.rs` | 2 400 | 5.16 snapshots under synthetic `snap-…` tenants |
+| `snapshots.rs` | 2 820 | 5.16 snapshots under synthetic `snap-…` tenants |
 | `contexts.rs` | 1 100 | 5.13 `/jsonldContexts` |
 | `conformance.rs` | 855 | 6.3.21 version negotiation |
 | `repr.rs` | 2 500 | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
