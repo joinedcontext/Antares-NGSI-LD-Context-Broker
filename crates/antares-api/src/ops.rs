@@ -2,6 +2,12 @@
 //! The broker's operational surface (`Admin`): health, readiness, metrics, the tenant list, size and purge, and the dead-letter admin.
 
 use super::*;
+// Clock rule: std Instant panics on wasm32; web-time is the std re-export
+// natively and performance.now() in the browser.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 /// The broker's own operational surface: health, readiness, metrics, the
 /// tenant list and purge, and the dead-letter admin. Health and readiness
@@ -530,7 +536,7 @@ pub const TENANT_BYTES_RETRY: std::time::Duration = std::time::Duration::from_se
 
 /// One tenant's entry in [`crate::state::Shared::tenant_bytes`]: when it was
 /// written and the size, `None` while it is measured or after it failed.
-pub type BytesEntry = (std::time::Instant, Option<serde_json::Value>);
+pub type BytesEntry = (Instant, Option<serde_json::Value>);
 
 /// What a size read takes from the cache: `Some(answer)` while an entry is
 /// fresh (a measured size for [`TENANT_BYTES_TTL`], a failure or a
@@ -540,7 +546,7 @@ pub type BytesEntry = (std::time::Instant, Option<serde_json::Value>);
 pub(super) fn bytes_cached_or_claim(
     map: &mut std::collections::HashMap<String, BytesEntry>,
     tenant: &str,
-    now: std::time::Instant,
+    now: Instant,
 ) -> Option<Option<serde_json::Value>> {
     if let Some((at, v)) = map.get(tenant) {
         let ttl = if v.is_some() {
@@ -566,9 +572,7 @@ pub(super) async fn tenant_bytes(st: &AppState, tenant: &TenantId) -> Option<ser
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    if let Some(answer) =
-        bytes_cached_or_claim(&mut cache(), tenant.as_str(), std::time::Instant::now())
-    {
+    if let Some(answer) = bytes_cached_or_claim(&mut cache(), tenant.as_str(), Instant::now()) {
         return answer;
     }
     let measured = async {
@@ -589,10 +593,7 @@ pub(super) async fn tenant_bytes(st: &AppState, tenant: &TenantId) -> Option<ser
             None
         }
     };
-    cache().insert(
-        tenant.as_str().to_owned(),
-        (std::time::Instant::now(), v.clone()),
-    );
+    cache().insert(tenant.as_str().to_owned(), (Instant::now(), v.clone()));
     v
 }
 
