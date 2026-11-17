@@ -122,11 +122,10 @@ pub(super) fn merge_remote_batch(
 
 /// The registration-matching input of a batch (4.3.6.1): the ids, the
 /// expanded types and the expanded Attribute names the whole array carries,
-/// as one `CsrSpec`, together with the items in the shape a forward sends
-/// them. An entry whose body is not an object, or whose `@context` did not
-/// resolve, contributes nothing and is left to the local arm to report.
-pub(super) fn batch_spec(items: &[BatchItem]) -> (crate::registry::CsrSpec, Vec<FwdItem>) {
-    let mut fwd_items = Vec::new();
+/// as one `CsrSpec`. An entry whose body is not an object, or whose
+/// `@context` did not resolve, contributes nothing and is left to the local
+/// arm to report.
+pub(super) fn batch_spec(items: &[BatchItem]) -> crate::registry::CsrSpec {
     let mut spec = crate::registry::CsrSpec::default();
     let (mut types, mut ids, mut attrs) = (Vec::new(), Vec::new(), Vec::new());
     for (item, ctx) in items {
@@ -148,7 +147,6 @@ pub(super) fn batch_spec(items: &[BatchItem]) -> (crate::registry::CsrSpec, Vec<
                 attrs.push(c.expand_key(k));
             }
         }
-        fwd_items.push((o.clone(), c.clone()));
     }
     if !types.is_empty() {
         spec.types = Some(types);
@@ -159,7 +157,19 @@ pub(super) fn batch_spec(items: &[BatchItem]) -> (crate::registry::CsrSpec, Vec<
     if !attrs.is_empty() {
         spec.attrs = Some(attrs);
     }
-    (spec, fwd_items)
+    spec
+}
+
+/// The items in the shape a forward sends them, the ones [`batch_spec`]
+/// matched on; built only once a registration matched.
+pub(super) fn forward_items(items: &[BatchItem]) -> Vec<FwdItem> {
+    items
+        .iter()
+        .filter_map(|(item, ctx)| match (item.as_object(), ctx.as_ref()) {
+            (Some(o), Ok(c)) => Some((o.clone(), c.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// What the forwards of one batch brought back: the ids a peer applied, each

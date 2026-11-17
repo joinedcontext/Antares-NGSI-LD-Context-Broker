@@ -76,9 +76,16 @@ async fn parse_batch(
     };
     let value: Value = parse_batch_body(body)
         .map_err(|e| NgsiError::InvalidRequest(format!("body is not valid JSON: {e}")))?;
-    let items = value.as_array().filter(|a| !a.is_empty()).ok_or_else(|| {
-        NgsiError::BadRequestData("batch body must be a non-empty JSON array".into())
-    })?;
+    // the parsed array is owned: its items move into the batch, uncopied
+    let items = match value {
+        Value::Array(a) if !a.is_empty() => a,
+        _ => {
+            return Err(NgsiError::BadRequestData(
+                "batch body must be a non-empty JSON array".into(),
+            )
+            .into())
+        }
+    };
     // 5.6.7.4 (and siblings): a null value in ANY item fails the whole
     // request with BadRequestData — not a per-item 207 error.
     if items.iter().any(Value::is_null) {
@@ -164,7 +171,7 @@ async fn parse_batch(
                 None => Ok(st.loader.core()),
             }
         };
-        out.push((item.clone(), ctx));
+        out.push((item, ctx));
     }
     Ok(out)
 }

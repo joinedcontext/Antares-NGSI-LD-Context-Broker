@@ -100,7 +100,7 @@ async fn batch_write(
         any_created: false,
     };
     run.decide(headers, &mut items).await?;
-    let (spec, fwd_items) = batch_spec(&items);
+    let spec = batch_spec(&items);
     let fed_regs = match crate::federation::write_plan(
         st,
         &run.tenant,
@@ -115,6 +115,11 @@ async fn batch_write(
         crate::federation::WritePlan::Forward(regs) => regs,
     };
     run.conds.unforwarded(!fed_regs.is_empty())?;
+    // the forwarded copies are made only when a registration matched
+    let fwd_items = match fed_regs.is_empty() {
+        true => Vec::new(),
+        false => forward_items(&items),
+    };
     let proxies: Vec<&crate::federation::FedReg> =
         fed_regs.iter().filter(|r| r.is_proxy()).collect();
     let (creates, prepped) = run.prep(items, &proxies);
