@@ -695,6 +695,65 @@ pub(crate) async fn on_csource_notification(
 /// name is expanded against `ctx` before it is compared or inserted, so the
 /// reduction happens in one representation — `expand_key` is idempotent on
 /// an absolute IRI, which is what the stored registration already holds.
+/// 5.8.1.4 "reduced to what is matched by the registration information":
+/// each selector of the Subscription against each EntityInfo of the
+/// registration. The subscriber's type stays when the EntityInfo names it
+/// (or no type), and its own id or idPattern stays, narrowed by the
+/// EntityInfo's id when it has none; a selector naming another id, or a type
+/// the EntityInfo lacks, is not provided there. A 4.17 type selection
+/// (`A|B`, `(A;B)`) is kept as written.
+fn intersect_selectors(own: &[Value], reg: &[&Value], ctx: &antares_jsonld::Context) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for r in reg {
+        // notification presentation arrayifies and compacts type
+        let r_types: Vec<String> = crate::registry::ei_types(r)
+            .into_iter()
+            .map(|t| ctx.expand_key(t))
+            .collect();
+        let r_id = r.get("id").and_then(Value::as_str);
+        let r_pattern = r.get("idPattern").and_then(Value::as_str);
+        let selectors: Vec<serde_json::Map<String, Value>> = if own.is_empty() {
+            vec![serde_json::Map::new()]
+        } else {
+            own.iter().filter_map(|s| s.as_object().cloned()).collect()
+        };
+        for mut s in selectors {
+            match s.get("type").and_then(Value::as_str) {
+                Some(t) if t.contains(['|', ';', '(', ')']) => {}
+                Some(t) => {
+                    if !r_types.is_empty() && !r_types.iter().any(|r| *r == ctx.expand_key(t)) {
+                        continue;
+                    }
+                }
+                None => match r_types.first() {
+                    Some(t) => {
+                        s.insert("type".into(), Value::String(t.clone()));
+                    }
+                    None => continue,
+                },
+            }
+            let s_id = s.get("id").and_then(Value::as_str);
+            match (s_id, r_id) {
+                (Some(a), Some(b)) if a != b => continue,
+                (None, Some(b)) if !s.contains_key("idPattern") => {
+                    s.insert("id".into(), Value::String(b.to_owned()));
+                }
+                (None, None) if !s.contains_key("idPattern") => {
+                    if let Some(p) = r_pattern {
+                        s.insert("idPattern".into(), Value::String(p.to_owned()));
+                    }
+                }
+                _ => {}
+            }
+            let s = Value::Object(s);
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 fn reduced_copy(
     st: &AppState,
     sub: &Value,
@@ -726,36 +785,26 @@ fn reduced_copy(
     o.retain(|k, _| !k.starts_with("__"));
     o.insert("id".into(), Value::String(remote_id.to_owned()));
     // reduce the entity selectors to the registration information
-    let reg_entities: Vec<Value> = reg
+    let reg_entities: Vec<&Value> = reg
         .get("information")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|i| i.get("entities").and_then(Value::as_array))
         .flatten()
-        .map(|e| {
-            let mut e = e.clone();
-            // notification presentation arrayifies type — EntitySelector
-            // wants the plain form back
-            if let Some(o) = e.as_object_mut() {
-                if let Some(t) = o
-                    .get("type")
-                    .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                    .cloned()
-                {
-                    o.insert("type".into(), t);
-                }
-                if let Some(t) = o.get("type").and_then(Value::as_str) {
-                    let t = Value::String(ctx.expand_key(t));
-                    o.insert("type".into(), t);
-                }
-            }
-            e
-        })
         .collect();
     if !reg_entities.is_empty() {
-        o.insert("entities".into(), Value::Array(reg_entities));
+        let own: Vec<Value> = o
+            .get("entities")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let reduced = intersect_selectors(&own, &reg_entities, ctx);
+        if reduced.is_empty() {
+            // nothing the subscriber selects is provided by this source
+            return None;
+        }
+        o.insert("entities".into(), Value::Array(reduced));
     }
     // watchedAttributes ∩ the registration's attribute scope
     let reg_attrs: Vec<String> = reg
@@ -1178,6 +1227,45 @@ mod tests {
                 "lastFailure": "2026-01-02T00:00:00Z",
             },
         })
+    }
+
+    /// 5.8.1.4: the copy keeps the subscriber's own id selector inside the
+    /// registration's scope instead of widening it to the registered type.
+    #[test]
+    fn a_reduced_copy_keeps_the_subscribers_id() {
+        let st = AppState::new("antares-ds-ids".into());
+        let mut sub = sub_doc();
+        if let Some(o) = sub.as_object_mut() {
+            o.insert(
+                "entities".into(),
+                json!([{"type": format!("{DC}Vehicle"), "id": "urn:ngsi-ld:Vehicle:7"}]),
+            );
+        }
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:r2",
+            "endpoint": "http://source.example.org",
+            "information": [{"entities": [{"type": ["Vehicle"]}], "propertyNames": ["speed"]}],
+        });
+        let copy = reduced_copy(
+            &st,
+            &sub,
+            &reg,
+            "urn:ngsi-ld:Subscription:remote2",
+            &st.loader.core(),
+        )
+        .expect("a copy the registration covers");
+        assert_eq!(
+            copy["entities"],
+            json!([{"type": format!("{DC}Vehicle"), "id": "urn:ngsi-ld:Vehicle:7"}]),
+            "{copy}"
+        );
+        // another Entity than the registration's is not provided there
+        let one = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:r3",
+            "endpoint": "http://source.example.org",
+            "information": [{"entities": [{"type": ["Vehicle"], "id": "urn:ngsi-ld:Vehicle:8"}]}],
+        });
+        assert!(reduced_copy(&st, &sub, &one, "urn:x:r3", &st.loader.core()).is_none());
     }
 
     /// a periodic Subscription that watches everything gets no
