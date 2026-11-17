@@ -423,6 +423,12 @@ pub const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
 pub const RETRY_CHAINS: usize = 256;
 /// Of [`RETRY_CHAINS`], what one tenant may hold.
 pub const RETRY_CHAINS_PER_TENANT: usize = RETRY_CHAINS / 8;
+/// splitEntities merges of inbound notifications (5.8.6) one broker runs at
+/// once. Each retrieves every notified Entity locally and from the other
+/// Context Sources after the notifying source was answered; past them a
+/// notification is answered 503 with `Retry-After`, before it is
+/// acknowledged, and the source sends it again.
+pub const SPLIT_MERGES: usize = 64;
 /// Destinations and registrations the egress breaker tracks. Both maps are
 /// keyed by client-supplied strings, so they need a bound: at the ceiling the
 /// least recently recorded entry is dropped, which costs at most a forgotten
@@ -480,6 +486,7 @@ impl LimitStats {
             "maxImplicitContexts": MAX_IMPLICIT_CONTEXTS,
             "retryChains": RETRY_CHAINS,
             "retryChainsPerTenant": RETRY_CHAINS_PER_TENANT,
+            "splitMerges": SPLIT_MERGES,
             "rejectedUriTooLong": self.uri_too_long.load(Ordering::Relaxed),
             "rejectedBodyTooLarge": self.body_too_large.load(Ordering::Relaxed),
             "rejectedBodyTooDeep": self.body_too_deep.load(Ordering::Relaxed),
@@ -751,6 +758,7 @@ mod tests {
                 "rejectedUriTooLong",
                 "retryChains",
                 "retryChainsPerTenant",
+                "splitMerges",
                 "temporalDefaultInstances",
                 "temporalInstanceLimit",
             ],

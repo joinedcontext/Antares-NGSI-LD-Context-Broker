@@ -497,6 +497,11 @@ pub struct Shared {
     /// otherwise grow them without limit. Native only: wasm32 sends once.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) retry_slots: Arc<tokio::sync::Semaphore>,
+    /// splitEntities merges of inbound notifications running at once
+    /// (`bounds::SPLIT_MERGES`): a merge runs after the source was
+    /// answered, so its slot is taken before, and a notification that
+    /// finds none free is answered 503.
+    pub split_merges: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::ops::Deref for AppState {
@@ -807,6 +812,7 @@ impl AppState {
                 delivery: antares_notifier::DeliveryPolicy::default(),
                 #[cfg(not(target_arch = "wasm32"))]
                 retry_slots: Arc::new(tokio::sync::Semaphore::new(crate::bounds::RETRY_CHAINS)),
+                split_merges: Arc::new(tokio::sync::Semaphore::new(crate::bounds::SPLIT_MERGES)),
             }),
         }
     }
