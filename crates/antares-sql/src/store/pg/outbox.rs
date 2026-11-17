@@ -11,9 +11,9 @@
 //! reads it back with [`event`] and [`reap_published`] frees it once the bus
 //! can no longer be carrying the message.
 //!
-//! Producer wiring into the entity write paths lands WITH the drain:
-//! enqueuing events nothing consumes would only grow the table
-//! without bound.
+//! The entity write paths enqueue only while the outbox is switched on
+//! (`PgEntityStore::set_outbox`, with ANTARES_BUS=nats), when a drain consumes
+//! the rows.
 
 use antares_model::TenantId;
 use serde_json::Value;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! PgStore slice two: the doc-table kinds —
 //! `subscriptions`, `csource_registrations`, `csource_subscriptions` — plus
-//! cross-tenant `jsonld_contexts`. Same sync-facade shape as `pg_entity`.
+//! cross-tenant `jsonld_contexts`, async like `pg::entity`.
 //!
 //! The v0 interchange form stores ONE doc per resource; the bookkeeping
 //! columns (`expires_at`, `is_active`, `times_sent`, `last_*`) are EXTRACTED
