@@ -1808,3 +1808,43 @@ async fn the_history_reap_finds_expired_rows_by_their_column() {
     }
     clean().await;
 }
+
+/// 4.22: the expired-entity reap deletes a bounded batch per transaction,
+/// so a backlog is worked off over several transactions instead of one
+/// statement that grows until it outruns `statement_timeout`.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_22_the_entity_reap_works_in_bounded_batches() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = TenantId::new("pgreapbatch").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = pg::entity::PgEntityStore::new(pool.clone());
+    let ids: Vec<String> = (0..5).map(|i| format!("urn:ngsi-ld:T:reap{i}")).collect();
+    for id in &ids {
+        let _ = store.delete(&t, id).await;
+        let doc = json!({"id": id, "type": ["https://e.org/T"],
+                         "createdAt": "2000-01-01T00:00:00Z", "modifiedAt": "2000-01-01T00:00:00Z",
+                         "expiresAt": "2000-01-02T00:00:00Z"});
+        assert!(store.create(&t, id, &doc).await.expect("create"));
+    }
+    let mut rounds = 0;
+    loop {
+        let gone = pg::maintenance::reap_expired_entities_once(&pool, 2)
+            .await
+            .expect("reap");
+        assert!(gone <= 2, "one batch reaped {gone} entities");
+        rounds += 1;
+        if gone == 0 || rounds > 1000 {
+            break;
+        }
+    }
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, &t).await.expect("tenant");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+    tx.commit().await.expect("commit");
+    assert_eq!(left, 0, "the batches worked off every expired entity");
+}
