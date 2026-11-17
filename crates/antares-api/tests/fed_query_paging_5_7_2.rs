@@ -272,3 +272,54 @@ async fn an_entity_map_forward_is_narrowed_to_the_registration() {
         lines[0]
     );
 }
+
+/// A source answering every request with `body` (201, JSON).
+fn canned_source(body: &'static str) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 8192];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    port
+}
+
+/// 4.3.6.1: the ids a peer's EntityMap returns join the local map only
+/// where the registration can provide them (or the query named them).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entity_map_imports_only_the_ids_the_registration_provides() {
+    antares_jsonld::allow_private_egress(true);
+    let st = AppState::new("antares1".into());
+    let port = canned_source(
+        r#"{"id":"urn:ngsi-ld:EntityMap:peer","type":"EntityMap",
+            "expiresAt":"2999-01-01T00:00:00Z","linkedMaps":{},
+            "entityMap":{"urn:ngsi-ld:Vehicle:1":["@none"],"urn:ngsi-ld:Vehicle:9":["@none"]}}"#,
+    );
+    let reg = serde_json::json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:em-import",
+        "type": "ContextSourceRegistration",
+        "operations": ["createEntityMapQueryEntity"],
+        "information": [{"entities": [{"type": "Vehicle", "id": "urn:ngsi-ld:Vehicle:1"}]}],
+        "endpoint": format!("http://127.0.0.1:{port}"),
+    })
+    .to_string();
+    let (status, text, _) = call(&st, "POST", "/ngsi-ld/v1/csourceRegistrations", Some(reg)).await;
+    assert_eq!(status, 201, "{text}");
+    let (status, text, _) = call(&st, "GET", "/ngsi-ld/v1/entityMaps?type=Vehicle", None).await;
+    assert_eq!(status, 201, "{text}");
+    let map: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let ids = map["entityMap"].as_object().expect("entityMap");
+    assert!(ids.contains_key("urn:ngsi-ld:Vehicle:1"), "{map}");
+    assert!(!ids.contains_key("urn:ngsi-ld:Vehicle:9"), "{map}");
+}
