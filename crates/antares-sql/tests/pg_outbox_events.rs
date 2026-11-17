@@ -219,3 +219,40 @@ async fn a_single_upsert_hooks_the_write_it_made() {
     assert_eq!(log[0].1.incarnation, log[1].1.incarnation);
     assert!(store.delete(&t, Kind::Entity, &id).await.expect("delete"));
 }
+
+/// A batch upsert enqueues one event per id, create then update, each
+/// carrying its item's document and the version the hook gets.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_upsert_enqueues_each_items_event() {
+    let _ = require_db!();
+    let t = TenantId::new("pgoutboxver").expect("tenant");
+    let Some((pool, s)) = store(&t).await else {
+        return;
+    };
+    let run = run_id();
+    let ids: Vec<String> = (0..3)
+        .map(|i| format!("urn:ngsi-ld:T:up{run}x{i}"))
+        .collect();
+    let items = |n: i64| -> Vec<(String, Value)> {
+        ids.iter().map(|id| (id.clone(), doc(id, n))).collect()
+    };
+    let first = s
+        .batch_upsert_replace_stamped(&t, &items(1))
+        .await
+        .expect("create");
+    let second = s
+        .batch_upsert_replace_stamped(&t, &items(2))
+        .await
+        .expect("replace");
+    for (i, id) in ids.iter().enumerate() {
+        let want: Vec<(String, i64, String)> = [("create", &first[i]), ("update", &second[i])]
+            .iter()
+            .map(|(op, (_, _, v))| {
+                let v = v.clone().expect("version");
+                ((*op).to_owned(), v.version, v.incarnation)
+            })
+            .collect();
+        assert_eq!(events(&pool, &t, id).await, want, "{id}");
+        s.delete(&t, id).await.expect("cleanup");
+    }
+}
