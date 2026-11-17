@@ -638,14 +638,8 @@ pub async fn matching_regs(
                 alias,
                 csi,
                 local_only: local_only_of(doc),
-                timeout_ms: doc
-                    .get("management")
-                    .and_then(|m| m.get("timeout"))
-                    .and_then(Value::as_u64),
-                cooldown_ms: doc
-                    .get("management")
-                    .and_then(|m| m.get("cooldown"))
-                    .and_then(Value::as_u64),
+                timeout_ms: management_ms(doc, "timeout"),
+                cooldown_ms: management_ms(doc, "cooldown"),
             })
         })
         .collect();
@@ -1874,6 +1868,16 @@ fn csi_of(reg: &Value) -> Vec<(String, String)> {
 
 /// A registration's endpoint without a trailing `/` or the API root it may name
 /// (`…/ngsi-ld/v1`), so a forward URL never doubles the prefix (IOP fixtures).
+/// A 5.2.34 `management` timeout or cooldown in milliseconds. The member is
+/// a Number greater than 0, which registration admits fractional; rounded up
+/// to whole milliseconds, never read as absent (no cooldown, the default
+/// timeout) for being fractional.
+fn management_ms(reg: &Value, key: &str) -> Option<u64> {
+    let ms = reg.get("management")?.get(key)?.as_f64()?;
+    // registration admits only finite values above 0; the cast saturates
+    (ms.is_finite() && ms > 0.0).then(|| ms.ceil() as u64)
+}
+
 pub(crate) fn endpoint_base(endpoint: &str) -> String {
     let e = endpoint.trim_end_matches('/');
     e.strip_suffix("/ngsi-ld/v1").unwrap_or(e).to_owned()
@@ -1919,14 +1923,8 @@ pub(crate) fn fed_reg_of(reg_id: &str, reg: &Value) -> FedReg {
         // registration view from this function.
         csi: csi_of(reg),
         local_only: local_only_of(reg),
-        timeout_ms: reg
-            .get("management")
-            .and_then(|m| m.get("timeout"))
-            .and_then(Value::as_u64),
-        cooldown_ms: reg
-            .get("management")
-            .and_then(|m| m.get("cooldown"))
-            .and_then(Value::as_u64),
+        timeout_ms: management_ms(reg, "timeout"),
+        cooldown_ms: management_ms(reg, "cooldown"),
     }
 }
 
@@ -3582,6 +3580,17 @@ pub fn strip_proxied(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Table 5.2.34-1: timeout and cooldown are Numbers; a fractional one
+    /// is honoured (rounded up to whole milliseconds), not dropped.
+    #[test]
+    fn a_fractional_management_number_is_honoured() {
+        let reg = json!({"id": "urn:ngsi-ld:ContextSourceRegistration:m",
+            "endpoint": "http://peer:9090",
+            "management": {"timeout": 2500.5, "cooldown": 1000}});
+        let r = fed_reg_of("urn:ngsi-ld:ContextSourceRegistration:m", &reg);
+        assert_eq!((r.timeout_ms, r.cooldown_ms), (Some(2501), Some(1000)));
+    }
 
     /// 6.3.5: a Link carries one @context, so an array of several URLs
     /// travels whole (in the body), never as its first URL alone.
