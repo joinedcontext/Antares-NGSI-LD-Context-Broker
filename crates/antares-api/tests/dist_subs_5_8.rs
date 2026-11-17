@@ -503,6 +503,110 @@ async fn clause_5_8_6_origin_csf_gates_inbound_notifications() {
     );
 }
 
+/// 5.8.6 splitEntities=true: the merge runs after the acknowledgement, so
+/// it takes one of the broker's merge slots first; with none free the
+/// notification is answered 503 with Retry-After and no merge starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_split_notification_without_a_merge_slot_is_refused() {
+    allow_private();
+    std::env::set_var("ANTARES_PUBLIC_URL", "http://127.0.0.1:9999");
+    let mut st = AppState::new("antares-split-full".into());
+    st.split_merges = Arc::new(tokio::sync::Semaphore::new(0));
+    antares_api::wire(&mut st).await;
+
+    let (remote_port, remote_seen) = recording_mock();
+    let (brand_port, brand_seen) = recording_mock();
+    for (id, port, op) in [
+        ("split-full-origin", remote_port, "federationOps"),
+        ("split-full-brand", brand_port, "retrieveEntity"),
+    ] {
+        let reg = json!({
+            "id": format!("urn:ngsi-ld:ContextSourceRegistration:{id}"),
+            "type": "ContextSourceRegistration",
+            "information": [{"entities": [{"type": "Vehicle"}]}],
+            "operations": [op],
+            "endpoint": format!("http://127.0.0.1:{port}"),
+        });
+        let (status, body) = send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/csourceRegistrations",
+            Some(reg.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (orig_port, orig_seen) = recording_mock();
+    let sub = json!({
+        "id": "urn:ngsi-ld:Subscription:ds-split-full",
+        "type": "Subscription",
+        "entities": [{"type": "Vehicle"}],
+        "splitEntities": true,
+        "notification": {"endpoint": {"uri": format!("http://127.0.0.1:{orig_port}/notify")}},
+    });
+    let (status, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(sub.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    wait_for("the forwarded remote subscription", || {
+        remote_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .any(|r| r.starts_with("POST /ngsi-ld/v1/subscriptions"))
+    })
+    .await;
+    let remote_id = {
+        let seen = remote_seen.lock().expect("seen");
+        let r = seen
+            .iter()
+            .find(|r| r.starts_with("POST /ngsi-ld/v1/subscriptions"))
+            .expect("post")
+            .clone();
+        serde_json::from_str::<Value>(r.split("\n\n").nth(1).expect("body")).expect("json")["id"]
+            .as_str()
+            .expect("remote id")
+            .to_owned()
+    };
+    let inbound = json!({
+        "type": "Notification",
+        "subscriptionId": remote_id,
+        "data": [{"id": "urn:ngsi-ld:Vehicle:full1", "type": "Vehicle",
+                  "speed": {"type": "Property", "value": 99}}],
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ex/v1/remote-notify")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", inbound.len())
+        .body(Body::from(inbound))
+        .expect("request");
+    let res = antares_api::router(st.clone())
+        .oneshot(req)
+        .await
+        .expect("response");
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        res.headers().contains_key("Retry-After"),
+        "{:?}",
+        res.headers()
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        brand_seen.lock().expect("seen").is_empty(),
+        "no merge retrieval started"
+    );
+    assert!(
+        orig_seen.lock().expect("seen").is_empty(),
+        "nothing was delivered"
+    );
+}
+
 /// 5.8.6 splitEntities=true: the Entities of an inbound Notification shall
 /// be retrieved from all OTHER Context Sources (never the origin), merged
 /// with the notified fragments, and re-filtered by the local Subscription's

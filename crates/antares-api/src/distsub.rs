@@ -1136,8 +1136,21 @@ async fn remote_notify_inner(st: &AppState, body: &[u8]) -> ApiResult<Response> 
     // acknowledgement, so a slow or failing other source never turns into a
     // delivery failure (and a retry) at the notifying one.
     let split = sub.get("splitEntities").and_then(Value::as_bool) == Some(true);
+    // The merge holds one of the broker's merge slots, taken before the
+    // source is answered: with none free the notification is not
+    // acknowledged, and the source sends it again after Retry-After.
+    let slot = match split {
+        true => Some(
+            st.split_merges
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| ApiError::Overloaded(crate::negotiate::RETRY_AFTER_SECONDS))?,
+        ),
+        false => None,
+    };
     let (st2, sub2, t2) = (st.clone(), sub.clone(), tenant.clone());
     crate::spawn(async move {
+        let _slot = slot;
         let data = if split {
             match split_merge(&st2, &t2, &sub2, origin_reg_id.as_deref(), data).await {
                 // "If there are Entities in the data member of the
