@@ -114,6 +114,31 @@ async fn the_facade_answers_its_own_shape_over_the_broker_s_data() {
     );
 }
 
+/// `kind` is one Entity type, never a way to add parameters to the inner
+/// request: an encoded `&limit=1` in it stays part of the type name, so the
+/// inner query does not come back narrowed to one Entity.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_kind_cannot_add_parameters_to_the_inner_request() {
+    let (st, _) = state();
+    create(&st, "facadei", "urn:ngsi-ld:Vehicle:a").await;
+    create(&st, "facadei", "urn:ngsi-ld:Vehicle:b").await;
+    let (code, body) = get(
+        &st,
+        "/x/example/things?kind=Vehicle%26limit%3D1",
+        Some("facadei"),
+    )
+    .await;
+    let narrowed = code == StatusCode::OK && body["value"].as_array().is_some_and(|a| a.len() == 1);
+    assert!(
+        !narrowed,
+        "the injected limit=1 reached the inner request: {code} {body}"
+    );
+    // negative: the plain kind still answers both
+    let (code, body) = get(&st, "/x/example/things?kind=Vehicle", Some("facadei")).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2), "{body}");
+}
+
 /// The tenant reaches the inner request without the façade doing anything
 /// about it. A façade that had to remember would be the place a deployment
 /// leaks one tenant's data into another's answer.
