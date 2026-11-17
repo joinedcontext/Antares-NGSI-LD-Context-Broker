@@ -100,19 +100,7 @@ pub fn parse_repr(params: &HashMap<String, String>, ctx: &Context) -> Result<Rep
         _ => {}
     }
     check_projection_exclusive(params)?;
-    if let Some(a) = params.get("attrs") {
-        let mut list = Vec::new();
-        for t in a.split(',') {
-            let t = t.trim();
-            if t.is_empty() || ENTITY_META.contains(&t) {
-                return Err(NgsiError::BadRequestData(format!(
-                    "invalid attribute name {t:?} in attrs"
-                )));
-            }
-            list.push(ctx.expand_key(t));
-        }
-        r.attrs = Some(list);
-    }
+    r.attrs = attrs_list(params, ctx)?;
     if let Some(pck) = params.get("pick") {
         r.pick = Some(parse_projection(pck, ctx)?);
     }
@@ -120,20 +108,51 @@ pub fn parse_repr(params: &HashMap<String, String>, ctx: &Context) -> Result<Rep
         r.omit = Some(parse_projection(o, ctx)?);
     }
     r.lang = params.get("lang").cloned();
-    if let Some(list) = params.get("datasetId") {
-        let mut ids = Vec::new();
-        for d in list.split(',').map(str::trim) {
-            // Table 6.4.3.2-1: "Shall be valid URIs, "@none" for ... the default"
-            if d != "@none" && antares_model::EntityId::new(d).is_err() {
-                return Err(NgsiError::BadRequestData(format!(
-                    "datasetId {d:?} is not a URI"
-                )));
-            }
-            ids.push(d.to_owned());
-        }
-        r.dataset_id = Some(ids);
-    }
+    r.dataset_id = dataset_id_list(params)?;
     Ok(r)
+}
+
+/// The expanded `attrs` list of a request: no empty name and no Entity
+/// member (`id`, `type`, ...) — shared by the entity and temporal readings.
+pub(crate) fn attrs_list(
+    params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<Option<Vec<String>>, NgsiError> {
+    let Some(a) = params.get("attrs") else {
+        return Ok(None);
+    };
+    let mut list = Vec::new();
+    for t in a.split(',') {
+        let t = t.trim();
+        if t.is_empty() || ENTITY_META.contains(&t) {
+            return Err(NgsiError::BadRequestData(format!(
+                "invalid attribute name {t:?} in attrs"
+            )));
+        }
+        list.push(ctx.expand_key(t));
+    }
+    Ok(Some(list))
+}
+
+/// The `datasetId` list of a request. Table 6.4.3.2-1: "Shall be valid
+/// URIs, "@none" for ... the default" — shared by the entity and temporal
+/// readings.
+pub(crate) fn dataset_id_list(
+    params: &HashMap<String, String>,
+) -> Result<Option<Vec<String>>, NgsiError> {
+    let Some(list) = params.get("datasetId") else {
+        return Ok(None);
+    };
+    let mut ids = Vec::new();
+    for d in list.split(',').map(str::trim) {
+        if d != "@none" && antares_model::EntityId::new(d).is_err() {
+            return Err(NgsiError::BadRequestData(format!(
+                "datasetId {d:?} is not a URI"
+            )));
+        }
+        ids.push(d.to_owned());
+    }
+    Ok(Some(ids))
 }
 
 /// 4.5.5.1: the datasetId "is of datatype URI, or equal to the JSON-LD
