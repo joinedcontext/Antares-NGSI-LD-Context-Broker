@@ -69,7 +69,8 @@ impl NatsBus {
     pub async fn connect(url: &str) -> Result<Self, BusError> {
         let reconnects = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let counter = reconnects.clone();
-        let client = async_nats::ConnectOptions::new()
+        let client = connect_options(|k| std::env::var(k).ok())
+            .await?
             .event_callback(move |ev| {
                 let counter = counter.clone();
                 async move {
@@ -560,6 +561,58 @@ where
 /// the alternative). Defence in depth: the subject's tenant segment must agree with
 /// the event body — consumers re-verify so a subject-mapping bug can never
 /// route one tenant's change into another tenant's processing.
+/// The client side of the connection's authentication, from the
+/// environment (`get`): `ANTARES_NATS_CREDS_FILE`, a NATS credentials file
+/// (user JWT and nkey seed); `ANTARES_NATS_CA_FILE`, PEM roots trusted for
+/// the server certificate; `ANTARES_NATS_CERT_FILE` with
+/// `ANTARES_NATS_KEY_FILE`, a client certificate for mutual TLS (both or
+/// neither). A CA or a client certificate requires TLS on the connection.
+/// User and password still ride in `ANTARES_NATS_URL`. An unreadable file
+/// or half a key pair fails the start; the error names the variable and the
+/// path, never what the file holds.
+async fn connect_options(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<async_nats::ConnectOptions, BusError> {
+    let set = |k: &str| get(k).filter(|v| !v.trim().is_empty());
+    let mut opts = async_nats::ConnectOptions::new();
+    if let Some(path) = set("ANTARES_NATS_CREDS_FILE") {
+        opts = opts.credentials_file(&path).await.map_err(|e| {
+            BusError(format!(
+                "ANTARES_NATS_CREDS_FILE {path:?}: not a readable credentials file ({})",
+                e.kind()
+            ))
+        })?;
+    }
+    let readable = |k: &str, path: &str| {
+        std::fs::metadata(path)
+            .map(|_| std::path::PathBuf::from(path))
+            .map_err(|e| BusError(format!("{k} {path:?}: unreadable ({})", e.kind())))
+    };
+    if let Some(path) = set("ANTARES_NATS_CA_FILE") {
+        opts = opts
+            .add_root_certificates(readable("ANTARES_NATS_CA_FILE", &path)?)
+            .require_tls(true);
+    }
+    match (set("ANTARES_NATS_CERT_FILE"), set("ANTARES_NATS_KEY_FILE")) {
+        (None, None) => {}
+        (Some(cert), Some(key)) => {
+            opts = opts
+                .add_client_certificate(
+                    readable("ANTARES_NATS_CERT_FILE", &cert)?,
+                    readable("ANTARES_NATS_KEY_FILE", &key)?,
+                )
+                .require_tls(true);
+        }
+        _ => {
+            return Err(BusError(
+                "ANTARES_NATS_CERT_FILE and ANTARES_NATS_KEY_FILE are set together or not at all"
+                    .into(),
+            ))
+        }
+    }
+    Ok(opts)
+}
+
 /// `ANTARES_NATS_REPLICAS`: absent = 1; present must be a positive integer.
 fn replicas_from(v: Option<&str>) -> Result<usize, BusError> {
     match v {
@@ -641,6 +694,60 @@ mod tests {
     use super::*;
     use crate::ChangeOp;
     use antares_model::{EntityId, TenantId};
+
+    /// The NATS client authenticates with what the operator configured: a
+    /// credentials file, a CA for the server certificate, a client
+    /// certificate. A setting that cannot be used fails the start and names
+    /// the variable; the error never echoes what a credentials file holds.
+    #[tokio::test]
+    async fn nats_credentials_and_tls_come_from_the_environment() {
+        let dir = std::env::temp_dir().join(format!("antares-nats-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let pem = dir.join("ca.pem");
+        std::fs::write(&pem, "not checked until the connect").expect("write");
+        let pem = pem.to_string_lossy().into_owned();
+        let bogus = dir.join("bogus.creds");
+        std::fs::write(&bogus, "SUAOWNSEEDSECRETVALUE no jwt here").expect("write");
+        let bogus = bogus.to_string_lossy().into_owned();
+        let env = |pairs: &[(&str, &str)]| {
+            let m: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            move |k: &str| m.get(k).cloned()
+        };
+        // nothing set, or set empty: plain options
+        assert!(connect_options(env(&[])).await.is_ok());
+        assert!(connect_options(env(&[("ANTARES_NATS_CREDS_FILE", " ")]))
+            .await
+            .is_ok());
+        // a CA and a full client pair are taken
+        assert!(connect_options(env(&[("ANTARES_NATS_CA_FILE", &pem)]))
+            .await
+            .is_ok());
+        assert!(connect_options(env(&[
+            ("ANTARES_NATS_CERT_FILE", &pem),
+            ("ANTARES_NATS_KEY_FILE", &pem),
+        ]))
+        .await
+        .is_ok());
+        let fails = |e: Result<async_nats::ConnectOptions, BusError>| match e {
+            Ok(_) => panic!("accepted"),
+            Err(e) => e.0,
+        };
+        // half a key pair
+        let e = fails(connect_options(env(&[("ANTARES_NATS_CERT_FILE", &pem)])).await);
+        assert!(e.contains("ANTARES_NATS_KEY_FILE"), "{e}");
+        // a missing file
+        let e =
+            fails(connect_options(env(&[("ANTARES_NATS_CA_FILE", "/nonexistent/ca.pem")])).await);
+        assert!(e.contains("ANTARES_NATS_CA_FILE"), "{e}");
+        // a credentials file that is none, without its content in the error
+        let e = fails(connect_options(env(&[("ANTARES_NATS_CREDS_FILE", &bogus)])).await);
+        assert!(e.contains("ANTARES_NATS_CREDS_FILE"), "{e}");
+        assert!(!e.contains("SECRET"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Config fatality: a typo'd replica count must never silently run a
     /// 3-node deployment at replicas=1 — that is a durability downgrade

@@ -115,6 +115,13 @@ const KNOWN_KEYS: &[&str] = &[
     // Stream/KV replication factor on a clustered JetStream (3 for
     // the reference manifests' R3; default 1 for single-node).
     "ANTARES_NATS_REPLICAS",
+    // NATS client authentication beside user:password in the URL: a
+    // credentials file, the CA for the server certificate, a client
+    // certificate and key for mutual TLS.
+    "ANTARES_NATS_CREDS_FILE",
+    "ANTARES_NATS_CA_FILE",
+    "ANTARES_NATS_CERT_FILE",
+    "ANTARES_NATS_KEY_FILE",
     // OTLP/HTTP span export endpoint (e.g. http://collector:4318/v1/traces);
     // unset = no OTLP anywhere.
     "ANTARES_OTLP_ENDPOINT",
