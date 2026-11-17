@@ -96,6 +96,7 @@ mod ops;
 mod router;
 pub mod secret;
 pub(crate) mod snapshots;
+pub use snapshots::fail_unfinished_snapshots;
 pub(crate) mod stamp;
 pub mod state;
 pub(crate) mod subscriptions;

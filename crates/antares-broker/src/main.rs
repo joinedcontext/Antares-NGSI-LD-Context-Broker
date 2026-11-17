@@ -1211,6 +1211,19 @@ async fn run(
         drop(bus);
     } else {
         antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
+
+        // One process runs every fill: a Snapshot still preparing now lost
+        // its fill with the previous life of this process. Walked beside
+        // serving: a store of many Tenants must not delay readiness.
+        let sweeper = state.clone();
+        tokio::spawn(async move {
+            let failed = antares_api::fail_unfinished_snapshots(&sweeper).await;
+            if failed > 0 {
+                tracing::warn!(
+                    "{failed} snapshot(s) left preparing by the previous run marked failure"
+                );
+            }
+        });
     }
     telemetry::spawn_sampler(state.clone());
 
