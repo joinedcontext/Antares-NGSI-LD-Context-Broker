@@ -31,19 +31,12 @@
 
 use crate::{CmpOp, QNode, QValue};
 
-/// The comparable-value members, in `eval::comparable_value` order. That
-/// function returns the FIRST present member; we OR over all of them, which
-/// is identical for valid NGSI-LD (an attribute instance carries exactly one)
-/// and only diverges for a document that is already invalid.
-const VALUE_KEYS: &[&str] = &[
-    "value",
-    "object",
-    "languageMap",
-    "vocab",
-    "json",
-    "valueList",
-    "objectList",
-];
+/// The comparable-value members, in `eval::comparable_value` order: the
+/// one list antares-jsonld keeps. That function returns the FIRST present
+/// member; we OR over all of them, which is identical for valid NGSI-LD (an
+/// attribute instance carries exactly one) and only diverges for a document
+/// that is already invalid.
+const VALUE_KEYS: &[(&str, &[&str])] = antares_jsonld::VALUE_MEMBERS;
 
 /// The members whose value a client may write as a JSON-LD typed value
 /// (annex C.6) — `eval::push_target` unwraps exactly these. A JsonProperty
@@ -195,6 +188,7 @@ pub fn value_or_filter(
     let mut parts = Vec::with_capacity(ARMS);
     let steps = VALUE_KEYS
         .iter()
+        .map(|(k, _)| k)
         .filter(|k| objects || !matches!(**k, "object" | "objectList"))
         // 4.9: a LanguageProperty's target value is a value of ANY of its
         // languageMap pairs (`eval::terminal`), so a compare reads the map's
