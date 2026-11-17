@@ -427,9 +427,16 @@ pub fn balanced_config(durable: &str) -> consumer::pull::Config {
     }
 }
 
+/// How long a message whose work asked for a retry waits before the server
+/// redelivers it: a store error has a moment to pass, and a message that
+/// keeps failing does not spin through its deliveries.
+pub const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Drive a balanced consumer: `work` runs once per message, in delivery
 /// order, and the message is acked when it has returned — never before
-/// (ADR-0002, at-least-once).
+/// (ADR-0002, at-least-once). `work` answers whether the message is done:
+/// `false` (a store error that may pass) NAKs it after [`RETRY_DELAY`], so the
+/// server redelivers it, up to [`MAX_DELIVER`] deliveries in all.
 ///
 /// Messages are pulled [`PULL_BATCH`] at a time, and every one this pod
 /// holds unacked — the one in `work` and the rest of its batch already
@@ -461,7 +468,7 @@ pub async fn run_balanced<F, Fut>(
 ) -> Result<(), BusError>
 where
     F: FnMut(&async_nats::jetstream::Message) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    Fut: std::future::Future<Output = bool>,
 {
     use std::sync::atomic::Ordering::SeqCst;
     let ack_wait = match consumer.cached_info().config.ack_wait {
@@ -511,9 +518,9 @@ where
             }
             let job = work(&msg);
             tokio::pin!(job);
-            loop {
+            let done = loop {
                 tokio::select! {
-                    () = &mut job => break,
+                    done = &mut job => break done,
                     _ = beat.tick() => {
                         for m in std::iter::once(&msg).chain(held.iter()) {
                             if let Err(e) = m.ack_with(jetstream::AckKind::Progress).await {
@@ -530,8 +537,15 @@ where
                         None => open = false,
                     },
                 }
-            }
-            if let Err(e) = msg.ack().await {
+            };
+            if !done {
+                if let Err(e) = msg
+                    .ack_with(jetstream::AckKind::Nak(Some(RETRY_DELAY)))
+                    .await
+                {
+                    tracing::warn!("nak for a retry failed: {e}");
+                }
+            } else if let Err(e) = msg.ack().await {
                 tracing::warn!("ack failed: {e}");
             }
         }
