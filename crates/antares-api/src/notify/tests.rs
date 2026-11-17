@@ -927,6 +927,62 @@ mod change_pipeline {
         );
     }
 
+    /// A delivery's bookkeeping lands in the mirror after the row commit,
+    /// so a client update or delete may have reached the mirror first: the
+    /// older copy neither undoes the update nor brings the deleted
+    /// subscription back.
+    #[test]
+    fn bookkeeping_never_overwrites_a_newer_mirror_entry() {
+        let mut st = AppState::new("antares-booked".into());
+        let mirror = Arc::new(crate::mirror::SubMirror::default());
+        st.sub_mirror = Some(mirror.clone());
+        let t = TenantId::default();
+        let sub = |modified: &str, active: bool, sent: u64| {
+            json!({"id": "urn:ngsi-ld:Subscription:booked", "type": "Subscription",
+                "entities": [{"type": "Vehicle"}], "isActive": active,
+                "modifiedAt": modified,
+                "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}, "timesSent": sent}})
+        };
+        let id = "urn:ngsi-ld:Subscription:booked";
+        mirror.apply(t.as_str(), id, Some(sub("2026-01-01T00:00:02Z", false, 0)));
+        // booked against the row before the pause
+        super::super::delivery::mirror_bookkeeping(
+            &st,
+            &t,
+            Kind::Subscription,
+            id,
+            Some(sub("2026-01-01T00:00:01Z", true, 1)),
+        );
+        let held = mirror.docs(t.as_str());
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0]["isActive"], json!(false), "the pause was undone");
+        // booked against the row after it: applied
+        super::super::delivery::mirror_bookkeeping(
+            &st,
+            &t,
+            Kind::Subscription,
+            id,
+            Some(sub("2026-01-01T00:00:02Z", false, 2)),
+        );
+        assert_eq!(
+            mirror.docs(t.as_str())[0]["notification"]["timesSent"],
+            json!(2)
+        );
+        // deleted meanwhile: not brought back
+        mirror.apply(t.as_str(), id, None);
+        super::super::delivery::mirror_bookkeeping(
+            &st,
+            &t,
+            Kind::Subscription,
+            id,
+            Some(sub("2026-01-01T00:00:02Z", false, 3)),
+        );
+        assert!(
+            mirror.docs(t.as_str()).is_empty(),
+            "a deleted subscription came back"
+        );
+    }
+
     /// Every accepted change is counted until its pass has run, so a drain
     /// that waits for zero closes the pool only after the last delivery.
     #[tokio::test(flavor = "multi_thread")]

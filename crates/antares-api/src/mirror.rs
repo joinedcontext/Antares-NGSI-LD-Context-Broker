@@ -333,6 +333,41 @@ impl SubMirror {
             .map
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.apply_in(&mut map, tenant, id, doc);
+    }
+
+    /// A delivery's bookkeeping document, committed under the row lock but
+    /// applied here after it: a client update or delete may have reached the
+    /// mirror in between. Applied only while the mirror still holds the
+    /// subscription at no later `modifiedAt` (the bookkeeping never moves
+    /// it, a client update does), so a deleted subscription is not brought
+    /// back and an update is not undone by an older copy.
+    pub fn apply_booked(&self, tenant: &str, id: &str, doc: Value) {
+        let mut map = self
+            .map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let modified = |d: &Value| {
+            d.get("modifiedAt")
+                .and_then(Value::as_str)
+                .map(antares_model::dt_key)
+        };
+        let current = map
+            .get(tenant)
+            .and_then(|t| t.docs.get(id))
+            .is_some_and(|held| modified(held) <= modified(&doc));
+        if current {
+            self.apply_in(&mut map, tenant, id, Some(doc));
+        }
+    }
+
+    fn apply_in(
+        &self,
+        map: &mut std::collections::HashMap<String, TenantIndex>,
+        tenant: &str,
+        id: &str,
+        doc: Option<Value>,
+    ) {
         let t = map.entry(tenant.to_owned()).or_default();
         let born = t.born.remove(id);
         t.quiet_until.remove(id);
