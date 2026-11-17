@@ -326,7 +326,7 @@ async fn a_change_event_carries_no_subject() {
     antares_api::wire(&mut st).await;
     st.change_flush = Some(Arc::new(move |batch| {
         if let Ok(mut v) = recorder.lock() {
-            for (tenant, before, after) in batch {
+            for ((tenant, before, after), _) in batch {
                 v.push(json!({"tenant": tenant, "before": before, "after": after}));
             }
         }

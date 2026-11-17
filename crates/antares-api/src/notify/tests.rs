@@ -806,6 +806,127 @@ mod change_pipeline {
         }
     }
 
+    /// S3-18 through a request: a change committed inside a request reaches
+    /// the matcher when the request ends, so a later commit made meanwhile
+    /// can be queued first. The matcher orders by the commit, not by the
+    /// queue: the subscriber's last notification holds the image committed
+    /// last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_change_held_by_its_request_is_not_notified_after_a_newer_one() {
+        crate::allow_private();
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let inbox = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let sink = axum::Router::new().route(
+            "/notify",
+            axum::routing::post(move |axum::Json(n): axum::Json<Value>| {
+                let inbox = inbox.clone();
+                async move {
+                    inbox.lock().expect("lock").push(n);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, sink).await.expect("serve") });
+        let mut st = AppState::new("antares-held-change".into());
+        crate::wire(&mut st).await;
+        subscribe(&st, "held", &format!("http://{addr}/notify"), 30_000).await;
+        assert_eq!(create_vehicle(&st, 0).await, 201);
+        let speeds = || -> Vec<Value> {
+            seen.lock()
+                .expect("lock")
+                .iter()
+                .flat_map(|n| n["data"].as_array().cloned().unwrap_or_default())
+                .map(|e| e["speed"]["value"].clone())
+                .collect()
+        };
+        let wait_for = |n: usize| {
+            let speeds = &speeds;
+            async move {
+                for _ in 0..500 {
+                    if speeds().len() >= n {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("no notification {n}: {:?}", speeds());
+            }
+        };
+        wait_for(1).await;
+        const ID: &str = "urn:ngsi-ld:Vehicle:pipe0";
+        let image = |st: AppState, v: i64| async move {
+            let mut doc = st
+                .store
+                .get(&TenantId::default(), Kind::Entity, ID)
+                .await
+                .expect("get")
+                .expect("stored");
+            let o = doc.as_object_mut().expect("object");
+            let key = o
+                .keys()
+                .find(|k| k.ends_with("/speed"))
+                .cloned()
+                .expect("speed");
+            o[&key][0]["value"] = json!(v);
+            st.store
+                .upsert(&TenantId::default(), Kind::Entity, ID, doc)
+                .await
+                .expect("upsert");
+        };
+        // the older write commits inside a request that is still open
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let (written, committed) = tokio::sync::oneshot::channel::<()>();
+        let slot = Arc::new(std::sync::Mutex::new(Some((held, written))));
+        let app = axum::Router::new()
+            .route(
+                "/held",
+                axum::routing::post(
+                    move |axum::extract::State(st): axum::extract::State<AppState>| {
+                        let slot = slot.clone();
+                        async move {
+                            image(st, 1).await;
+                            let taken = slot.lock().expect("lock").take();
+                            if let Some((held, written)) = taken {
+                                let _ = written.send(());
+                                let _ = held.await;
+                            }
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                crate::history::layer,
+            ))
+            .with_state(st.clone());
+        let request = tokio::spawn(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/held")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            ),
+        );
+        committed.await.expect("the older write committed");
+        // the newer write commits outside any request and is queued at once
+        image(st.clone(), 2).await;
+        wait_for(2).await;
+        let _ = release.send(());
+        request.await.expect("task").expect("response");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            speeds().last(),
+            Some(&json!(2)),
+            "the image committed last is notified last: {:?}",
+            speeds()
+        );
+    }
+
     /// Every accepted change is counted until its pass has run, so a drain
     /// that waits for zero closes the pool only after the last delivery.
     #[tokio::test(flavor = "multi_thread")]

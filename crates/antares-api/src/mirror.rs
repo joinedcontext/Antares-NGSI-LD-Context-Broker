@@ -11,6 +11,11 @@ use serde_json::Value;
 /// One change queue event: tenant, before-image, after-image.
 pub type Change = (String, Option<Value>, Option<Value>);
 
+/// A change with the version its write left, as the change hook hands it on:
+/// a request holds its changes until it ends, so the version, not the
+/// moment it reaches the queue, says which of two changes committed last.
+pub type VersionedChange = (Change, antares_store::ChangeVersion);
+
 /// A per-instance tenant-keyed document mirror (bus=nats). One
 /// instance holds subscriptions (fed by the KV watcher), another holds
 /// registrations (fed by `ANTARES_REGISTRY` deltas). Postgres stays the

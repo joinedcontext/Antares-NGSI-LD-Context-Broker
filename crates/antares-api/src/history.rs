@@ -33,7 +33,7 @@ pub fn drain_errors() -> u64 {
 tokio::task_local! {
     static BUFFER: std::cell::RefCell<Vec<TemporalEvent>>;
     static STAGED: std::cell::RefCell<Vec<TemporalEvent>>;
-    static CHANGES: std::cell::RefCell<Vec<crate::mirror::Change>>;
+    static CHANGES: std::cell::RefCell<Vec<crate::mirror::VersionedChange>>;
     static PROVENANCE: Value;
     static TENANT: Option<TenantId>;
 }
@@ -186,7 +186,9 @@ fn audited() -> bool {
 /// Buffer one entity change for the request in flight so the matcher
 /// receives the whole request at once. Handed back when no request is in
 /// flight — the caller then gives it to the matcher on the spot.
-pub(crate) fn buffer_change(change: crate::mirror::Change) -> Option<crate::mirror::Change> {
+pub(crate) fn buffer_change(
+    change: crate::mirror::VersionedChange,
+) -> Option<crate::mirror::VersionedChange> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let mut slot = Some(change);
@@ -681,7 +683,7 @@ pub(crate) async fn drain(st: &AppState, evs: Vec<TemporalEvent>) {
 struct Buffered {
     st: AppState,
     evs: Vec<TemporalEvent>,
-    changes: Vec<crate::mirror::Change>,
+    changes: Vec<crate::mirror::VersionedChange>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1111,7 +1113,11 @@ mod tests {
                 .await
                 .expect("commit");
             push(&st, ev("urn:ngsi-ld:T:1")).await;
-            assert!(buffer_change(("urn:ngsi-ld:T:1".to_owned(), None, None)).is_none());
+            assert!(buffer_change((
+                ("urn:ngsi-ld:T:1".to_owned(), None, None),
+                antares_store::ChangeVersion::default()
+            ))
+            .is_none());
             end().await;
         };
         let app = axum::Router::new()
