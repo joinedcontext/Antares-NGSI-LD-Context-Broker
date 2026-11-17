@@ -482,7 +482,8 @@ fn observed_range(rows: &[Value]) -> (String, String) {
 }
 
 /// The rows of one append that are new observations: of rows with an
-/// `observedAt`, one per (attribute, datasetId, observedAt), and of rows
+/// `observedAt`, one per (attribute, datasetId, observedAt), the last one
+/// (as a later request's row replaces the stored one in place), and of rows
 /// without, each one that differs but for its stamps from the row kept
 /// before it in its (attribute, datasetId) — the rule NEWEST_REPEATS applies
 /// against the table, so a value that comes back after another is recorded.
@@ -490,30 +491,48 @@ fn observed_range(rows: &[Value]) -> (String, String) {
 /// predecessor is that row, never the table's newest, and `insert_rows`
 /// holds only a series' first row against what the table already holds.
 fn unseen(rows: Vec<Value>) -> Vec<Value> {
-    let mut observed = std::collections::HashSet::new();
+    let field = |r: &Value, k: &str| r.get(k).cloned().unwrap_or(Value::Null);
+    let series_of = |r: &Value| {
+        (
+            field(r, "attr_id").to_string(),
+            field(r, "dataset_id").to_string(),
+        )
+    };
+    let observed_key = |r: &Value| {
+        r.get("data")
+            .and_then(|d| d.get("observedAt"))
+            .is_some()
+            .then(|| (series_of(r), field(r, "observed_at").to_string()))
+    };
+    // the position of the last row of each observed (series, instant)
+    let last_of: std::collections::HashMap<_, usize> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| observed_key(r).map(|k| (k, i)))
+        .collect();
     let mut last: std::collections::HashMap<(String, String), Value> =
         std::collections::HashMap::new();
     rows.into_iter()
-        .filter_map(|mut r| {
-            let field = |k: &str| r.get(k).cloned().unwrap_or(Value::Null);
-            let series = (
-                field("attr_id").to_string(),
-                field("dataset_id").to_string(),
-            );
-            let at = field("observed_at").to_string();
-            let mut d = field("data");
-            let has_observed_at = d.get("observedAt").is_some();
+        .enumerate()
+        .filter_map(|(i, mut r)| {
+            let series = series_of(&r);
+            let mut d = field(&r, "data");
             if let Some(o) = d.as_object_mut() {
                 for k in ["instanceId", "createdAt", "modifiedAt"] {
                     o.remove(k);
                 }
             }
-            if has_observed_at {
-                if !observed.insert((series.0.clone(), series.1.clone(), at)) {
-                    return None;
+            match observed_key(&r) {
+                Some(k) => {
+                    if last_of.get(&k) != Some(&i) {
+                        return None;
+                    }
                 }
-            } else if last.get(&series) == Some(&d) {
-                return None;
+                None => {
+                    if last.get(&series) == Some(&d) {
+                        return None;
+                    }
+                }
             }
             if last.insert(series, d).is_some() {
                 if let Some(o) = r.as_object_mut() {
@@ -2155,6 +2174,21 @@ impl PgTemporalStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two instances of one attribute observed at one instant in one
+    /// append keep the later value, as two appends do (the later one
+    /// replaces the stored row in place).
+    #[test]
+    fn unseen_keeps_the_last_value_of_one_observed_at() {
+        let row = |v: i64, i: &str| {
+            serde_json::json!({"attr_id": "a", "dataset_id": null, "instance_id": i,
+                "observed_at": "2026-01-01T00:00:00Z",
+                "data": {"type": "Property", "value": v, "observedAt": "2026-01-01T00:00:00Z"}})
+        };
+        let kept = unseen(vec![row(1, "i1"), row(2, "i2")]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["data"]["value"], 2);
+    }
     use crate::compile::temporal::InstanceRange;
 
     fn pair(n: usize) -> (String, String) {
