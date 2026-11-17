@@ -132,3 +132,74 @@ async fn registration_reads_mask_forwarding_credentials() {
         "Bearer s3cr3t"
     );
 }
+
+/// A stored credential stays with its endpoint: a fragment that moves the
+/// registration to another endpoint and leaves `contextSourceInfo` out is
+/// refused while a credential is stored, and the client sends the values
+/// for the new endpoint (or none). Without a stored credential the move
+/// keeps what the broker processes.
+#[tokio::test]
+async fn a_stored_credential_does_not_follow_a_new_endpoint() {
+    let st = AppState::new("antares1".into());
+    let at = format!("/ngsi-ld/v1/csourceRegistrations/{ID}");
+    let reg = json!({
+        "id": ID,
+        "type": "ContextSourceRegistration",
+        "endpoint": "http://peer.example:9090",
+        "information": [{"entities": [{"type": "Building"}]}],
+        "contextSourceInfo": [
+            {"key": "Authorization", "value": "Bearer s3cr3t"},
+            {"key": "jsonldContext", "value": "https://example.org/ctx.jsonld"}
+        ]
+    });
+    let (status, _) = call(&st, "POST", "/ngsi-ld/v1/csourceRegistrations", Some(reg)).await;
+    assert_eq!(status, 201);
+
+    let moved = json!({"endpoint": "http://elsewhere.example:9090"});
+    let (status, body) = call(&st, "PATCH", &at, Some(moved)).await;
+    assert_eq!(status, 400, "{body}");
+    let held = stored(&st).await;
+    assert_eq!(held["endpoint"], "http://peer.example:9090");
+    assert_eq!(held["contextSourceInfo"][0]["value"], "Bearer s3cr3t");
+
+    // the same endpoint, written again, keeps the credential
+    let same = json!({"endpoint": "http://peer.example:9090"});
+    let (status, body) = call(&st, "PATCH", &at, Some(same)).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(
+        stored(&st).await["contextSourceInfo"][0]["value"],
+        "Bearer s3cr3t"
+    );
+
+    // the move with the values for the new endpoint is taken
+    let resent = json!({
+        "endpoint": "http://elsewhere.example:9090",
+        "contextSourceInfo": [
+            {"key": "Authorization", "value": "Bearer other"},
+            {"key": "jsonldContext", "value": "https://example.org/ctx.jsonld"}
+        ]
+    });
+    let (status, body) = call(&st, "PATCH", &at, Some(resent)).await;
+    assert_eq!(status, 204, "{body}");
+    let held = stored(&st).await;
+    assert_eq!(held["endpoint"], "http://elsewhere.example:9090");
+    assert_eq!(held["contextSourceInfo"][0]["value"], "Bearer other");
+
+    // no credential stored: the move keeps the processed keys
+    let processed = json!({
+        "contextSourceInfo": [
+            {"key": "jsonldContext", "value": "https://example.org/ctx.jsonld"}
+        ]
+    });
+    let (status, body) = call(&st, "PATCH", &at, Some(processed)).await;
+    assert_eq!(status, 204, "{body}");
+    let back = json!({"endpoint": "http://peer.example:9090"});
+    let (status, body) = call(&st, "PATCH", &at, Some(back)).await;
+    assert_eq!(status, 204, "{body}");
+    let held = stored(&st).await;
+    assert_eq!(held["endpoint"], "http://peer.example:9090");
+    assert_eq!(
+        held["contextSourceInfo"][0]["value"],
+        "https://example.org/ctx.jsonld"
+    );
+}
