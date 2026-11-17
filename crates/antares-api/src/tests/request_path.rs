@@ -388,3 +388,20 @@ async fn a_post_query_matches_the_union_of_its_selectors() {
         assert_eq!(ids_of(&body), want, "{selectors}");
     }
 }
+
+/// 6.3.4: Set Attribute Value takes application/json or application/ld+json
+/// like every other write; another media type is 415.
+#[tokio::test]
+async fn set_attribute_value_refuses_another_media_type() {
+    let st = state();
+    create(
+        &st,
+        r#"{"id":"urn:ngsi-ld:T:v","type":"T","speed":{"type":"Property","value":1}}"#,
+    )
+    .await;
+    let uri = "/ngsi-ld/v1/entities/urn:ngsi-ld:T:v/attrs/speed/value";
+    let resp = send(&st, with_body("PUT", uri, "text/plain", "5")).await;
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let resp = send(&st, with_body("PUT", uri, "application/json", "5")).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
