@@ -26,9 +26,11 @@ store-failure-output = true
 # drain legitimately destroys — it publishes the rows the sigkill drill and
 # the RLS pentest have just seeded, out from under them. One serial group
 # restores the sequencing `cargo test`'s one-binary-at-a-time execution used
-# to provide. pg_explain and pg_retention join it because they create and
-# drop attr_instances partitions: that ACCESS EXCLUSIVE lock queues every
-# parallel reader behind it into the session's lock_timeout. The bus's own
+# to provide. pg_retention joins it because it creates and drops
+# attr_instances partitions: that ACCESS EXCLUSIVE lock queues every
+# parallel reader behind it into the session's lock_timeout. pg_explain
+# plans in a database of its own, where its tests create partitions too:
+# it joins to keep its own tests apart. The bus's own
 # NATS suite (binary_id antares-bus::nats) joins it as well: one of its tests
 # deletes the shared `matcher` durable and acks what it pulls from the new
 # one, so beside nats_e2e it swallowed, or let the Interest stream discard,

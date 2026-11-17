@@ -7,7 +7,8 @@
 //! Tree in OFFSET pages, judged the regex in Rust, and passed the gateway's
 //! 10 s (or hit TooManyResults past 100 000). The store now decides the
 //! pattern and counts in SQL. The guard counts the Entity rows Postgres
-//! returns to the broker, from sqlx's `sqlx::query` events; wall time is
+//! returns to the broker for the request under test, from sqlx's
+//! `sqlx::query` events inside the request's own span; wall time is
 //! printed, not asserted. Own test binary because the subscriber
 //! is process-wide. Skips loudly without `ANTARES_TEST_DATABASE_URL`.
 #![cfg(feature = "postgres")]
@@ -23,7 +24,9 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
+use tracing::Instrument;
 use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
@@ -32,8 +35,14 @@ fn iri(term: &str) -> String {
     format!("{DEFAULT}{term}")
 }
 
-/// The rows each Entity read returned, summed over the statements sqlx sent
-/// since the last `take`.
+/// The span a measured request runs in. Only the statements sent inside it
+/// count: the matcher and interval loops `antares_api::wire` starts read
+/// Entities of their own on this process, and a request slowed by a
+/// loaded database let their reads fall inside its measurement.
+const MEASURED: &str = "measured";
+
+/// The rows each Entity read of a measured request returned, summed over the
+/// statements sqlx sent since the last `take`.
 #[derive(Clone, Default)]
 struct EntityRows(Arc<Mutex<u64>>);
 
@@ -65,9 +74,12 @@ impl tracing::field::Visit for Query {
     }
 }
 
-impl<S: tracing::Subscriber> Layer<S> for EntityRows {
-    fn on_event(&self, e: &tracing::Event<'_>, _: Context<'_, S>) {
-        if e.metadata().target() == "sqlx::query" {
+impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for EntityRows {
+    fn on_event(&self, e: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        let measured = ctx
+            .event_scope(e)
+            .is_some_and(|mut scope| scope.any(|span| span.name() == MEASURED));
+        if measured && e.metadata().target() == "sqlx::query" {
             let mut q = Query::default();
             e.record(&mut q);
             if q.sql.contains("SELECT entity AS entity FROM") {
@@ -146,7 +158,8 @@ async fn a_views_id_pattern_over_a_whole_type_is_counted_in_the_store() {
         tracing_subscriber::registry().with(
             rows.clone().with_filter(
                 tracing_subscriber::filter::Targets::new()
-                    .with_target("sqlx::query", tracing::Level::TRACE),
+                    .with_target("sqlx::query", tracing::Level::TRACE)
+                    .with_target(MEASURED, tracing::Level::INFO),
             ),
         ),
     )
@@ -225,7 +238,9 @@ async fn a_views_id_pattern_over_a_whole_type_is_counted_in_the_store() {
         "type=Tree&limit=2&offset=5",
     ] {
         rows.take();
-        let (code, count, body, took) = get(&st, &tenant, query).await;
+        let (code, count, body, took) = get(&st, &tenant, query)
+            .instrument(tracing::info_span!(target: MEASURED, MEASURED))
+            .await;
         let read = rows.take();
         eprintln!("{query}: {code} in {took:?}, {read} Entity rows read");
         assert_eq!(code, StatusCode::OK, "{query}: {body}");
@@ -251,8 +266,10 @@ async fn a_views_id_pattern_over_a_whole_type_is_counted_in_the_store() {
                 "{query}"
             );
         }
-        // the page alone: the walk read every Tree
+        // the page alone: the walk read every Tree; and some: a
+        // measurement that missed the request's statements proves nothing
         assert!(read <= 10, "{query} read {read} Entity rows for a page");
+        assert!(read > 0, "{query}: no Entity read was measured");
     }
 
     antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
