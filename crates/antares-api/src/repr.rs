@@ -1064,12 +1064,8 @@ fn joined_repr(parent: &crate::repr::Repr, key_compact: &str, key_iri: &str) -> 
     r
 }
 
-/// 4.5.23.1: "When retrieving Linked Entities, it is necessary to limit
-/// retrieval to avoid cascades of an excessive length, duplicates or loops."
-/// joinLevel bounds the DEPTH of the walk; this bounds its WIDTH — the total
-/// number of Linked Entity reads a single request may buy, so that a densely
-/// linked graph cannot turn one retrieval into an unbounded store scan.
-pub(crate) const MAX_JOIN_LOOKUPS: usize = 1_000;
+/// The join budget of one request ([`crate::bounds::MAX_JOIN_LOOKUPS`]).
+pub(crate) use crate::bounds::MAX_JOIN_LOOKUPS;
 
 /// State of one Linked Entity Retrieval walk (4.5.23.1): the entity ids
 /// already resolved — a loop or a duplicate is never walked a second time —

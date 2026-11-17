@@ -3,8 +3,8 @@
 
 use super::*;
 
-/// The most periods an aggregated `onChange` Attribute answers, rows and held gaps together.
-pub(super) const MAX_HELD_BUCKETS: usize = 10_000;
+/// The most periods an aggregated `onChange` Attribute answers ([`crate::bounds::MAX_HELD_BUCKETS`]).
+pub(super) use crate::bounds::MAX_HELD_BUCKETS;
 
 /// 6.3.10: the ceiling is a CUT, not a label. An Attribute holding more
 /// instances than the broker serves at once is truncated to the ceiling in

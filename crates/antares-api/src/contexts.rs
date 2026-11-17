@@ -151,10 +151,7 @@ pub async fn purge_tenant(st: &AppState, tenant: &TenantId) -> Result<(), NgsiEr
     Ok(())
 }
 
-/// Most ImplicitlyCreated @contexts one Tenant may hold. A read with an inline
-/// @context writes one row per DISTINCT @context, so a caller who may only
-/// read could otherwise grow the store without bound by varying it.
-const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
+use crate::bounds::MAX_IMPLICIT_CONTEXTS;
 
 /// 6.3.6: an "application/json" response "shall include a Link to the
 /// associated JSON-LD @context", and a Link carries a URL. An inline @context

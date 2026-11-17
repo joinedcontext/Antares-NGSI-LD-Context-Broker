@@ -11,18 +11,13 @@ pub(crate) fn dead_letters_written() -> u64 {
     DEAD_LETTERS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Retry chains one broker runs at once. A failed notification past them
-/// is settled at once: its dead letter is written instead of a chain that
-/// would hold its payload for the policy's age (ADR-0015 parks what the
-/// policy cannot deliver; this parks what the broker cannot hold).
+/// Retry chains one broker runs at once, and one tenant's share of them
+/// (bounds.rs). A failed notification past them is settled at once: its dead
+/// letter is written instead of a chain that would hold its payload for the
+/// policy's age (ADR-0015 parks what the policy cannot deliver; this parks
+/// what the broker cannot hold).
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) const RETRY_CHAINS: usize = 256;
-
-/// Of [`RETRY_CHAINS`], what one tenant may hold: a tenant whose endpoints
-/// all fail cannot take every chain and leave the others' failures settled
-/// at once.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) const RETRY_CHAINS_PER_TENANT: usize = RETRY_CHAINS / 8;
+pub(crate) use crate::bounds::RETRY_CHAINS_PER_TENANT;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) static RETRY_SHARES: std::sync::LazyLock<super::throttle::TenantShares> =

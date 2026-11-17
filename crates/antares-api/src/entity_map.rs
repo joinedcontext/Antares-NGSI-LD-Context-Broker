@@ -16,8 +16,8 @@ use axum::response::Response;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
-/// Per-tenant EntityMap cap (every buffer bounded); earliest-expiring evicted.
-pub(crate) const MAX_MAPS_PER_TENANT: usize = 512;
+/// Per-tenant EntityMap cap ([`crate::bounds::MAX_ENTITY_MAPS_PER_TENANT`]).
+pub(crate) use crate::bounds::MAX_ENTITY_MAPS_PER_TENANT as MAX_MAPS_PER_TENANT;
 
 /// Default lifetime when the client suggests none — 5.5.14: "the caching
 /// strategy and expiry time … depend on implementation specific

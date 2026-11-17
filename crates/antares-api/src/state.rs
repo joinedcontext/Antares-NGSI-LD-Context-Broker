@@ -216,9 +216,8 @@ pub struct KnownTenants(std::sync::Mutex<std::collections::HashMap<String, Insta
 impl KnownTenants {
     /// How long a remembered "exists" stands in for the store's answer.
     pub const TTL: std::time::Duration = std::time::Duration::from_secs(30);
-    /// The most names held at once (ADR-0001's 10 000-tenant target): a
-    /// full map takes no new name until its old entries age out.
-    pub const CAP: usize = 10_000;
+    /// The most names held at once ([`crate::bounds::MAX_KNOWN_TENANTS`]).
+    pub const CAP: usize = crate::bounds::MAX_KNOWN_TENANTS;
 
     fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
         self.0
@@ -493,7 +492,7 @@ pub struct Shared {
     /// Default = one attempt (5.8.6 as written).
     pub delivery: antares_notifier::DeliveryPolicy,
     /// Retry chains of failed notifications running at once
-    /// (`notify::RETRY_CHAINS`): each holds its payload for the policy's
+    /// (`bounds::RETRY_CHAINS`): each holds its payload for the policy's
     /// whole age, so a fast-failing endpoint under a write stream could
     /// otherwise grow them without limit. Native only: wasm32 sends once.
     #[cfg(not(target_arch = "wasm32"))]
@@ -804,10 +803,10 @@ impl AppState {
                 subject_required: false,
                 history_off: HistoryOff::default(),
                 public_url,
-                snapshot_cap: 1024,
+                snapshot_cap: crate::bounds::MAX_SNAPSHOTS_PER_TENANT,
                 delivery: antares_notifier::DeliveryPolicy::default(),
                 #[cfg(not(target_arch = "wasm32"))]
-                retry_slots: Arc::new(tokio::sync::Semaphore::new(crate::notify::RETRY_CHAINS)),
+                retry_slots: Arc::new(tokio::sync::Semaphore::new(crate::bounds::RETRY_CHAINS)),
             }),
         }
     }
