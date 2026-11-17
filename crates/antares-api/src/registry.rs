@@ -88,6 +88,107 @@ pub fn present_registration(doc: &Value, ctx: &Context, sys_attrs: bool) -> Valu
     Value::Object(out)
 }
 
+/// The `contextSourceInfo` keys the broker itself processes (4.3.6.6): they
+/// shape a forward and carry no credential, so a read shows their values.
+const CSI_PROCESSED: [&str; 4] = [
+    "jsonldContext",
+    "contentType",
+    "accept",
+    "ngsildConformance",
+];
+
+/// Whether a reader is shown this `contextSourceInfo` pair's value as stored:
+/// a processed key, or the instruction to copy the triggering request's header.
+fn csi_shown(pair: &Value) -> bool {
+    let key = pair.get("key").and_then(Value::as_str).unwrap_or_default();
+    CSI_PROCESSED.iter().any(|k| k.eq_ignore_ascii_case(key))
+        || pair.get("value").and_then(Value::as_str) == Some("urn:ngsi-ld:request")
+}
+
+/// `contextSourceInfo` carries the headers a forward is sent with (4.3.6.5,
+/// an Authorization header among them) and the endpoint may carry userinfo:
+/// no read and no Context Source Notification answers them. The keys stay,
+/// the values are [`crate::subscriptions::MASKED`], as for a Subscription's
+/// `receiverInfo`.
+pub(crate) fn mask_registration(doc: &mut Value) {
+    let Some(obj) = doc.as_object_mut() else {
+        return;
+    };
+    if let Some(ep) = obj.get_mut("endpoint") {
+        if let Some(masked) = ep.as_str().and_then(crate::subscriptions::masked_uri) {
+            *ep = Value::String(masked);
+        }
+    }
+    let pairs = obj
+        .get_mut("contextSourceInfo")
+        .and_then(Value::as_array_mut);
+    for pair in pairs.into_iter().flatten() {
+        if csi_shown(pair) {
+            continue;
+        }
+        if let Some(v) = pair.get_mut("value") {
+            *v = Value::String(crate::subscriptions::MASKED.into());
+        }
+    }
+}
+
+/// A client that reads a Registration and writes it back sends the masked
+/// values it was answered: such a value keeps the one stored under the same
+/// key, and the masked endpoint keeps the stored endpoint. A stored
+/// credential stays with its endpoint: sent beside another endpoint it is
+/// refused, or an update-right holder could redirect it.
+pub(crate) fn keep_masked_registration(
+    fragment: &mut Map<String, Value>,
+    stored: &Map<String, Value>,
+) -> Result<(), antares_model::NgsiError> {
+    use crate::subscriptions::{masked_uri, MASKED};
+    let refuse = |what: &str| {
+        Err(antares_model::NgsiError::BadRequestData(format!(
+            "{what}: a masked value cannot move to another endpoint: send the credential again"
+        )))
+    };
+    let stored_ep = stored.get("endpoint").and_then(Value::as_str);
+    if let Some(ep) = fragment.get_mut("endpoint") {
+        match (stored_ep, ep.as_str()) {
+            (Some(held), Some(sent)) if masked_uri(held).as_deref() == Some(sent) => {
+                *ep = Value::String(held.to_owned());
+            }
+            (_, Some(sent)) if masked_uri(sent).is_some_and(|m| m == sent) => {
+                return refuse("endpoint");
+            }
+            _ => {}
+        }
+    }
+    let moved = fragment
+        .get("endpoint")
+        .is_some_and(|e| e.as_str() != stored_ep);
+    let held = stored
+        .get("contextSourceInfo")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let pairs = fragment
+        .get_mut("contextSourceInfo")
+        .and_then(Value::as_array_mut);
+    for pair in pairs.into_iter().flatten() {
+        if pair.get("value").and_then(Value::as_str) != Some(MASKED) {
+            continue;
+        }
+        let previous = held
+            .iter()
+            .find(|h| h.get("key") == pair.get("key"))
+            .and_then(|h| h.get("value"))
+            .cloned();
+        if let (Some(previous), Some(v)) = (previous, pair.get_mut("value")) {
+            if moved {
+                return refuse("contextSourceInfo");
+            }
+            *v = previous;
+        }
+    }
+    Ok(())
+}
+
 /// 5.10.2.4 temporal matching against observationInterval/managementInterval.
 pub(crate) fn temporal_interval_matches(doc: &Value, tq: &crate::temporalq::TemporalQ) -> bool {
     let key = if tq.timeproperty == "observedAt" {

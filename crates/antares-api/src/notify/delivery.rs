@@ -102,7 +102,7 @@ pub(super) async fn deliver_as(
     kind: Kind,
     sub: &Value,
     ntype: &str,
-    data: Vec<Value>,
+    mut data: Vec<Value>,
     ctx: &Context,
     trigger_reason: Option<&str>,
 ) {
@@ -133,6 +133,10 @@ pub(super) async fn deliver_as(
             handler(st, tenant, own_id, trigger_reason, &data).await;
         }
         return;
+    }
+    // what leaves the process names no forwarding credential (4.3.6.5)
+    if ntype == "ContextSourceNotification" {
+        data.iter_mut().for_each(crate::registry::mask_registration);
     }
     // 6.3.8: the binding comes from the registry and nowhere else. Creation
     // rejects an endpoint whose scheme no sink serves, so a stored row that
