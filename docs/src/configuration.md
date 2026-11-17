@@ -52,6 +52,10 @@ here).
 |---|---|---|
 | `ANTARES_NATS_URL` | — (required for `bus=nats`) | NATS server URL; JetStream streams and the subscription KV bucket are asserted at startup. |
 | `ANTARES_NATS_REPLICAS` | `1` | JetStream replica count for streams/KV (set 3 on a 3-node NATS cluster). |
+| `ANTARES_NATS_CREDS_FILE` | unset | NATS credentials file (user JWT and nkey seed) the bus authenticates with. User and password can instead ride in `ANTARES_NATS_URL`. An unreadable or malformed file fails the start. |
+| `ANTARES_NATS_CA_FILE` | unset | PEM file of the roots that verify the NATS server certificate; setting it requires TLS on the connection. |
+| `ANTARES_NATS_CERT_FILE` | unset | PEM client certificate for mutual TLS with NATS; set together with `ANTARES_NATS_KEY_FILE` (one without the other fails the start) and requires TLS. |
+| `ANTARES_NATS_KEY_FILE` | unset | PEM private key of `ANTARES_NATS_CERT_FILE`. |
 | `ANTARES_OUTBOX_DRAIN` | on | `off` disables the notification outbox drainer in this process (crash-drill lever / dedicated-drainer split). |
 
 ## Federation & egress hardening
