@@ -158,30 +158,15 @@ pub(super) static CSOURCE_FANOUT: tokio::sync::Semaphore =
 /// still find a slot.
 pub(super) const CSOURCE_FANOUT_PER_TENANT: usize = CSOURCE_FANOUT_WIDTH / 8;
 
-type FanoutShares =
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>;
-static FANOUT_SHARES: std::sync::LazyLock<FanoutShares> =
-    std::sync::LazyLock::new(FanoutShares::default);
+static FANOUT_SHARES: std::sync::LazyLock<super::throttle::TenantShares> =
+    std::sync::LazyLock::new(|| super::throttle::TenantShares::new(CSOURCE_FANOUT_PER_TENANT));
 
 /// Both permits one fan-out holds until its sends settle: the tenant's
 /// share first, as `delivery_permits` takes it, so a tenant at its share
-/// waits there and never inside the broker's slots. A share lives only
-/// while a fan-out holds it: creating one drops every entry nothing holds,
-/// so the map is bounded by the width, not by the tenants ever seen.
+/// waits there and never inside the broker's slots ([`super::throttle::TenantShares`]
+/// bounds the map by the width, not by the tenants ever seen).
 pub(super) async fn fanout_permits(tenant: &TenantId) -> impl Sized {
-    let shares = {
-        // a poisoned map is a past panic; what it holds is rebuildable
-        let mut map = FANOUT_SHARES.lock().unwrap_or_else(|p| p.into_inner());
-        match map.get(tenant.as_str()) {
-            Some(s) => std::sync::Arc::clone(s),
-            None => {
-                map.retain(|_, s| std::sync::Arc::strong_count(s) > 1);
-                let s = std::sync::Arc::new(tokio::sync::Semaphore::new(CSOURCE_FANOUT_PER_TENANT));
-                map.insert(tenant.as_str().to_owned(), std::sync::Arc::clone(&s));
-                s
-            }
-        }
-    };
+    let shares = FANOUT_SHARES.of(tenant);
     // never closed, so acquire only fails if it were — then send unbounded
     let share = shares.acquire_owned().await.ok();
     (share, CSOURCE_FANOUT.acquire().await.ok())
