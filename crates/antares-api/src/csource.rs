@@ -1430,7 +1430,7 @@ pub async fn update_registration(
         // The 5.9.3.4 re-checks below read the registration set that the
         // mutate then writes — the pair is atomic or a concurrent write can
         // invalidate the checks between them.
-        let (before, res) = {
+        let (before, res, after) = {
             let _serialized = registration_write_lock(&tenant).await;
             let before = take_live_registration(&st, &tenant, &id).await?;
             if let Some(prev) = before.as_ref().and_then(Value::as_object) {
@@ -1467,14 +1467,21 @@ pub async fn update_registration(
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
-            (before, res)
+            // read back and mirrored under the lock: a delete waits for it,
+            // so the mirror never takes back a registration already deleted
+            let after = if matches!(res, Some(Ok(()))) {
+                let after = st.store.get(&tenant, Kind::Registration, &id).await?;
+                st.reg_changed(&tenant, &id, after.as_ref());
+                after
+            } else {
+                None
+            };
+            (before, res, after)
         };
         match res {
             None => Err(NgsiError::ResourceNotFound(format!("registration {id} not found")).into()),
             Some(Err(e)) => Err(ApiError::from(e)),
             Some(Ok(())) => {
-                let after = st.store.get(&tenant, Kind::Registration, &id).await?;
-                st.reg_changed(&tenant, &id, after.as_ref());
                 crate::notify::csource_fanout(&st, &tenant, before, after).await;
                 Ok(no_content(&tenant))
             }
@@ -1497,9 +1504,18 @@ pub async fn delete_registration(
             .map_err(|_| NgsiError::BadRequestData(format!("invalid registration id {id:?}")))?;
         check_params(&params, &["local"])?;
         gate!(st, &tenant, &headers, "5.9.4", ids: &[&id]).await?;
-        let before = take_live_registration(&st, &tenant, &id).await?;
-        if st.store.delete(&tenant, Kind::Registration, &id).await? {
-            st.reg_changed(&tenant, &id, None);
+        // the write lock every registration write holds, so an update's
+        // read-back cannot put the deleted registration back in the mirror
+        let (before, deleted) = {
+            let _serialized = registration_write_lock(&tenant).await;
+            let before = take_live_registration(&st, &tenant, &id).await?;
+            let deleted = st.store.delete(&tenant, Kind::Registration, &id).await?;
+            if deleted {
+                st.reg_changed(&tenant, &id, None);
+            }
+            (before, deleted)
+        };
+        if deleted {
             crate::notify::csource_fanout(&st, &tenant, before, None).await;
             Ok(no_content(&tenant))
         } else {
@@ -1648,6 +1664,42 @@ mod csi_tests {
             norm("sideways", full).is_err(),
             "mode outside the 5.2.9 enum"
         );
+    }
+
+    /// A delete holds the registration write lock, as create and update do:
+    /// an update's read-back and mirror write cannot interleave with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registration_delete_waits_for_the_write_lock() {
+        let st = crate::state::AppState::new("me".into());
+        let tenant = antares_model::TenantId::new("default").expect("tenant");
+        let id = "urn:ngsi-ld:ContextSourceRegistration:locked";
+        st.store
+            .create(
+                &tenant,
+                Kind::Registration,
+                id,
+                json!({"id": id, "type": "ContextSourceRegistration",
+                    "endpoint": "http://peer:9090",
+                    "information": [{"entities": [{"type": "Vehicle"}]}]}),
+            )
+            .await
+            .expect("seed");
+        let held = registration_write_lock(&tenant).await;
+        let st2 = st.clone();
+        let del = tokio::spawn(async move {
+            delete_registration(
+                State(st2),
+                Path(id.to_owned()),
+                CleanParams(std::collections::HashMap::new()),
+                HeaderMap::new(),
+            )
+            .await
+            .status()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!del.is_finished(), "the delete ran past a held write lock");
+        drop(held);
+        assert_eq!(del.await.expect("task"), StatusCode::NO_CONTENT);
     }
 
     /// 4.3.6.3: each EntityInfo of a new proxied registration is checked
