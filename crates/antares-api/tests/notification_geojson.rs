@@ -127,4 +127,10 @@ async fn prefer_body_json_strips_the_context() {
         n["data"].get("@context").is_none(),
         "Prefer body=json must strip @context from the FeatureCollection: {n}"
     );
+    // the key is a header name, matched in any case
+    let n = notified_body(Some(json!([{"key": "prefer", "value": "body=json"}]))).await;
+    assert!(
+        n["data"].get("@context").is_none(),
+        "a lower-case prefer key is the same header: {n}"
+    );
 }
