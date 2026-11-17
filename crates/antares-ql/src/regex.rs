@@ -53,7 +53,9 @@ pub const MAX_REGEX_PROGRAM_BYTES: usize = 256 * 1024;
 /// one request never evicts its own working set.
 pub const MAX_REGEX_CACHE: usize = 1024;
 /// Retained bytes. Each entry is charged the tier it compiled within, not
-/// its true size, plus its key and, for a refusal, its message — both
+/// its true size, and the lazy DFA cache it may grow (32 KiB;
+/// once more per thread that matches with it at the same moment), plus its
+/// key and, for a refusal, its message — both
 /// client-sized, a syntax error reprinting the pattern — so the number is an
 /// upper bound on what the map holds.
 pub const MAX_REGEX_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -65,6 +67,13 @@ pub const MAX_REGEX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Subscription `idPattern`s and still bounds a mix of the largest programs
 /// the ceiling admits.
 const PROGRAM_TIER_BYTES: usize = 32 * 1024;
+
+/// Ceiling on the lazy DFA cache a compiled program grows while it matches
+/// (the `regex` default is 2 MiB per program and per thread matching with
+/// it). Every retained program is charged it on top of its tier, so the byte
+/// budget covers the cache the program owns besides the program itself. A
+/// pattern whose DFA outgrows it still matches, on the slower engines.
+const LAZY_DFA_BYTES: usize = 32 * 1024;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -128,7 +137,10 @@ thread_local! {
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn build(pattern: &str, limit: usize) -> Result<regex::Regex, regex::Error> {
-    regex::RegexBuilder::new(pattern).size_limit(limit).build()
+    regex::RegexBuilder::new(pattern)
+        .size_limit(limit)
+        .dfa_size_limit(LAZY_DFA_BYTES)
+        .build()
 }
 
 /// The compiled program for `pattern`, shared with every other caller that
@@ -150,9 +162,9 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
     // matcher — and a poisoned lock degrades to "compile every time", never
     // to a failed request.
     let (outcome, charge): (Outcome, usize) = match build(pattern, PROGRAM_TIER_BYTES) {
-        Ok(re) => (Ok(Arc::new(re)), PROGRAM_TIER_BYTES),
+        Ok(re) => (Ok(Arc::new(re)), PROGRAM_TIER_BYTES + LAZY_DFA_BYTES),
         Err(_) => match build(pattern, MAX_REGEX_PROGRAM_BYTES) {
-            Ok(re) => (Ok(Arc::new(re)), MAX_REGEX_PROGRAM_BYTES),
+            Ok(re) => (Ok(Arc::new(re)), MAX_REGEX_PROGRAM_BYTES + LAZY_DFA_BYTES),
             // A refusal retains a message, not a program.
             Err(e) => (Err(e.to_string().into()), 0),
         },
@@ -521,6 +533,31 @@ mod tests {
         assert!(len() >= 300);
         // the documented tier, written out: a small program costs 32 KiB
         assert!(retained_bytes() >= 300 * 32 * 1024);
+    }
+
+    /// A retained program is charged the lazy DFA cache it may grow besides
+    /// its tier, and that cache is capped: a pattern whose DFA explodes
+    /// still answers correctly on the slower engines.
+    #[test]
+    fn a_program_is_charged_its_capped_lazy_dfa_cache() {
+        let _serial = serial_lock();
+        let p = "^dfa-charge-[a-z]+$";
+        let before = retained_bytes();
+        compile(p).expect("compiles");
+        assert!(
+            retained_bytes() >= before + PROGRAM_TIER_BYTES + LAZY_DFA_BYTES + p.len(),
+            "{} -> {}",
+            before,
+            retained_bytes()
+        );
+        // the classic exponential DFA: the 16th symbol from the end is an a
+        let blowup = compile("(?:a|b)*a(?:a|b){15}$").expect("compiles");
+        let text: String = (0..4000)
+            .map(|i| if i % 7 == 0 { 'a' } else { 'b' })
+            .collect();
+        let want = text.as_bytes()[text.len() - 16] == b'a';
+        assert_eq!(blowup.is_match(&text), want);
+        assert!(!blowup.is_match(&"b".repeat(4000)));
     }
 
     /// Two callers that missed one pattern together both retain it; the
