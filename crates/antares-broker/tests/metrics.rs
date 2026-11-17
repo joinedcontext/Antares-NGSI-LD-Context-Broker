@@ -199,3 +199,41 @@ fn metrics_port_serves_metrics_only_and_api_port_none() {
         "the API port must not serve /q/metrics: {api_metrics}"
     );
 }
+
+/// The metrics listener carries the API listener's header-read timeout: a
+/// client that never finishes its request headers is closed, not held for
+/// as long as it likes.
+#[test]
+fn metrics_port_closes_a_connection_that_never_sends_its_headers() {
+    let port = free_port();
+    let metrics_port = free_port();
+    let _broker = Broker(
+        Command::new(env!("CARGO_BIN_EXE_antares"))
+            .env("ANTARES_HTTP_PORT", port.to_string())
+            .env("ANTARES_METRICS_PORT", metrics_port.to_string())
+            .env("ANTARES_TELEMETRY", "1")
+            .env("ANTARES_HEADER_READ_TIMEOUT_MS", "300")
+            .spawn()
+            .expect("spawn antares"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !http(metrics_port, "GET", "/q/metrics", None).starts_with("HTTP/1.1 200") {
+        assert!(Instant::now() < deadline, "metrics listener never answered");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut s = TcpStream::connect(("127.0.0.1", metrics_port)).expect("connect");
+    s.write_all(b"GET /q/metrics HTTP/1.1\r\nHost: x\r\n")
+        .expect("half a request");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    let started = Instant::now();
+    let mut buf = Vec::new();
+    // the server ends the connection (a 408 or a plain close); a held one
+    // runs into this read's own 5 s timeout instead
+    let closed = s.read_to_end(&mut buf).is_ok();
+    assert!(
+        closed && started.elapsed() < Duration::from_secs(4),
+        "a half-sent request held the metrics connection for {:?}",
+        started.elapsed()
+    );
+}

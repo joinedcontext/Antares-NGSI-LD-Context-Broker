@@ -1342,15 +1342,14 @@ async fn run(
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("listening on http://0.0.0.0:{port}");
-    if let Some((p, app)) = metrics_app {
-        let metrics_listener = tokio::net::TcpListener::bind(("0.0.0.0", p)).await?;
-        tracing::info!("serving /q/metrics only on http://0.0.0.0:{p}");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(metrics_listener, app).await {
-                tracing::error!(error = %e, "metrics listener stopped");
-            }
-        });
-    }
+    let metrics_listener = match metrics_app {
+        Some((p, app)) => {
+            let l = tokio::net::TcpListener::bind(("0.0.0.0", p)).await?;
+            tracing::info!("serving /q/metrics only on http://0.0.0.0:{p}");
+            Some((l, app))
+        }
+        None => None,
+    };
     // Count open connections so the drain can wait for them. Incremented
     // before the task is spawned — incrementing inside the task would race the
     // drain's first check and let a just-accepted connection be missed.
@@ -1365,6 +1364,28 @@ async fn run(
     // (the LB holds one per backend — counting them as in-flight made every
     // api roll burn the full deadline) while an active request still finishes.
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    // The metrics listener is served like the API one: the header-read
+    // timeout, a connection ceiling of its own (a scrape flood takes no
+    // API slot) and the drain signal. Its connections are not waited for.
+    if let Some((listener, app)) = metrics_listener {
+        let app: App = tower::util::MapRequest::new(app, antares_api::trim_trailing_slash);
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_METRICS_CONNECTIONS));
+        let not_drained = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drain_rx = drain_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let stream = accept(&listener).await;
+                serve(
+                    stream,
+                    app.clone(),
+                    not_drained.clone(),
+                    drain_rx.clone(),
+                    permits.clone(),
+                    header_read_timeout,
+                );
+            }
+        });
+    }
     // The signal future is created ONCE and polled by reference. Written
     // inline in the select, it would be dropped and re-created on every
     // accepted connection — and a SIGTERM landing in that drop-to-recreate
@@ -1569,6 +1590,10 @@ fn accept_backoff(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::Interrupted
     )
 }
+
+/// Ceiling on concurrently served connections of the metrics listener: a
+/// scraper or two, with room to spare.
+const MAX_METRICS_CONNECTIONS: usize = 64;
 
 /// The served app: the router under trailing-slash normalization, which
 /// trims every path.
