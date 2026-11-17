@@ -304,7 +304,8 @@ fn arms(wheres: &[String], split: Option<&TypeSplit>) -> Vec<String> {
 /// Does `q` require the Entity to have no `location`, by a top-level
 /// `!location` term? Then `location IS NULL` holds for every match: a stored
 /// geometry comes from an instance's `value` or `object` (`extract`), which
-/// `!location` resolves as present. The conjunct is leakproof, so
+/// `!location` resolves as present, unless that instance has expired (4.22),
+/// which only a row with a past `attrs_expire_at` can hold. The conjunct is leakproof, so
 /// it reaches `i_entities_type_unlocated` (0018) under RLS, where the negated
 /// `@?` read the whole type; the `@?` stays and decides.
 fn unlocated(q: &QNode, expand: &dyn Fn(&str) -> String) -> bool {
@@ -1326,7 +1327,9 @@ impl PgEntityStore {
                 None => decided = false,
             }
             if unlocated(node, f.expand) {
-                wheres.push("location IS NULL".to_owned());
+                // a row holding an expired instance (its `location` one,
+                // maybe) reaches the exact predicate, which reads it live
+                wheres.push("(location IS NULL OR attrs_expire_at < now())".to_owned());
             }
             if let Some(name) = named(node, f.expand) {
                 binds.push(Bind::Text(name.to_owned()));
