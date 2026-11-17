@@ -506,80 +506,12 @@ pub async fn wire_nats(
                 // otherwise turn into a hot loop of reads and warn lines
                 let mut failures = 0u32;
                 loop {
-                    let rows = match store.outbox_peek(64).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("outbox peek failed: {e}");
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    };
-                    if rows.is_empty() {
-                        // woken by the same-process write hook, or the fallback
-                        // poll for rows another pod failed to publish
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_millis(250),
-                            nudge.notified(),
-                        )
-                        .await;
-                        continue;
-                    }
-                    // Ack the EXACT published seqs — a blanket
-                    // up-to-max delete loses a lower-seq row whose
-                    // transaction commits between peek and ack.
-                    let mut acked: Vec<i64> = Vec::new();
-                    // Rows whose bodies were too big for the bus: the message
-                    // carries a reference, and this row is the only copy of
-                    // what it references. Kept, not deleted, and taken out of
-                    // the next page by the same stamp.
-                    let mut retained: Vec<(TenantId, i64)> = Vec::new();
-                    let mut failed = false;
-                    for (seq, _tenant, event) in rows {
-                        match serde_json::from_value::<ChangeEvent>(event) {
-                            Ok(mut ev) => {
-                                ev.seq = seq;
-                                match bus_for_drain.publish(&ev).await {
-                                    Ok(true) => retained.push((ev.tenant, seq)),
-                                    Ok(false) => acked.push(seq),
-                                    Err(e) => {
-                                        tracing::warn!("outbox publish of seq {seq} failed: {e}");
-                                        failed = true;
-                                        break; // retry from here next round
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // an undecodable row would wedge the drain forever
-                                tracing::error!("outbox row {seq} undecodable ({e}) — skipped");
-                                acked.push(seq);
-                            }
-                        }
-                    }
-                    // Retain BEFORE ack: both statements are separate
-                    // transactions, and a crash between them must leave a
-                    // claim-check row alive rather than published and gone.
-                    // One statement per row, under that row's tenant — the
-                    // outbox UPDATE takes no service escape (0005), and an
-                    // event over the bus ceiling is rare enough that grouping
-                    // the page by tenant would cost more code than statements.
-                    for (tenant, seq) in &retained {
-                        if let Err(e) = store.outbox_retain(tenant, &[*seq]).await {
-                            tracing::warn!("outbox retain of seq {seq} failed: {e}");
-                        }
-                    }
-                    if !acked.is_empty() {
-                        if let Err(e) = store.outbox_ack(&acked).await {
-                            tracing::warn!("outbox ack {acked:?} failed: {e}");
-                        }
-                    }
-                    failures = if failed {
-                        failures.saturating_add(1)
-                    } else {
-                        0
-                    };
-                    if failed {
-                        tokio::time::sleep(drain_retry_backoff(failures)).await;
-                    }
+                    // a panicking round is contained: the drain goes on
+                    contained(
+                        "outbox-drain",
+                        drain_round(&*store, &bus_for_drain, &nudge, &mut failures),
+                    )
+                    .await;
                 }
             });
         }
@@ -716,6 +648,87 @@ pub async fn wire_nats(
     Ok(bus)
 }
 
+/// One round of the outbox drain: peek a page, publish it in order, retain
+/// the claim-checked rows, ack the published ones; after a failed publish,
+/// pause by `failures` before the next round retries from the failed row.
+async fn drain_round(
+    store: &dyn antares_store::CurrentStateDriver,
+    bus: &NatsBus,
+    nudge: &tokio::sync::Notify,
+    failures: &mut u32,
+) {
+    let rows = match store.outbox_peek(64).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("outbox peek failed: {e}");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            return;
+        }
+    };
+    if rows.is_empty() {
+        // woken by the same-process write hook, or the fallback
+        // poll for rows another pod failed to publish
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(250), nudge.notified()).await;
+        return;
+    }
+    // Ack the EXACT published seqs — a blanket
+    // up-to-max delete loses a lower-seq row whose
+    // transaction commits between peek and ack.
+    let mut acked: Vec<i64> = Vec::new();
+    // Rows whose bodies were too big for the bus: the message
+    // carries a reference, and this row is the only copy of
+    // what it references. Kept, not deleted, and taken out of
+    // the next page by the same stamp.
+    let mut retained: Vec<(TenantId, i64)> = Vec::new();
+    let mut failed = false;
+    for (seq, _tenant, event) in rows {
+        match serde_json::from_value::<ChangeEvent>(event) {
+            Ok(mut ev) => {
+                ev.seq = seq;
+                match bus.publish(&ev).await {
+                    Ok(true) => retained.push((ev.tenant, seq)),
+                    Ok(false) => acked.push(seq),
+                    Err(e) => {
+                        tracing::warn!("outbox publish of seq {seq} failed: {e}");
+                        failed = true;
+                        break; // retry from here next round
+                    }
+                }
+            }
+            Err(e) => {
+                // an undecodable row would wedge the drain forever
+                tracing::error!("outbox row {seq} undecodable ({e}) — skipped");
+                acked.push(seq);
+            }
+        }
+    }
+    // Retain BEFORE ack: both statements are separate
+    // transactions, and a crash between them must leave a
+    // claim-check row alive rather than published and gone.
+    // One statement per row, under that row's tenant — the
+    // outbox UPDATE takes no service escape (0005), and an
+    // event over the bus ceiling is rare enough that grouping
+    // the page by tenant would cost more code than statements.
+    for (tenant, seq) in &retained {
+        if let Err(e) = store.outbox_retain(tenant, &[*seq]).await {
+            tracing::warn!("outbox retain of seq {seq} failed: {e}");
+        }
+    }
+    if !acked.is_empty() {
+        if let Err(e) = store.outbox_ack(&acked).await {
+            tracing::warn!("outbox ack {acked:?} failed: {e}");
+        }
+    }
+    *failures = if failed {
+        failures.saturating_add(1)
+    } else {
+        0
+    };
+    if failed {
+        tokio::time::sleep(drain_retry_backoff(*failures)).await;
+    }
+}
+
 /// The matcher loop's share of `pending_changes`, given back however the
 /// task ends (a panic included), so a drain never waits out its deadline on
 /// a loop that is gone.
@@ -780,7 +793,10 @@ async fn watch_registry(
                         continue;
                     }
                     open_delta(key.as_deref(), DocKind::Registration, &mut delta);
-                    apply_delta(reg_mirror.as_ref(), &delta);
+                    contained("registry", async {
+                        apply_delta(reg_mirror.as_ref(), &delta)
+                    })
+                    .await;
                 }
                 tracing::warn!("registry broadcast consumer stream ended — reopening");
             }
@@ -897,7 +913,11 @@ async fn watch_subscriptions(
             let Ok(entry) = entry else { continue };
             if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&entry.value) {
                 open_sub_delta(key.as_deref(), &mut v);
-                apply_delta(mirror.as_ref(), &v);
+                // a panicking apply is contained: the watch goes on
+                contained("subscription-kv", async {
+                    apply_delta(mirror.as_ref(), &v)
+                })
+                .await;
             }
         }
         tracing::warn!("subscription KV watch ended — reopening");
