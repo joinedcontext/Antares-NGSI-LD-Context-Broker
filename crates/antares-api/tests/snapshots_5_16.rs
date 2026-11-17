@@ -1823,3 +1823,56 @@ async fn clause_5_16_7_purge_by_creation_time() {
         "a snapshot made earlier is purged"
     );
 }
+
+/// 5.16.4.4: an update merges onto the snapshot as stored when it writes,
+/// so an update of another member that landed after its read is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_16_4_two_updates_keep_each_others_members() {
+    use antares_store::Kind;
+    use std::sync::Arc;
+
+    let mut st = state().await;
+    let snap = json!({"type": "Snapshot", "snapshotPriority": 2,
+        "snapshotQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}]}]})
+    .to_string();
+    let (status, headers, body) =
+        send_h(&st, "POST", "/ngsi-ld/v1/snapshots", Some(snap), &[]).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let loc = headers
+        .get("Location")
+        .and_then(|v| v.to_str().ok())
+        .expect("Location header")
+        .to_owned();
+    wait_ready(&st, &loc).await;
+    let sid = loc.rsplit('/').next().expect("id").to_owned();
+    let tenant = antares_model::TenantId::default();
+    // the other update: priority 9, landing right after this one's read
+    let mut other = st
+        .store
+        .get(&tenant, Kind::Snapshot, &sid)
+        .await
+        .expect("read")
+        .expect("stored");
+    other["snapshotPriority"] = json!(9);
+    st.store = Arc::new(common::Double::racing_write_of(
+        st.store.clone(),
+        Kind::Snapshot,
+        other,
+    ));
+    let (status, body) = send(
+        &st,
+        "PATCH",
+        &loc,
+        Some(json!({"snapshotLifetime": "PT2H"}).to_string()),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, _, now) = send_h(&st, "GET", &loc, None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        now["snapshotPriority"],
+        json!(9),
+        "the other update was lost: {now}"
+    );
+    assert_eq!(now["snapshotLifetime"], json!("PT2H"), "{now}");
+}

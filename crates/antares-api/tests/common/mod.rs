@@ -25,6 +25,8 @@ pub struct Double {
     delete_on_get: bool,
     racing_write: Option<Value>,
     raced: AtomicBool,
+    /// The kind whose read the racing write follows.
+    race_kind: Kind,
     refuse_registrations: bool,
     refuse_doc: Option<(Kind, String)>,
     refuse_create: Option<(Kind, String)>,
@@ -55,6 +57,7 @@ impl Double {
             delete_on_get: false,
             racing_write: None,
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: false,
             refuse_doc: None,
             refuse_create: None,
@@ -79,6 +82,7 @@ impl Double {
             delete_on_get: false,
             racing_write: None,
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: false,
             refuse_doc: None,
             refuse_create: None,
@@ -103,6 +107,7 @@ impl Double {
             delete_on_get: true,
             racing_write: None,
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: false,
             refuse_doc: None,
             refuse_create: None,
@@ -129,6 +134,7 @@ impl Double {
             delete_on_get: false,
             racing_write: Some(replacement),
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: false,
             refuse_doc: None,
             refuse_create: None,
@@ -146,13 +152,25 @@ impl Double {
         let Some(doc) = &self.racing_write else {
             return Ok(());
         };
-        if kind != Kind::Entity || self.raced.swap(true, Ordering::SeqCst) {
+        if kind != self.race_kind || self.raced.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         if self.inner.get(tenant, kind, id).await?.is_some() {
             self.inner.upsert(tenant, kind, id, doc.clone()).await?;
         }
         Ok(())
+    }
+
+    /// [`Self::racing_write`] after the read of a document of `kind`.
+    pub fn racing_write_of(
+        inner: Arc<dyn CurrentStateDriver>,
+        kind: Kind,
+        replacement: Value,
+    ) -> Self {
+        Self {
+            race_kind: kind,
+            ..Self::racing_write(inner, replacement)
+        }
     }
 
     /// The registration read fails while everything else keeps working —
@@ -167,6 +185,7 @@ impl Double {
             delete_on_get: false,
             racing_write: None,
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: true,
             refuse_doc: None,
             refuse_create: None,
@@ -191,6 +210,7 @@ impl Double {
             delete_on_get: false,
             racing_write: None,
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: false,
             refuse_doc: Some((kind, id.to_owned())),
             refuse_create: None,
@@ -217,6 +237,7 @@ impl Double {
             delete_on_get: false,
             racing_write: None,
             raced: AtomicBool::new(false),
+            race_kind: Kind::Entity,
             refuse_registrations: false,
             refuse_doc: None,
             refuse_create: Some((kind, id.to_owned())),
