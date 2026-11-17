@@ -117,9 +117,13 @@ impl TemporalDriver for Recording {
             .lock()
             .expect("lock")
             .push((f.range.is_some(), f.last_n.is_some()));
+        // the client's page, not the fold-budget page an unpaged query
+        // still pushes (its limit is the budget and one more)
+        let budget = i64::try_from(*antares_api::bounds::MAX_FOLD_DOCS + 1).unwrap_or(i64::MAX);
         self.paged.lock().expect("lock").push(
             f.page
                 .as_ref()
+                .filter(|p| p.limit != budget)
                 .map(|_| f.page_attrs.map(<[String]>::to_vec)),
         );
         let out = self.inner.query_temporal(t, f).await?;
