@@ -71,9 +71,7 @@ pub(crate) fn db(e: sqlx::Error) -> NgsiError {
 /// 4.22: the read-boundary "now" — every entity read strips expired docs and
 /// instances against this stamp (UTC Z, millisecond precision, the same form
 /// the broker writes into system timestamps).
-pub(crate) fn now_utc() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
+pub(crate) use antares_store::filter::now_utc;
 
 #[cfg(feature = "postgres")]
 fn doc_kind(kind: Kind) -> Result<DocKind, NgsiError> {
@@ -2178,12 +2176,7 @@ impl antares_store::TemporalDriver for AnyStore {
     ) -> Result<u64, NgsiError> {
         match self {
             AnyStore::Mem(_) => {
-                let instant = |t: &str| {
-                    chrono::DateTime::parse_from_rfc3339(
-                        &antares_store::filter::canonical_datetime(t),
-                    )
-                    .ok()
-                };
+                let instant = antares_store::filter::instant;
                 // an instance goes when it was observed at or before the cut;
                 // a cut that is no DateTime erases nothing
                 let cut = before.map(instant);

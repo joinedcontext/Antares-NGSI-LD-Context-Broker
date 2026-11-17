@@ -243,11 +243,23 @@ pub fn expired_at(v: &Value, now: &str) -> bool {
     let Some(e) = v.get("expiresAt").and_then(Value::as_str) else {
         return false;
     };
-    let instant = |s: &str| chrono::DateTime::parse_from_rfc3339(&canonical_datetime(s)).ok();
     match (instant(e), instant(now)) {
         (Some(exp), Some(n)) => exp < n,
         _ => e < now,
     }
+}
+
+/// A stored DateTime as an instant: 4.6.3 allows a comma seconds-fraction,
+/// which RFC 3339 parsing refuses, so it is canonicalized first. `None` when
+/// it is no DateTime.
+pub fn instant(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(&canonical_datetime(s)).ok()
+}
+
+/// The UTC-Z millisecond stamp the stores judge 4.22 against, the form the
+/// read boundary compares `expiresAt` with.
+pub fn now_utc() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// 4.6.3: "In requests, also a comma instead of a decimal point may be used
