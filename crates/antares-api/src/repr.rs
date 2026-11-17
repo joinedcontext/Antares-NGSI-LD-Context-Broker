@@ -872,7 +872,10 @@ fn transform_instance(inst: &Value, r: &Repr) -> Value {
             _ => {}
         }
         // sub-attributes recurse
-        if let Some(arr) = v.as_array().filter(|_| !is_reserved_member(k)) {
+        if let Some(arr) = v
+            .as_array()
+            .filter(|_| !antares_jsonld::RESERVED_MEMBERS.contains(&k.as_str()))
+        {
             let subs: Vec<Value> = arr.iter().map(|i| transform_instance(i, r)).collect();
             out.insert(k.clone(), Value::Array(subs));
         } else {
@@ -969,34 +972,6 @@ fn select_lang(lm: &Map<String, Value>, lang: &str) -> Option<(String, Value)> {
         return Some(("@none".to_owned(), v.clone()));
     }
     lm.iter().next().map(|(k, v)| (k.clone(), v.clone()))
-}
-
-fn is_reserved_member(k: &str) -> bool {
-    matches!(
-        k,
-        "type"
-            | "value"
-            | "object"
-            | "objectType"
-            | "datasetId"
-            | "observedAt"
-            | "unitCode"
-            | "lang"
-            | "languageMap"
-            | "vocab"
-            | "json"
-            | "valueList"
-            | "objectList"
-            | "createdAt"
-            | "modifiedAt"
-            | "deletedAt"
-            | "instanceId"
-            | "previousValue"
-            | "previousObject"
-            | "previousLanguageMap"
-            | "previousJson"
-            | "previousVocab"
-    )
 }
 
 /// 4.5.4: the simplified (keyValues) value of one instance — bare value for
