@@ -1283,43 +1283,16 @@ pub fn resolve(clause: &str, decision: Decision) -> Decision {
 /// interrupt it; an engine that blocks is a deployment's own bug, and the
 /// bound that catches it is the request timeout in front of the broker.
 pub async fn decide(engine: &dyn PolicyEngine, subject: &Subject, op: &Operation<'_>) -> Decision {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use futures_util::FutureExt as _;
-        let built =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.decide(subject, op)));
-        let Ok(fut) = built else {
-            tracing::error!("policy engine {} panicked; denying", engine.name());
-            metrics::counter!("antares_policy_failures_total", "reason" => "panic").increment(1);
-            return Decision::Deny(ENGINE_FAILED.to_owned());
-        };
-        let guarded = std::panic::AssertUnwindSafe(fut).catch_unwind();
-        match tokio::time::timeout(*TIMEOUT, guarded).await {
-            Ok(Ok(d)) => resolve(op.clause, d),
-            Ok(Err(_)) => {
-                tracing::error!("policy engine {} panicked; denying", engine.name());
-                metrics::counter!("antares_policy_failures_total", "reason" => "panic")
-                    .increment(1);
-                Decision::Deny(ENGINE_FAILED.to_owned())
-            }
-            Err(_) => {
-                tracing::error!(
-                    "policy engine {} did not answer within {:?}; denying",
-                    engine.name(),
-                    *TIMEOUT
-                );
-                metrics::counter!("antares_policy_failures_total", "reason" => "timeout")
-                    .increment(1);
-                Decision::Deny(ENGINE_TIMED_OUT.to_owned())
-            }
-        }
-    }
-    // The browser build has no timer to race against and aborts on panic;
-    // it also loads no addon, so the engine is always the built-in one.
-    #[cfg(target_arch = "wasm32")]
-    {
-        resolve(op.clause, engine.decide(subject, op).await)
-    }
+    // one Operation through the batch guard: the same panic, timeout and
+    // length handling, the decision built inside the guarded call
+    let ask = || -> DecisionsFuture<'_> {
+        let one = engine.decide(subject, op);
+        Box::pin(async move { vec![one.await] })
+    };
+    guarded(engine, std::slice::from_ref(op), ask)
+        .await
+        .pop()
+        .unwrap_or_else(|| Decision::Deny(ENGINE_FAILED.to_owned()))
 }
 
 /// [`decide`] for a batch: one answer per Operation, failing closed the
