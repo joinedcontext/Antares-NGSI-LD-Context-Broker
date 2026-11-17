@@ -122,7 +122,7 @@ fn in_scope(id: &str, doc: &Value, scope: antares_store::HistoryScope<'_>) -> bo
 
 /// The instant an attribute instance is kept by, the same fallback the
 /// Postgres arm's `observed_at` column takes.
-fn instance_instant(inst: &Value) -> Option<&str> {
+pub(crate) fn instance_instant(inst: &Value) -> Option<&str> {
     ["observedAt", "modifiedAt", "deletedAt", "createdAt"]
         .iter()
         .find_map(|k| inst.get(*k).and_then(Value::as_str))
