@@ -170,14 +170,31 @@ impl BatchRun<'_> {
     /// would — its id, its types (stored and written), its Attributes and its
     /// expanded body. A refused member lands in E with the AccessDenied
     /// problem and the rest are applied (207); a batch refused whole is the
-    /// 403 it always was. An entry that does not expand is shown by its id
-    /// alone and left to the local arm to report.
+    /// 403 it always was. Each member is expanded as its write expands it; one
+    /// that does not expand cannot be shown, so it lands in E with its error
+    /// and is neither written nor forwarded (deny by default).
     async fn decide(&mut self, headers: &HeaderMap, items: &mut Vec<BatchItem>) -> ApiResult<()> {
         let st = self.st;
         let Some(engine) = &st.policy else {
             return Ok(());
         };
-        let shown = self.pre_images(members(items)).await?;
+        let mut expanded = Vec::with_capacity(items.len());
+        let mut kept = Vec::with_capacity(items.len());
+        for (id, body) in members(items, self.opts.mode) {
+            match body {
+                Ok(body) => {
+                    expanded.push((id, body));
+                    kept.push(true);
+                }
+                Err(e) => {
+                    self.out.errors.push(err_entry(id.as_deref(), &e));
+                    kept.push(false);
+                }
+            }
+        }
+        let mut keep = kept.into_iter();
+        items.retain(|_| keep.next().unwrap_or(true));
+        let shown = self.pre_images(expanded).await?;
         let attrs: Vec<Vec<String>> = shown
             .iter()
             .map(|(_, _, b)| written_attrs(b.as_ref()))
@@ -611,20 +628,39 @@ impl BatchRun<'_> {
     }
 }
 
-/// Each entry's id and, when it expands, its expanded body: what the engine
-/// is shown of it.
-fn members(items: &[BatchItem]) -> Vec<(Option<String>, Option<Value>)> {
+/// A member's body as [`members`] expands it.
+type Expanded = Result<Option<Value>, NgsiError>;
+
+/// Each entry's id and its body expanded exactly as its write expands it
+/// ([`expand_opts`]): what the engine is shown. `Ok(None)` for an entry
+/// whose `@context` failed (the local arm reports it, and it is never
+/// forwarded); `Err` for one that does not expand.
+fn members(items: &[BatchItem], mode: BatchMode) -> Vec<(Option<String>, Expanded)> {
     items
         .iter()
         .map(|(item, ctx)| {
             let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
             let body = match (item.as_object(), ctx.as_ref()) {
-                (Some(o), Ok(c)) => expand_entity(o, c, ExpandOpts::default()).ok(),
-                _ => None,
+                (Some(o), Ok(c)) => expand_entity(o, c, expand_opts(mode)).map(Some),
+                (None, Ok(_)) => Err(NgsiError::BadRequestData("entity must be an object".into())),
+                (_, Err(_)) => Ok(None),
             };
             (id, body)
         })
         .collect()
+}
+
+/// How a member of a `mode` batch expands; a merge allows the null that
+/// deletes an Attribute.
+fn expand_opts(mode: BatchMode) -> ExpandOpts {
+    let fragment_ok = mode == BatchMode::Merge;
+    ExpandOpts {
+        fragment: false,
+        allow_null: fragment_ok,
+        merge: fragment_ok,
+        temporal: false,
+        ..Default::default()
+    }
 }
 
 /// The Attribute names an expanded member writes.
@@ -661,7 +697,7 @@ fn prep_create(item: &Value, ctx: &antares_jsonld::Context, ts: &str) -> Result<
     let obj = item
         .as_object()
         .ok_or_else(|| NgsiError::BadRequestData("entity must be an object".into()))?;
-    let mut expanded = expand_entity(obj, ctx, ExpandOpts::default())?;
+    let mut expanded = expand_entity(obj, ctx, expand_opts(BatchMode::Create))?;
     let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
     stamp_new(&mut expanded, ts);
     Ok((id, expanded))
@@ -677,18 +713,7 @@ fn prep_write(
     let obj = item
         .as_object()
         .ok_or_else(|| NgsiError::BadRequestData("entity must be an object".into()))?;
-    let fragment_ok = mode == BatchMode::Merge;
-    let expanded = expand_entity(
-        obj,
-        ctx,
-        ExpandOpts {
-            fragment: false,
-            allow_null: fragment_ok,
-            merge: fragment_ok,
-            temporal: false,
-            ..Default::default()
-        },
-    )?;
+    let expanded = expand_entity(obj, ctx, expand_opts(mode))?;
     let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
     Ok((id, expanded))
 }
