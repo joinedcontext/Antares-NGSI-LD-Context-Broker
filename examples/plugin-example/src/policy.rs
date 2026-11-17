@@ -113,29 +113,45 @@ impl ExamplePolicy {
             .ok_or_else(|| "the rules document must be a JSON object".to_owned())?;
         let mut rules = HashMap::new();
         for (tenant, v) in obj {
-            let strings = |key: &str| -> Vec<String> {
-                v.get(key)
-                    .and_then(Value::as_array)
-                    .map(|a| {
+            // A rule this engine cannot read is refused, never read as "no
+            // rule": a misspelt key or a wrong shape would leave the tenant
+            // unrestricted, and this engine fails closed.
+            let v = v
+                .as_object()
+                .ok_or_else(|| format!("tenant {tenant:?}: a rule is a JSON object"))?;
+            if let Some(k) = v
+                .keys()
+                .find(|k| !["denyTypes", "omit", "q"].contains(&k.as_str()))
+            {
+                return Err(format!(
+                    "tenant {tenant:?}: unknown rule member {k:?} (denyTypes, omit, q)"
+                ));
+            }
+            let strings = |key: &str| -> Result<Vec<String>, String> {
+                let Some(m) = v.get(key) else {
+                    return Ok(Vec::new());
+                };
+                m.as_array()
+                    .and_then(|a| {
                         a.iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
+                            .map(|s| s.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
                     })
-                    .unwrap_or_default()
+                    .ok_or_else(|| format!("tenant {tenant:?}: {key} is an array of strings"))
             };
-            let q = match v.get("q").and_then(Value::as_str) {
-                Some(q) => Some(
+            let q = match v.get("q") {
+                Some(Value::String(q)) => Some(
                     antares_ql::parse_q(q)
                         .map_err(|e| format!("tenant {tenant:?}: q {q:?} does not parse: {e}"))?,
                 ),
+                Some(_) => return Err(format!("tenant {tenant:?}: q is a string")),
                 None => None,
             };
             rules.insert(
                 tenant.clone(),
                 Rule {
-                    deny_types: strings("denyTypes"),
-                    omit: strings("omit"),
+                    deny_types: strings("denyTypes")?,
+                    omit: strings("omit")?,
                     q,
                 },
             );
@@ -380,5 +396,26 @@ mod tests {
             ExamplePolicy::from_value(&json!({"acme": {"q": "(unbalanced"}})).is_err(),
             "a q that does not parse would narrow nothing"
         );
+    }
+
+    /// A rule of the wrong shape, or with a misspelt member, is refused at
+    /// load time: read as "no rule", it left the tenant unrestricted.
+    #[test]
+    fn a_rule_of_the_wrong_shape_is_refused() {
+        for doc in [
+            json!({"acme": {"denyTypes": "Secret"}}),
+            json!({"acme": {"denyTypes": ["Secret", 1]}}),
+            json!({"acme": {"denyType": ["Secret"]}}),
+            json!({"acme": {"omit": {"a": 1}}}),
+            json!({"acme": {"q": 7}}),
+            json!({"acme": "denyTypes"}),
+        ] {
+            assert!(ExamplePolicy::from_value(&doc).is_err(), "{doc}");
+        }
+        // negative: the documented shape still loads
+        assert!(ExamplePolicy::from_value(
+            &json!({"acme": {"denyTypes": ["Secret"], "omit": ["a"], "q": "speed>1"}})
+        )
+        .is_ok());
     }
 }
