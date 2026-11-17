@@ -73,17 +73,16 @@ pub(super) fn attr_keys(doc: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Per-attribute change classification between two internal docs.
+/// Per-attribute change classification between two internal docs. Linear
+/// in the Attributes and their instances: it runs in the write's change
+/// hook, so a quadratic walk let one Entity with many Attributes (or many
+/// instances of one) stall the write path.
 pub(super) fn diff(before: Option<&Value>, after: Option<&Value>) -> Vec<(String, ChangeClass)> {
     let empty = Value::Object(Map::new());
     let b = before.unwrap_or(&empty);
     let a = after.unwrap_or(&empty);
     let mut keys = attr_keys(b);
-    for k in attr_keys(a) {
-        if !keys.contains(&k) {
-            keys.push(k);
-        }
-    }
+    keys.extend(attr_keys(a).into_iter().filter(|k| b.get(k).is_none()));
     let mut out = Vec::new();
     for k in keys {
         let bv = b.get(&k);
@@ -96,17 +95,23 @@ pub(super) fn diff(before: Option<&Value>, after: Option<&Value>) -> Vec<(String
                 // attributeDeleted even when other instances survive (5.8.6)
                 let bx: Vec<&Value> = x.as_array().map(|a| a.iter().collect()).unwrap_or_default();
                 let by: Vec<&Value> = y.as_array().map(|a| a.iter().collect()).unwrap_or_default();
-                let removed = bx
-                    .iter()
-                    .any(|bi| !by.iter().any(|ai| instance_ds(ai) == instance_ds(bi)));
+                // the first instance of each datasetId, as `find` took it
+                let mut before_by_ds: std::collections::HashMap<Option<&str>, &Value> =
+                    std::collections::HashMap::with_capacity(bx.len());
+                for bi in &bx {
+                    before_by_ds.entry(instance_ds(bi)).or_insert(bi);
+                }
+                let after_ds: std::collections::HashSet<Option<&str>> =
+                    by.iter().map(|ai| instance_ds(ai)).collect();
+                let removed = bx.iter().any(|bi| !after_ds.contains(&instance_ds(bi)));
                 if removed {
                     out.push((k.clone(), ChangeClass::Deleted));
-                    let survivors_changed = by.iter().any(|ai| {
-                        match bx.iter().find(|bi| instance_ds(bi) == instance_ds(ai)) {
-                            Some(bi) => !stable_eq(bi, ai),
-                            None => true,
-                        }
-                    });
+                    let survivors_changed =
+                        by.iter()
+                            .any(|ai| match before_by_ds.get(&instance_ds(ai)) {
+                                Some(bi) => !stable_eq(bi, ai),
+                                None => true,
+                            });
                     if survivors_changed {
                         out.push((k, ChangeClass::Updated));
                     }
@@ -604,4 +609,63 @@ pub(super) fn read_or_warn<T>(res: Result<Vec<T>, antares_model::NgsiError>, wha
         tracing::warn!("notification path: reading {what} failed: {e}");
         Vec::new()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The diff of a wide Entity, and of an Attribute with many instances,
+    /// keeps the per-attribute verdicts: added, removed, changed instances.
+    #[test]
+    fn diff_of_a_wide_entity_classifies_every_attribute() {
+        let n = 20_000;
+        let mut before = Map::new();
+        let mut after = Map::new();
+        for i in 0..n {
+            before.insert(
+                format!("urn:a:{i}"),
+                json!([{"type": "Property", "value": i}]),
+            );
+            after.insert(
+                format!("urn:a:{}", i + 1),
+                json!([{"type": "Property", "value": i + 1}]),
+            );
+        }
+        let instances = |shift: usize| -> Value {
+            (0..n)
+                .map(|i| json!({"type": "Property", "value": i, "datasetId": format!("urn:ds:{}", i + shift)}))
+                .collect()
+        };
+        before.insert("urn:many".into(), instances(0));
+        after.insert("urn:many".into(), instances(1));
+        let started = std::time::Instant::now();
+        let out = diff(Some(&Value::Object(before)), Some(&Value::Object(after)));
+        let class = |k: &str| -> Vec<ChangeClass> {
+            out.iter()
+                .filter(|(a, _)| a == k)
+                .map(|(_, c)| *c)
+                .collect()
+        };
+        assert_eq!(class("urn:a:0"), [ChangeClass::Deleted]);
+        assert_eq!(class(&format!("urn:a:{n}")), [ChangeClass::Created]);
+        assert!(
+            class("urn:a:7").is_empty(),
+            "an unchanged Attribute is no change"
+        );
+        assert_eq!(
+            class("urn:many"),
+            [ChangeClass::Deleted, ChangeClass::Updated]
+        );
+        assert_eq!(out.len(), 4);
+        // quadratic, this took minutes in a debug build
+        if std::env::var_os("ANTARES_TEST_SANITIZER").is_none() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+    }
 }
