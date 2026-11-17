@@ -27,11 +27,11 @@ To install the ETSI NGSI-LD Test Suite, download the configuration script:
 
 - For macOS and Ubuntu, download the following file:
 
-```$ curl https://forge.etsi.org/rep/cim/ngsi-ld-test-suite/-/raw/develop/scripts/configure.sh > configure.sh```
+```$ curl https://forge.etsi.org/rep/data/ngsi-ld-test-suite/-/raw/develop/scripts/configure.sh > configure.sh```
 
 - For Windows, using PowerShell download the following file (curl is an alias for Invoke-WebRequest in PowerShell):
 
-```> curl https://forge.etsi.org/rep/cim/ngsi-ld-test-suite/-/raw/develop/scripts/configure.ps1 > configure.ps1```
+```> curl https://forge.etsi.org/rep/data/ngsi-ld-test-suite/-/raw/develop/scripts/configure.ps1 > configure.ps1```
 
 - For macOS and Ubuntu, be sure that you have the proper execution permissions of the file and the user is included 
 in the sudoers group, then execute the following script:
