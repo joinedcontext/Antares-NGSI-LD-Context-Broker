@@ -1220,9 +1220,8 @@ fn slots_of(
     let Some(obj) = doc.as_object() else {
         return out;
     };
-    let metas = ["id", "type", "scope", "createdAt", "modifiedAt", "@context"];
     for (k, v) in obj {
-        if metas.contains(&k.as_str()) {
+        if k == "@context" || antares_model::is_meta(k) {
             continue;
         }
         let iri = ctx.expand_key(k);

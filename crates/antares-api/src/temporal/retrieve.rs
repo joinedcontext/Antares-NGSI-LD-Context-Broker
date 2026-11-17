@@ -378,17 +378,7 @@ pub(super) fn merge_temporal_docs(base: &mut Value, add: &Value, aux: bool, time
         return;
     };
     for (k, v) in source {
-        if [
-            "id",
-            "type",
-            "scope",
-            "createdAt",
-            "modifiedAt",
-            "deletedAt",
-            "expiresAt",
-        ]
-        .contains(&k.as_str())
-        {
+        if antares_model::is_meta(k) {
             target.entry(k.clone()).or_insert_with(|| v.clone());
             continue;
         }
