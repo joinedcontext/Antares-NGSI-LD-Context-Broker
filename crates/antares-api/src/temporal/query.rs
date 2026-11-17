@@ -873,12 +873,22 @@ async fn fetch_temporal(
             }),
         oldest_first: !page_n.desc,
         timeproperty: &qry.timeprop,
-        page: plan.page.then_some(antares_store::filter::Page {
-            offset: plan.offset as i64,
-            limit: plan.limit as i64,
-            // without count=true the store only says whether a next page
-            // exists, as on the entity query path
-            count: req.params.get("count").map(String::as_str) == Some("true"),
+        page: Some(if plan.page {
+            antares_store::filter::Page {
+                offset: plan.offset as i64,
+                limit: plan.limit as i64,
+                // without count=true the store only says whether a next page
+                // exists, as on the entity query path
+                count: req.params.get("count").map(String::as_str) == Some("true"),
+            }
+        } else {
+            // the client's page cannot be pushed: the store still reads no
+            // more than the fold budget and one more, which says it is past
+            antares_store::filter::Page {
+                offset: 0,
+                limit: i64::try_from(fold_budget().saturating_add(1)).unwrap_or(i64::MAX),
+                count: false,
+            }
         }),
         page_attrs: plan.page_attrs.as_deref().filter(|_| plan.page),
         q: qry.q_ast.as_ref(),
@@ -893,7 +903,26 @@ async fn fetch_temporal(
             anchor: qry.tq.as_ref().map(|t| t.time_at.as_str()),
         }),
     };
-    Ok(req.st.temporal.query_temporal(req.tenant, &tf).await?)
+    let mut outcome = req.st.temporal.query_temporal(req.tenant, &tf).await?;
+    // 5.5.6: a match set the page cannot be pushed into is held whole until
+    // it is paged here, so it is bounded like every unpaginated fold
+    if !plan.page && outcome.rows.len() > fold_budget() {
+        return Err(NgsiError::TooManyResults(format!(
+            "the query matches more than {} Entities and cannot be paged in the store; \
+             narrow it",
+            fold_budget()
+        ))
+        .into());
+    }
+    // only the client's own page is a page the answer may take as applied
+    outcome.paged &= plan.page;
+    Ok(outcome)
+}
+
+/// The most Entities a temporal query whose page cannot be pushed into the
+/// store holds at once (`ANTARES_DISCOVERY_SCAN_MAX`).
+fn fold_budget() -> usize {
+    *crate::bounds::MAX_FOLD_DOCS
 }
 
 /// 5.7.4.4: fan the query out to matching queryTemporal registrations
