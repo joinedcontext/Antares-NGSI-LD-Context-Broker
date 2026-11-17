@@ -195,3 +195,42 @@ async fn a_store_failure_during_a_join_is_a_truncation() {
         assert!(!warnings.is_empty(), "{join}: no warning, {body}");
     }
 }
+
+/// 5.5.7: each forwarded batch item is read under its own @context, so items
+/// with different @contexts travel in separate requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_forwarded_batch_item_travels_under_its_own_context() {
+    let st = state();
+    let (port, seen) = mock(NO_CONTENT, std::time::Duration::ZERO);
+    register(&st, port, &["upsertBatch"]).await;
+    let body = r#"[
+        {"@context": {"speed": "https://a.example/speed"}, "id": "urn:ngsi-ld:Vehicle:c1",
+         "type": "Vehicle", "speed": {"type": "Property", "value": 1}},
+        {"@context": {"speed": "https://b.example/speed"}, "id": "urn:ngsi-ld:Vehicle:c2",
+         "type": "Vehicle", "speed": {"type": "Property", "value": 2}}]"#;
+    let (status, _, answer) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/upsert",
+        "application/ld+json",
+        Some(body.to_owned()),
+    )
+    .await;
+    assert!(status < 300, "{status} {answer}");
+    let seen = seen.lock().unwrap().clone();
+    let sent: Vec<&String> = seen
+        .iter()
+        .filter(|r| r.contains("entityOperations"))
+        .collect();
+    assert_eq!(sent.len(), 2, "{seen:?}");
+    for (mine, other, id) in [
+        ("a.example", "b.example", "c1"),
+        ("b.example", "a.example", "c2"),
+    ] {
+        let req = sent
+            .iter()
+            .find(|r| r.contains(&format!("urn:ngsi-ld:Vehicle:{id}")))
+            .unwrap();
+        assert!(req.contains(mine) && !req.contains(other), "{req}");
+    }
+}
