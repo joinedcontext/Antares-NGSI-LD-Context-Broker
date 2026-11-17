@@ -251,6 +251,18 @@ async fn order_by_scope_orders_by_the_scope_member() {
     );
 }
 
+/// A dead letter listed through /q shows no credential, whatever shape its
+/// key-value pairs were stored in.
+#[test]
+fn a_dead_letter_is_redacted_in_every_pair_shape() {
+    let mut l = serde_json::json!({"uri": "http://h/x",
+        "receiverInfo": [{"key": "Authorization", "value": "Bearer s3cret"}],
+        "notifierInfo": [["k", "s3cret"], "s3cret"],
+        "headers": {"Authorization": "s3cret"}});
+    crate::ops::redact_letter(&mut l);
+    assert!(!l.to_string().contains("s3cret"), "{l}");
+}
+
 /// 6.3.6: a json answer to a POST temporal query compacted with an inline
 /// @context links that @context, never the core one.
 #[tokio::test]
