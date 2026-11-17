@@ -668,3 +668,27 @@ async fn a_purge_names_its_types_attributes_and_query() {
     assert_eq!(s.attrs, vec![iri("speed")]);
     assert!(s.q, "the purge's q");
 }
+
+/// 5.6.20: a merge member may carry the null that deletes an Attribute. The
+/// engine is shown that member expanded as the merge applies it, its
+/// Attributes named, exactly as the single-Entity merge shows them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_merge_member_with_a_null_is_shown_whole() {
+    let (st, seen) = state().await;
+    seed(&st).await;
+    let member = json!([{"id": "urn:ngsi-ld:Vehicle:v", "type": "Vehicle",
+                         "speed": "urn:ngsi-ld:null",
+                         "colour": {"type": "Property", "value": "blue"}}]);
+    let (code, answer) = call(&st, "/ngsi-ld/v1/entityOperations/merge", member).await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{answer}");
+    let shown = last(&seen);
+    assert_eq!(shown.clause, "5.6.20");
+    assert!(shown.body.is_some(), "the member body is shown");
+    for name in ["speed", "colour"] {
+        assert!(
+            shown.attrs.contains(&iri(name)),
+            "{name}: {:?}",
+            shown.attrs
+        );
+    }
+}
