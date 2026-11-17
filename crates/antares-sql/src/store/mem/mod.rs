@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! In-memory store — v0 storage backend.
-//!
-//! DELIBERATE DEVIATION (recorded in docs/adr/): the target backend is
-//! Postgres; the suite-green loop uses an in-memory backend first. The store
-//! API is shaped like the Postgres store traits (tenant first parameter
-//! everywhere) so the sqlx implementation can land behind the same seam.
+//! In-memory store: the `memory` backend, and with a redb file behind it the
+//! `file` backend (the browser and single-process deployments). It sits
+//! behind the same driver seam as the Postgres store (tenant first parameter
+//! everywhere) and keeps the same contract (`antares_store::contract`).
 //!
 //! Documents are held in the *internal expanded form* produced by
 //! `antares_jsonld::expand` (IRI keys, instance arrays), with server-managed
@@ -459,8 +457,8 @@ impl Store {
     }
 
     /// 4.22 garbage collection for the memory/file arm: remove entity docs
-    /// whose `expiresAt` (byte-compared against the UTC-Z `now` stamp, same
-    /// as the read filter) has passed, and prune expired ATTRIBUTE instances
+    /// whose `expiresAt` (compared as an instant with the UTC-Z `now` stamp,
+    /// as the read filter does) has passed, and prune expired ATTRIBUTE instances
     /// from current-state and temporal docs — the read filter hides them,
     /// but without physical removal a long-running store (the browser's OPFS
     /// file under ticking sensors) grows without bound. `file` mode persists
@@ -1035,8 +1033,8 @@ impl Store {
 
     /// An expired entity is already invalid (4.22): deleting it is a 404,
     /// the same answer retrieving it gives, not a 204 for something the API
-    /// stopped serving. The row itself still goes — the sweep would take it
-    /// anyway, and leaving it would resurrect the 409.
+    /// stopped serving. The expired row stays for the sweep, which persists
+    /// its removal (see below).
     pub async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> bool {
         let _order = match kind {
             Kind::Entity => Some(self.emit_ordered().await),

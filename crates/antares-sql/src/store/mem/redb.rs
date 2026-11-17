@@ -16,7 +16,8 @@ use antares_store::Kind;
 //
 // Table per resource family, named after the spec resource, snake_cased.
 // The v0 memory store keeps one temporal doc per entity, so `attr_instances`
-// has no separate table; entityMaps are TTL-ephemeral and not durable state.
+// has no separate table. EntityMaps are persisted like the other kinds
+// (`T_ENTITY_MAP_DOCS`).
 pub(super) const T_ENTITIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entities");
 pub(super) const T_SUBSCRIPTIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("subscriptions");
