@@ -475,15 +475,13 @@ pub(super) async fn matches_for(
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
         }
-        let narrow = None;
         let triggers = triggers_of(&sub);
         // which attribute-level changes this sub cares about
         let watched: Option<Vec<&str>> = sub
             .get("watchedAttributes")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect());
-        #[expect(unused_mut)]
-        let mut relevant: Vec<&(String, ChangeClass)> = changes
+        let relevant: Vec<&(String, ChangeClass)> = changes
             .iter()
             .filter(|(k, _)| watched.as_ref().is_none_or(|w| w.contains(&k.as_str())))
             .collect();
@@ -504,7 +502,7 @@ pub(super) async fn matches_for(
         if !selector_match(&sub, eval_doc, &ctx) {
             continue;
         }
-        if !linked_eval(st, &tenant, narrow, |l| {
+        if !linked_eval(st, &tenant, None, |l| {
             conditions_match(&sub, eval_doc, &ctx, l)
         })
         .await
