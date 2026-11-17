@@ -187,12 +187,16 @@ fn change_event(
             })
             .unwrap_or_default()
     }
-    let mut changed: Vec<&str> = Vec::new();
-    for k in keys(prev).into_iter().chain(keys(next)) {
-        if !changed.contains(&k) && prev.and_then(|p| p.get(k)) != next.and_then(|n| n.get(k)) {
-            changed.push(k);
-        }
-    }
+    // Each image's keys are unique, so walking the before-image and then only
+    // the after-image keys it lacks visits every key once: linear in the
+    // attribute count, no membership scan over what was collected.
+    let differs = |k: &str| prev.and_then(|p| p.get(k)) != next.and_then(|n| n.get(k));
+    let in_prev = |k: &str| prev.and_then(|p| p.get(k)).is_some();
+    let changed: Vec<&str> = keys(prev)
+        .into_iter()
+        .filter(|k| differs(k))
+        .chain(keys(next).into_iter().filter(|k| !in_prev(k)))
+        .collect();
     serde_json::json!({
         "tenant": tenant.as_str(),
         "entity_id": id,
@@ -2664,6 +2668,39 @@ mod tests {
         assert_eq!(
             ev(Some(&a), Some(&ids)),
             json!(["https://a/x", "https://a/y"])
+        );
+    }
+
+    /// `changed_attrs` costs one pass over each image: an entity with many
+    /// attributes is diffed in time linear in their count, inside the write
+    /// transaction that holds the row lock.
+    #[test]
+    fn changed_attrs_is_linear_in_the_attribute_count() {
+        let mut o = serde_json::Map::new();
+        o.insert("id".into(), json!("urn:e"));
+        let n = 50_000usize;
+        for i in 0..n {
+            o.insert(format!("https://a/a{i:07}"), json!([{"value": 1}]));
+        }
+        let doc = Value::Object(o);
+        let start = std::time::Instant::now();
+        let ev = change_event(
+            &TenantId::default(),
+            "create",
+            "urn:e",
+            &[],
+            None,
+            Some(&doc),
+            1,
+            "inc",
+        );
+        let took = start.elapsed();
+        assert_eq!(ev["changed_attrs"].as_array().map(Vec::len), Some(n));
+        // a single pass takes milliseconds; the pairwise scan took tens of
+        // seconds here, so the margin absorbs any slow CI host
+        assert!(
+            took < std::time::Duration::from_secs(3),
+            "diffing {n} attributes took {took:?}"
         );
     }
 
