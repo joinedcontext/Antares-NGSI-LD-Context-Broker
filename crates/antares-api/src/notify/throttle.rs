@@ -536,38 +536,50 @@ pub(super) fn note_drop() {
 pub(super) static DELIVERY_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*DELIVERY_WIDTH));
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) type TenantSlots =
-    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>;
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) static TENANT_SLOTS: std::sync::LazyLock<TenantSlots> =
-    std::sync::LazyLock::new(TenantSlots::default);
-
-/// The tenant's share, created on first use. An entry lives only while a
-/// delivery is holding it: a lookup that has to create one first drops every
-/// entry nothing else still references, so this map is bounded by the
-/// delivery width and not by how many of the broker's 10 000 tenants have
-/// ever had a subscription fire.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn tenant_slots(tenant: &TenantId) -> Arc<tokio::sync::Semaphore> {
-    // A poisoned map is a panic in some past delivery, not a reason to stop
-    // delivering: what it holds is rebuildable and bounded either way.
-    let mut map = TENANT_SLOTS.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(s) = map.get(tenant.as_str()) {
-        return Arc::clone(s);
-    }
-    map.retain(|_, s| Arc::strong_count(s) > 1);
-    let slots = Arc::new(tokio::sync::Semaphore::new(*DELIVERY_WIDTH_PER_TENANT));
-    map.insert(tenant.as_str().to_owned(), Arc::clone(&slots));
-    slots
+/// Per-tenant shares of one broker-wide width: a semaphore of `width`
+/// permits per tenant, created on first use. An entry lives only while
+/// something holds it: a lookup that has to create one first drops every
+/// entry nothing else still references, so the map is bounded by the width
+/// it shares and not by how many of the broker's 10 000 tenants have ever
+/// used it. Serves the delivery pool and the CSource notification fan-out.
+pub(super) struct TenantShares {
+    width: usize,
+    map: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
+
+impl TenantShares {
+    pub(super) fn new(width: usize) -> Self {
+        Self {
+            width,
+            map: Default::default(),
+        }
+    }
+
+    /// The tenant's share.
+    pub(super) fn of(&self, tenant: &TenantId) -> Arc<tokio::sync::Semaphore> {
+        // A poisoned map is a panic in some past holder, not a reason to
+        // stop: what it holds is rebuildable and bounded either way.
+        let mut map = self.map.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = map.get(tenant.as_str()) {
+            return Arc::clone(s);
+        }
+        map.retain(|_, s| Arc::strong_count(s) > 1);
+        let share = Arc::new(tokio::sync::Semaphore::new(self.width));
+        map.insert(tenant.as_str().to_owned(), Arc::clone(&share));
+        share
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) static TENANT_SLOTS: std::sync::LazyLock<TenantShares> =
+    std::sync::LazyLock::new(|| TenantShares::new(*DELIVERY_WIDTH_PER_TENANT));
 
 /// Both permits one delivery holds until it settles. The tenant's share is
 /// taken first, so a tenant already at its share waits there instead of
 /// waiting inside one of the broker's slots.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) async fn delivery_permits(tenant: &TenantId) -> impl Sized {
-    let share = tenant_slots(tenant).acquire_owned().await;
+    let share = TENANT_SLOTS.of(tenant).acquire_owned().await;
     (share, DELIVERY_SLOTS.acquire().await)
 }
 
