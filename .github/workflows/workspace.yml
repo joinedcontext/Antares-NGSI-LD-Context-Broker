@@ -242,6 +242,11 @@ jobs:
       # broken (an empty column reads as "nothing happened") — check them here.
       - name: ETSI sampling self-check
         run: python3 dev/etsi-selftest.py
+      # The official suite's gate (dev/etsi-baseline.py) and its fetch helper
+      # on fixture runs and a local git repo standing in for forge: a gate
+      # that stopped telling regressions from upstream changes would pass.
+      - name: ETSI baseline gate self-check
+        run: python3 dev/etsi-baseline.py selftest
       # Same failure shape one layer over: the merged coverage table counts
       # functions from lcov FN records, and a wrong key there prints a
       # plausible percentage rather than an error.
