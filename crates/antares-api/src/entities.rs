@@ -1322,18 +1322,10 @@ pub(crate) fn type_selection(
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
 ) -> Option<Vec<Vec<String>>> {
-    params.get("type").filter(|s| *s != "*").map(|s| {
-        s.split([',', '|'])
-            .map(|alt| {
-                alt.trim()
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .split(';')
-                    .map(|t| ctx.expand_key(t.trim()))
-                    .collect()
-            })
-            .collect()
-    })
+    params
+        .get("type")
+        .filter(|s| *s != "*")
+        .map(|s| antares_ql::type_selection_groups(s, ctx))
 }
 
 /// The expanded `attrs` list of a query.

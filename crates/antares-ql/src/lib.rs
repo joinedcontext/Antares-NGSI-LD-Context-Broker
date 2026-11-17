@@ -44,16 +44,29 @@ pub(crate) fn test_core() -> std::sync::Arc<antares_jsonld::Context> {
     std::sync::Arc::clone(&CORE)
 }
 
+/// Entity Type Selection Language (4.17) as OR-of-AND groups of expanded
+/// type IRIs: `,`/`|` separate alternatives, `(a;b)` is AND within one. The
+/// one reading of the selection, for the store push-down and the in-memory
+/// match alike ([`check_type_selection`] validates the grammar).
+pub fn type_selection_groups(sel: &str, ctx: &antares_jsonld::Context) -> Vec<Vec<String>> {
+    sel.split([',', '|'])
+        .map(|alt| {
+            alt.trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(';')
+                .map(|t| ctx.expand_key(t.trim()))
+                .collect()
+        })
+        .collect()
+}
+
 /// Entity Type Selection Language (4.17) match against expanded type IRIs:
 /// `,`/`|` = OR of alternatives, `(a;b)` = AND within one alternative.
 pub fn type_selection_matches(sel: &str, types: &[&str], ctx: &antares_jsonld::Context) -> bool {
-    sel.split([',', '|']).any(|alt| {
-        alt.trim()
-            .trim_start_matches('(')
-            .trim_end_matches(')')
-            .split(';')
-            .all(|t| types.contains(&ctx.expand_key(t.trim()).as_str()))
-    })
+    type_selection_groups(sel, ctx)
+        .iter()
+        .any(|group| group.iter().all(|t| types.contains(&t.as_str())))
 }
 
 /// The 4.17 grammar of a type selection: `EntityTypes = OrEntityType
