@@ -1640,6 +1640,21 @@ async fn collect_flat_walk(
     }
 }
 
+/// The member an Attribute of type `ty` holds its value in (5.2.5-5.2.38):
+/// `object` for a Relationship, `languageMap`, `json`, `vocab`,
+/// `valueList`, `objectList` for their types, `value` for every other.
+pub(crate) fn value_member(ty: &str) -> &'static str {
+    match ty {
+        "Relationship" => "object",
+        "LanguageProperty" => "languageMap",
+        "JsonProperty" => "json",
+        "VocabProperty" => "vocab",
+        "ListProperty" => "valueList",
+        "ListRelationship" => "objectList",
+        _ => "value",
+    }
+}
+
 /// 4.5.16.2 GeoJSON Feature, members per Table 5.2.29-1 (5.2.29 Feature):
 /// id = entity id (URI), fixed type "Feature", geometry = the selected
 /// GeoProperty's value or null (4.5.16.1: geometryProperty parameter,
