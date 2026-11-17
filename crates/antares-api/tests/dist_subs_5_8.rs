@@ -2036,3 +2036,128 @@ async fn clause_5_8_2_4_narrowing_update_deletes_the_copy_that_no_longer_matches
     )
     .await;
 }
+
+/// 5.8.6 splitEntities=true: the notifying source is answered before the
+/// fragments are merged with what the other Context Sources hold, so a slow
+/// other source never holds the source's notification request open (and
+/// never makes it book a failure and retry); the merged notification still
+/// reaches the subscriber.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_8_6_a_split_notification_is_acknowledged_before_the_merge() {
+    allow_private();
+    std::env::set_var("ANTARES_PUBLIC_URL", "http://127.0.0.1:9999");
+    let mut st = AppState::new("antares-split-ack".into());
+    antares_api::wire(&mut st).await;
+    let (remote_port, remote_seen) = recording_mock();
+    let reg = json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:ack-origin",
+        "type": "ContextSourceRegistration",
+        "information": [{"entities": [{"type": "Vehicle"}]}],
+        "operations": ["federationOps"],
+        "endpoint": format!("http://127.0.0.1:{remote_port}"),
+    });
+    let (status, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/csourceRegistrations",
+        Some(reg.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // a SECOND, slow context source holding the brandName part
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let slow_addr = listener.local_addr().expect("addr");
+    let app = axum::Router::new().route(
+        "/ngsi-ld/v1/entities/{id}",
+        axum::routing::get(
+            |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                axum::Json(json!({"id": id, "type": "Vehicle",
+                "brandName": {"type": "Property", "value": "Tesla"}}))
+            },
+        ),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let reg2 = json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:ack-slow",
+        "type": "ContextSourceRegistration",
+        "information": [{"entities": [{"type": "Vehicle"}]}],
+        "operations": ["retrieveEntity"],
+        "endpoint": format!("http://{slow_addr}"),
+    });
+    let (status, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/csourceRegistrations",
+        Some(reg2.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (orig_port, orig_seen) = recording_mock();
+    let sub = json!({
+        "id": "urn:ngsi-ld:Subscription:ds-split-ack",
+        "type": "Subscription",
+        "entities": [{"type": "Vehicle"}],
+        "q": "brandName==\"Tesla\"",
+        "splitEntities": true,
+        "notification": {"endpoint": {"uri": format!("http://127.0.0.1:{orig_port}/notify")}},
+    });
+    let (status, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(sub.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    wait_for("the forwarded remote subscription", || {
+        remote_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .any(|r| r.starts_with("POST /ngsi-ld/v1/subscriptions"))
+    })
+    .await;
+    let remote_id = {
+        let seen = remote_seen.lock().expect("seen");
+        let r = seen
+            .iter()
+            .find(|r| r.starts_with("POST /ngsi-ld/v1/subscriptions"))
+            .expect("post")
+            .clone();
+        let v: Value = serde_json::from_str(r.split("\n\n").nth(1).expect("body")).expect("json");
+        v["id"].as_str().expect("remote id").to_owned()
+    };
+    let inbound = json!({
+        "type": "Notification",
+        "subscriptionId": remote_id,
+        "data": [{"id": "urn:ngsi-ld:Vehicle:ack1", "type": "Vehicle",
+                  "speed": {"type": "Property", "value": 99}}],
+    });
+    let started = std::time::Instant::now();
+    let (status, _) = send(
+        &st,
+        "POST",
+        "/ex/v1/remote-notify",
+        Some(inbound.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2_000),
+        "the source waited {:?} for the merge",
+        started.elapsed()
+    );
+    wait_for("the merged notification at the original subscriber", || {
+        orig_seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .any(|r| r.contains("urn:ngsi-ld:Vehicle:ack1") && r.contains("Tesla"))
+    })
+    .await;
+}
