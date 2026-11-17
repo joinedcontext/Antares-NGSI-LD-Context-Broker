@@ -369,7 +369,7 @@ fn parse_capped(input: &str, depth: usize, nodes: usize) -> Result<QNode, NgsiEr
 /// A float parse is much wider: `+5`, `01`, `.5`, `5.`, `NaN` and `inf` all
 /// come back as numbers from it and none of them is a Number here, so each
 /// would compare against a number where the term named text.
-fn is_json_number(s: &str) -> bool {
+pub(crate) fn is_json_number(s: &str) -> bool {
     let s = s.strip_prefix('-').unwrap_or(s);
     let digits = |t: &str| t.bytes().take_while(u8::is_ascii_digit).count();
     let int = digits(s);

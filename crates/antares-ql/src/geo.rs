@@ -197,6 +197,11 @@ impl GeoQuery {
         // 4.10 PositiveNumber: RFC 8259 Number "excluding the 'minus' symbol
         // and excluding the number 0".
         let positive = |v: &str, name: &str| -> Result<f64, NgsiError> {
+            // the RFC 8259 grammar first: a float parse also takes `+5`,
+            // `.5` and `5.`, none of which is a JSON Number
+            if !crate::is_json_number(v) {
+                return Err(bad(format!("invalid {name} {v:?}")));
+            }
             let n = v
                 .parse::<f64>()
                 .map_err(|_| bad(format!("invalid {name} {v:?}")))?;
@@ -876,8 +881,21 @@ mod clause_4_10_grammar {
                 "{rel} must be rejected"
             );
         }
-        // a positive number stays valid
+        // spellings a float parse takes and RFC 8259 does not
+        for rel in [
+            "near;maxDistance==+5",
+            "near;maxDistance==.5",
+            "near;maxDistance==5.",
+            "near;minDistance==05",
+        ] {
+            assert!(
+                GeoQuery::from_params(&params(rel)).is_err(),
+                "{rel} is not a JSON Number"
+            );
+        }
+        // a positive number stays valid, an exponent included
         assert!(GeoQuery::from_params(&params("near;maxDistance==0.5")).is_ok());
+        assert!(GeoQuery::from_params(&params("near;maxDistance==1e3")).is_ok());
     }
 
     /// 4.10 nearRel = nearOp andOp distance equal PositiveNumber — exactly
