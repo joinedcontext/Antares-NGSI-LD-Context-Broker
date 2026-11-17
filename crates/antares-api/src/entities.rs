@@ -3307,10 +3307,9 @@ async fn retrieve_attr_inner(
 /// registrations supporting createEntityMapQueryEntity and merge each
 /// returned EntityMap (ids → registration id, linkedMaps → remote map id);
 /// store the local EntityMap and return it.
-/// Known ceiling: the local candidate ids are the first max_limit matches —
-/// the query is paged into the store instead of materializing every matching
-/// Entity document, so one request cannot pull a whole tenant into memory.
-/// Raise the cap if local candidate sets outgrow it.
+/// The local candidate ids are read page by page from the store, never the
+/// whole match set at once, and at most max_limit of them fit a map: a query
+/// matching more is refused (TooManyResults) rather than stored cut.
 pub(crate) async fn build_query_map(
     st: &AppState,
     tenant: &TenantId,
@@ -3365,7 +3364,7 @@ pub(crate) async fn build_query_map(
     // every Entity the rest of the filter matched.
     let mut emap = Map::new();
     let mut offset = 0usize;
-    while emap.len() < st.max_limit {
+    loop {
         let batch = filter_entities_paged(
             st,
             tenant,
@@ -3381,10 +3380,11 @@ pub(crate) async fn build_query_map(
         )
         .await?;
         for d in &batch.docs {
-            if emap.len() == st.max_limit {
-                break;
-            }
             if let Some(id) = d.get("id").and_then(Value::as_str) {
+                // one past the cap is enough to know the map cannot hold it
+                if emap.len() == st.max_limit && !emap.contains_key(id) {
+                    return Err(crate::entity_map::map_too_wide(st.max_limit).into());
+                }
                 // "@none" refers to an Entity held locally (5.2.39)
                 emap.insert(id.to_owned(), json!(["@none"]));
             }
