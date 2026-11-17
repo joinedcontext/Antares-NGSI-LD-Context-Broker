@@ -2727,10 +2727,17 @@ pub(crate) async fn fed_entity_maps(
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body) in fetched {
-        if (200..300).contains(&status) && body.get("entityMap").is_some() {
-            out.push((reg.reg_id.clone(), body));
+    for (reg, status, mut body) in fetched {
+        if !(200..300).contains(&status) {
+            continue;
         }
+        // 4.3.6.1: an id the registration cannot provide, and the query did
+        // not name, is not imported from the peer's map
+        let Some(ids) = body.get_mut("entityMap").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        ids.retain(|id, _| admits_import(&reg, &spec, id));
+        out.push((reg.reg_id.clone(), body));
     }
     Ok(out)
 }
