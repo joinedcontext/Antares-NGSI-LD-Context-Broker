@@ -48,6 +48,7 @@ async fn maintenance_winning(
             pool,
             backend,
             retention_days,
+            std::time::Duration::ZERO,
         )
         .await?;
         if !msg.starts_with("skipped") {
@@ -56,6 +57,32 @@ async fn maintenance_winning(
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("never won the maintenance claim in 50 tries");
+}
+
+/// A pass is claimed only when the last one began at least the gap before:
+/// a pod that ticks right after another's pass runs none of it, so the
+/// retention, reaps and index builds after the partition transaction are
+/// not repeated by every pod on its own tick.
+#[tokio::test]
+async fn a_pass_within_the_gap_is_skipped() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 2).await.expect("connect");
+    let backend = antares_sql::store::pg::maintenance::detect_temporal_backend(&pool)
+        .await
+        .expect("temporal backend");
+    maintenance_winning(&pool, None).await.expect("a pass");
+    let again = antares_sql::store::pg::maintenance::temporal_maintenance(
+        &pool,
+        backend,
+        None,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .expect("second pass");
+    assert!(
+        again.starts_with("skipped"),
+        "ran again within the gap: {again}"
+    );
 }
 
 /// The current-state row an auto-recorded append hangs off. Written raw: the

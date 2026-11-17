@@ -108,23 +108,35 @@ pub async fn detect_temporal_backend(pool: &PgPool) -> Result<TemporalBackend, S
 const CLAIM_CHECK_HOURS: i64 = 24;
 
 /// One maintenance pass. Returns a short human-readable summary ("skipped"
-/// when another instance holds the claim). `retention_days = None` keeps
-/// history forever — retention is a deliberate deployment knob, never a
-/// default.
+/// when another instance holds the claim, or a pass began less than
+/// `min_gap` ago). `retention_days = None` keeps history forever — retention
+/// is a deliberate deployment knob, never a default.
+///
+/// The claim row's lock ends with the partition transaction, and the
+/// retention, the 4.22 reaps and the index builds run after it. What keeps
+/// every pod from repeating them on its own tick is `last_run`: a pass is
+/// claimed only when the last one began at least `min_gap` before, so the
+/// whole cluster runs about one pass per `min_gap`. Zero claims whenever
+/// the row is free.
 pub async fn temporal_maintenance(
     pool: &PgPool,
     backend: TemporalBackend,
     retention_days: Option<i64>,
+    min_gap: std::time::Duration,
 ) -> Result<String, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let claimed = sqlx::query(
         "SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions'
+           AND (last_run IS NULL OR last_run <= now() - make_interval(secs => $1))
          FOR UPDATE SKIP LOCKED",
     )
+    .bind(min_gap.as_secs_f64())
     .fetch_optional(&mut *tx)
     .await?;
     if claimed.is_none() {
-        return Ok("skipped: another instance holds the claim".into());
+        return Ok(
+            "skipped: another instance holds the claim, or ran a pass within the gap".into(),
+        );
     }
     // retention DML is cross-tenant service work (the `antares.service`
     // escape in 0001_init.sql)

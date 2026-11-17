@@ -44,7 +44,7 @@ here).
 | `ANTARES_MAX_LIMIT` | `1000` | Most items one page answers (`limit`; past it 403 TooManyResults): every paged list, Entities (`GET /entities`, `POST /entityOperations/query`), Temporal Evolutions (`GET /temporal/entities`, `POST /temporal/entityOperations/query`), Subscriptions, Context Source Registrations and their Subscriptions, and the admin dead letters. |
 | `ANTARES_DEFAULT_LIMIT` | `100` | Items a page of the same lists answers when the request names no `limit`; a `Link: rel="next"` names the next page. Never above `ANTARES_MAX_LIMIT`. |
 | `ANTARES_TEMPORAL_DEFAULT_INSTANCES` | `100` | Instances of one Attribute a temporal response serves when the request names no `lastN`/`firstN`; past it the answer is 206 with a Content-Range, as at the ceiling. Never above `ANTARES_TEMPORAL_INSTANCE_LIMIT` (the ETSI brokers at `9` stay at 9). |
-| `ANTARES_SWEEP_SECS` | `900` | Cadence of the background GC sweep (expired entities/registrations, 4.22) — identical across store modes. |
+| `ANTARES_SWEEP_SECS` | `900` | Cadence of the background GC sweep (expired entities/registrations, 4.22) — identical across store modes. On Postgres the sweep is the temporal maintenance pass, which a pod runs only when the last pass on that database, whichever pod ran it, began at least half a period before. |
 
 ## NATS scale-out
 
