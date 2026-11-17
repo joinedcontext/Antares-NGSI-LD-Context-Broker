@@ -8,42 +8,75 @@
 # the one that needs reading. Security updates ignore the schedule and
 # open the day the advisory lands.
 #
-# A version is proposed only once it has been published for more than a
-# week (cooldown, 8 days): a hijacked or broken release is usually yanked
-# within days, before it reaches a pull request here. Security updates
-# skip the cooldown.
+# A version is proposed only once it has been published for at least 7
+# days (cooldown): a hijacked or broken release is usually yanked within
+# days, before it reaches a pull request here. Security updates skip the
+# cooldown. deps-vet.yml then checks every version the pull request moves
+# (age, advisories, supply-chain signals) and prints one table to approve
+# from.
+#
+# Every directory with its own lockfile, Dockerfile or image list is named
+# here: a directory left out never gets an update, and the bump that did
+# reach the root lockfile leaves the other one behind (sha2 0.11 had to be
+# carried into fuzz/ by hand). vendor/ and ngsi-ld-test-suite/ are upstream
+# copies and follow their upstream.
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    # the workspace, the fuzz harness (own lockfile) and the standalone
+    # wasm-kpi demo crate
+    directories: ["/", "/fuzz", "/demo/hfp/kpi/wasm-kpi"]
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
-    cooldown: { default-days: 8 }
+    cooldown: { default-days: 7 }
     groups:
       cargo:
         update-types: [minor, patch]
 
   # Actions are pinned by tag (ADR-0018); this is what moves the tags.
+  # The one composite action (.github/actions/failure-issue) uses no other
+  # action, so the workflows directory is the whole list.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
-    cooldown: { default-days: 8 }
+    cooldown: { default-days: 7 }
     groups:
       actions:
         update-types: [minor, patch]
 
+  # Base images of the Dockerfiles and the images of the k8s manifests.
   - package-ecosystem: docker
-    directory: /
+    directories: ["/", "/compose-files/mosquitto", "/demo/hfp/ingester", "/deploy/k8s"]
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
-    cooldown: { default-days: 8 }
+    cooldown: { default-days: 7 }
+    groups:
+      images:
+        update-types: [minor, patch]
+
+  # The images the compose files start (databases, NATS, mosquitto,
+  # haproxy). Tags such as pg17 or 2-alpine follow upstream on purpose
+  # (ADR-0018); this proposes the next one when it exists.
+  - package-ecosystem: docker-compose
+    directories:
+      - /compose-files
+      - /demo/hfp
+      - /examples/federation
+      - /examples/quickstart
+      - /examples/subscriptions
+    schedule: { interval: weekly, day: monday }
+    commit-message: { prefix: deps }
+    cooldown: { default-days: 7 }
+    groups:
+      compose:
+        update-types: [minor, patch]
 
   - package-ecosystem: npm
     directory: /www
     schedule: { interval: weekly, day: monday }
     commit-message: { prefix: deps }
-    cooldown: { default-days: 8 }
+    cooldown: { default-days: 7 }
     groups:
       playground:
         update-types: [minor, patch]
