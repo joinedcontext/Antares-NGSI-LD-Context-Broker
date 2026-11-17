@@ -2402,6 +2402,36 @@ fn in_scope(reg: &FedReg, spec: &crate::registry::CsrSpec, ctx: &Context, c: &Va
 /// there and how large (threat V23). Such a `q` stays home: the
 /// local re-check applies it to the aggregate (5.7.2.4, 5.7.4.4), as it
 /// does for split entities.
+/// The `type` a forward asks a Context Source for: of the types the client
+/// selected only those the registration names, and the registration's own
+/// types when the client named none (4.3.6.1 "all constraints specified in
+/// the registration shall be respected"), so a source is not asked about
+/// types it did not register. A 4.17 selection with `|`, `;` or brackets,
+/// and a registration that admits every type, keep the client's selector.
+fn forward_types(reg: &FedReg, ctx: &Context, params: &HashMap<String, String>) -> Option<String> {
+    let asked = params.get("type");
+    if reg.ent_types.is_empty() {
+        return asked.cloned();
+    }
+    let Some(sel) = asked else {
+        let own: Vec<String> = reg.ent_types.iter().map(|t| ctx.compact_iri(t)).collect();
+        return Some(own.join(","));
+    };
+    if sel.contains(['|', ';', '(', ')', '*']) {
+        return Some(sel.clone());
+    }
+    let keep: Vec<&str> = sel
+        .split(',')
+        .map(str::trim)
+        .filter(|t| reg.ent_types.contains(&ctx.expand_key(t)))
+        .collect();
+    Some(if keep.is_empty() {
+        sel.clone()
+    } else {
+        keep.join(",")
+    })
+}
+
 // The peer is modelled with our own caps; a peer with smaller ones
 // can still refuse the conjunction. Forward only the caller's own q then.
 fn forwardable(k: &str, v: &str) -> bool {
@@ -2478,9 +2508,10 @@ pub async fn fed_query(
                 .map(String::to_owned)
         };
         let bounds = fed_read_bounds(st, params, push_filters);
+        let types = forward_types(&reg, ctx, params);
         let ((status, body, peer_warns), actx, more) = if op == "queryBatch" {
             let mut sel = Map::new();
-            if let Some(t) = params.get("type") {
+            if let Some(t) = &types {
                 sel.insert("type".into(), Value::String(t.clone()));
             }
             match &ids {
@@ -2547,7 +2578,7 @@ pub async fn fed_query(
             .await
         } else {
             let mut query: Vec<(String, String)> = vec![("options".into(), "sysAttrs".into())];
-            if let Some(t) = params.get("type") {
+            if let Some(t) = &types {
                 query.push(("type".into(), t.clone()));
             }
             // Table 6.4.3.2-1, and 5.2.33 for the body rendering below:
@@ -2656,10 +2687,10 @@ pub(crate) async fn fed_entity_maps(
     let held_back = &held_back;
     let fetched = fan_out(regs, move |reg| async move {
         let mut query: Vec<(String, String)> = Vec::new();
+        query.extend(forward_types(&reg, ctx, params).map(|t| ("type".into(), t)));
         for k in [
             "id",
             "idPattern",
-            "type",
             "timerel",
             "timeAt",
             "endTimeAt",
@@ -2823,7 +2854,8 @@ pub async fn fed_query_temporal(
         .collect();
     let fetched = fan_out(regs, move |reg| async move {
         let mut query = temporal_window(params);
-        for k in ["type", "id", "idPattern"] {
+        query.extend(forward_types(&reg, ctx, params).map(|t| ("type".into(), t)));
+        for k in ["id", "idPattern"] {
             if let Some(v) = params.get(k) {
                 query.push((k.into(), v.clone()));
             }
