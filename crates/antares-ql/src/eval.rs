@@ -421,20 +421,26 @@ fn push_target(kind: TargetKind, v: &Value, out: &mut Vec<(TargetKind, Value)>) 
 
 fn comparable_value(inst: &Value) -> Option<(TargetKind, &Value)> {
     let obj = inst.as_object()?;
-    for (k, kind) in [
-        ("value", TargetKind::Value),
-        ("object", TargetKind::Object),
-        ("languageMap", TargetKind::LanguageMap),
-        ("vocab", TargetKind::Vocab),
-        ("json", TargetKind::Json),
-        ("valueList", TargetKind::ValueList),
-        ("objectList", TargetKind::ObjectList),
-    ] {
-        if let Some(v) = obj.get(k) {
-            return Some((kind, v));
-        }
-    }
-    None
+    antares_jsonld::VALUE_MEMBERS.iter().find_map(|(k, _)| {
+        let v = obj.get(*k)?;
+        Some((target_kind(k)?, v))
+    })
+}
+
+/// What a value-defining member holds; `None` for a member this evaluator
+/// has no comparison for (`value_members_all_have_a_target_kind` keeps
+/// that empty).
+fn target_kind(member: &str) -> Option<TargetKind> {
+    Some(match member {
+        "value" => TargetKind::Value,
+        "object" => TargetKind::Object,
+        "languageMap" => TargetKind::LanguageMap,
+        "vocab" => TargetKind::Vocab,
+        "json" => TargetKind::Json,
+        "valueList" => TargetKind::ValueList,
+        "objectList" => TargetKind::ObjectList,
+        _ => return None,
+    })
 }
 
 /// Do target and Query Term value share a datatype? 4.9 hangs two opposite
@@ -629,6 +635,17 @@ mod clause_4_9_extensions {
     use crate::parse_q;
     use antares_jsonld::Context;
     use serde_json::json;
+
+    /// Every value-defining member antares-jsonld lists is one this
+    /// evaluator can compare: a new attribute type added there and not here
+    /// fails this, not a query that silently matches nothing.
+    #[test]
+    fn value_members_all_have_a_target_kind() {
+        for (m, _) in antares_jsonld::VALUE_MEMBERS {
+            assert!(target_kind(m).is_some(), "{m} has no target kind");
+        }
+        assert!(target_kind("unitCode").is_none());
+    }
 
     fn ctx() -> std::sync::Arc<Context> {
         crate::test_core()

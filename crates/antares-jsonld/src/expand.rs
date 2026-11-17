@@ -625,22 +625,27 @@ fn expand_attribute(
     }
 }
 
+/// The value-defining member of each attribute type (4.5.2.2) and the
+/// types that own it, in the order the 4.9 evaluator reads a target value
+/// (`value` first). The one list: expansion's prohibited-member check, the
+/// instance sniff, and antares-ql's SQL arms and evaluator all derive from
+/// it, so a new attribute type is added here once.
+pub const VALUE_MEMBERS: &[(&str, &[&str])] = &[
+    ("value", &["Property", "GeoProperty"]),
+    ("object", &["Relationship"]),
+    ("languageMap", &["LanguageProperty"]),
+    ("vocab", &["VocabProperty"]),
+    ("json", &["JsonProperty"]),
+    ("valueList", &["ListProperty"]),
+    ("objectList", &["ListRelationship"]),
+];
+
 fn looks_like_instance(v: &Value) -> bool {
     v.as_object().is_some_and(|o| {
         o.get("type")
             .and_then(Value::as_str)
             .is_some_and(|t| ATTR_TYPES.contains(&t))
-            || [
-                "value",
-                "object",
-                "languageMap",
-                "vocab",
-                "json",
-                "valueList",
-                "objectList",
-            ]
-            .iter()
-            .any(|k| o.contains_key(*k))
+            || VALUE_MEMBERS.iter().any(|(k, _)| o.contains_key(*k))
     })
 }
 
@@ -660,16 +665,7 @@ fn check_prohibited_members(
     out: &mut Map<String, Value>,
 ) -> Result<(), NgsiError> {
     let bad = NgsiError::BadRequestData;
-    const VALUE_OWNERS: &[(&str, &[&str])] = &[
-        ("value", &["Property", "GeoProperty"]),
-        ("object", &["Relationship"]),
-        ("languageMap", &["LanguageProperty"]),
-        ("json", &["JsonProperty"]),
-        ("vocab", &["VocabProperty"]),
-        ("valueList", &["ListProperty"]),
-        ("objectList", &["ListRelationship"]),
-    ];
-    for (m, owners) in VALUE_OWNERS {
+    for (m, owners) in VALUE_MEMBERS {
         if obj.contains_key(*m) && !owners.contains(&attr_type) {
             return Err(bad(format!(
                 "attribute {name}: {m} is not allowed on a {attr_type} (4.5.2.2)"

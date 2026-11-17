@@ -36,7 +36,7 @@ pub use expand::{
     expand_attr_fragment, expand_attr_name, expand_entity, expand_types, expanded_id,
     expanded_object, is_deletion_instance, is_ngsi_null, is_ngsi_null_langmap, is_ngsi_null_list,
     new_entity_id, parse_datetime, reject_first_level_nulls, removes_member, valid_name,
-    valid_scope_value, ExpandOpts, RESERVED_MEMBERS,
+    valid_scope_value, ExpandOpts, RESERVED_MEMBERS, VALUE_MEMBERS,
 };
 #[cfg(feature = "fetch")]
 pub use loader::{
