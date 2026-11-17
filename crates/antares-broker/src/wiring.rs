@@ -266,8 +266,8 @@ pub async fn wire_nats(
                     // compare-and-set on the revision read before the store: each
                     // write's sync is its own task with its own retries, and a
                     // document captured at write time, put late, overwrote a
-                    // newer write — in the KV every matcher pod replays after its
-                    // hydrate. A sync that loses the race re-reads both, so the
+                    // newer write in the KV every matcher pod watches. A sync
+                    // that loses the race re-reads both, so the
                     // last one to succeed carries the store's last write.
                     for attempt in 0..MIRROR_SYNC_ATTEMPTS {
                         let revision = match kv.entry(key.clone()).await {
@@ -591,30 +591,13 @@ pub async fn wire_nats(
                  matching falls back to a store scan per change"
             ),
         }
-        tokio::spawn(async move {
-            // Same restart contract as the registry consumer: the watch ends
-            // on a NATS restart, and a task that returns there stops seeing
-            // every subscription change — i.e. this pod silently stops
-            // notifying — for the process lifetime. `watch_all` replays the
-            // bucket's current values, so re-opening also re-converges the
-            // mirror over the gap.
-            let mut watch = watch;
-            loop {
-                while let Some(entry) = watch.next().await {
-                    let Ok(entry) = entry else { continue };
-                    if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&entry.value) {
-                        open_sub_delta(key.as_deref(), &mut v);
-                        apply_delta(sub_mirror.as_ref(), &v);
-                    }
-                }
-                tracing::warn!("subscription KV watch ended — reopening");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                match kv.watch_all().await {
-                    Ok(w) => watch = w,
-                    Err(e) => tracing::warn!("subscription KV watch reopen failed: {e}"),
-                }
-            }
-        });
+        tokio::spawn(watch_subscriptions(
+            kv,
+            watch,
+            sub_mirror,
+            state.store.clone(),
+            key,
+        ));
 
         // The balanced matcher durable: decode → process_change → ack AFTER,
         // with progress heartbeats for every message this pod holds while
@@ -872,6 +855,90 @@ async fn seal_kv_entries(
         }
     }
     sealed
+}
+
+/// The subscription KV watch: every entry into the mirror, for the process
+/// lifetime.
+///
+/// Same restart contract as the registry consumer: the watch ends on a NATS
+/// restart, and a task that returns there stops seeing every subscription
+/// change (this pod silently stops notifying) for the process lifetime. A
+/// reopened watch delivers only what is put after it opens (`watch_all`
+/// starts at the newest message, it replays nothing), so the gap is closed
+/// from the store once the new watch is open.
+async fn watch_subscriptions(
+    kv: nats::KvStore,
+    mut watch: nats::KvWatch,
+    mirror: Arc<antares_api::mirror::SubMirror>,
+    store: Arc<dyn antares_store::CurrentStateDriver>,
+    key: Option<Arc<SecretKey>>,
+) {
+    loop {
+        while let Some(entry) = watch.next().await {
+            let Ok(entry) = entry else { continue };
+            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&entry.value) {
+                open_sub_delta(key.as_deref(), &mut v);
+                apply_delta(mirror.as_ref(), &v);
+            }
+        }
+        tracing::warn!("subscription KV watch ended — reopening");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match kv.watch_all().await {
+            Ok(w) => {
+                watch = w;
+                if let Err(e) = resync_subscriptions(&*store, &mirror).await {
+                    tracing::error!(
+                        "subscription mirror re-read after a KV watch gap failed ({e}); \
+                         changes made during the gap reach this pod at its next restart"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("subscription KV watch reopen failed: {e}"),
+        }
+    }
+}
+
+/// Bring the subscription mirror back to the store's set after a gap in the
+/// KV watch, which may have swallowed creations, changes and deletions:
+/// every Subscription the store holds is applied where the mirror differs,
+/// and every one it no longer holds leaves the mirror. Called with the new
+/// watch already open, so a write after the store read still arrives as an
+/// entry. On an error the mirror stays as it was.
+async fn resync_subscriptions(
+    store: &dyn antares_store::CurrentStateDriver,
+    mirror: &antares_api::mirror::SubMirror,
+) -> Result<(), antares_model::NgsiError> {
+    use antares_api::mirror::Mirror;
+    let fresh = antares_api::mirror::DocMirror::default();
+    antares_api::notify::seed_mirror(store, &fresh, Kind::Subscription).await?;
+    let id_of = |d: &serde_json::Value| {
+        d.get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    for tenant in mirror.tenants() {
+        let kept: std::collections::HashSet<String> =
+            fresh.docs(&tenant).iter().filter_map(id_of).collect();
+        for doc in mirror.docs(&tenant) {
+            if let Some(id) = id_of(&doc).filter(|id| !kept.contains(id)) {
+                Mirror::apply(mirror, &tenant, &id, None);
+            }
+        }
+    }
+    for tenant in fresh.tenants() {
+        let held: std::collections::HashMap<String, Arc<serde_json::Value>> = mirror
+            .docs(&tenant)
+            .into_iter()
+            .filter_map(|d| id_of(&d).map(|id| (id, d)))
+            .collect();
+        for doc in fresh.docs(&tenant) {
+            let Some(id) = id_of(&doc) else { continue };
+            if held.get(&id).map(|d| d.as_ref()) != Some(&doc) {
+                Mirror::apply(mirror, &tenant, &id, Some(doc));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Re-seed the registration mirror after a gap in its deltas. The gap may
@@ -1633,8 +1700,8 @@ mod tests {
     /// The KV holds what the store holds. Each write's sync runs as its own
     /// task with its own retries, so one that lands late (a retried put, or
     /// a task scheduled after a newer write's) used to overwrite the newer
-    /// value with the document it captured — and the KV is what every
-    /// matcher pod replays, after its store hydrate, on every (re)start.
+    /// value with the document it captured, in the KV every matcher pod
+    /// watches.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_late_subscription_sync_never_overwrites_a_newer_write() {
         use antares_store::CurrentStateDriverExt;
@@ -1699,6 +1766,155 @@ mod tests {
             kv_v!().await,
             Some(2),
             "the KV went back to the document an older write captured"
+        );
+    }
+
+    /// A sync that gave up leaves its KV key holding an older document, or
+    /// a deleted Subscription's. A (re)started matcher pod hydrates from the
+    /// store, and its watch starts at the newest message: the stale entry is
+    /// not replayed over the hydrate, while what is put after the watch
+    /// opened arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_kv_entry_never_overrides_the_hydrate() {
+        let Some(url) = nats_url() else { return };
+        let st = AppState::new("antares".into());
+        let tenant = TenantId::new(&format!("kvreplay{}", std::process::id())).expect("tenant");
+        let doc = |id: &str, v: i64| {
+            json!({"id": id, "type": "Subscription", "v": v,
+                   "entities": [{"type": "https://x/T"}]})
+        };
+        let (kept, gone, late) = ("urn:sub:kept", "urn:sub:gone", "urn:sub:late");
+        st.store
+            .create(&tenant, Kind::Subscription, kept, doc(kept, 2))
+            .await
+            .expect("kept");
+        let bus = NatsBus::connect(&url).await.expect("connect");
+        let kv = bus.subs_kv().await.expect("kv");
+        let put = |id: &'static str, v: i64| {
+            let (kv, tenant) = (kv.clone(), tenant.clone());
+            async move {
+                let value = json!({"tenant": tenant.as_str(), "id": id,
+                                   "doc": doc(id, v), "csub": false});
+                kv.put(
+                    kv_key(tenant.as_str(), Kind::Subscription, id),
+                    serde_json::to_vec(&value).expect("json").into(),
+                )
+                .await
+                .expect("put");
+            }
+        };
+        // what syncs that gave up left: an older document, a deleted one
+        put(kept, 1).await;
+        put(gone, 1).await;
+
+        let mirror = Arc::new(antares_api::mirror::SubMirror::default());
+        let watch = kv.watch_all().await.expect("watch");
+        antares_api::notify::seed_mirror(&*st.store, mirror.as_ref(), Kind::Subscription)
+            .await
+            .expect("hydrate");
+        let watcher = tokio::spawn(watch_subscriptions(
+            kv.clone(),
+            watch,
+            mirror.clone(),
+            st.store.clone(),
+            None,
+        ));
+        put(late, 1).await;
+        let v_of = |id: &str| {
+            mirror
+                .docs(tenant.as_str())
+                .iter()
+                .find(|d| d["id"] == id)
+                .map(|d| d["v"].clone())
+        };
+        wait_until("the put after the watch opened", || {
+            let held = v_of(late).is_some();
+            async move { held }
+        })
+        .await;
+        watcher.abort();
+        assert_eq!(
+            v_of(kept),
+            Some(json!(2)),
+            "an older KV value replaced the hydrate"
+        );
+        assert_eq!(
+            v_of(gone),
+            None,
+            "a deleted Subscription came back from the KV"
+        );
+        for id in [kept, gone, late] {
+            let _ = kv
+                .purge(kv_key(tenant.as_str(), Kind::Subscription, id))
+                .await;
+        }
+    }
+
+    /// A reopened KV watch delivers nothing the gap dropped: the re-read
+    /// that follows it brings the mirror back to the store's set, the
+    /// creations, changes and deletions made while nothing watched included.
+    #[tokio::test]
+    async fn a_watch_gap_is_closed_from_the_store() {
+        use antares_store::CurrentStateDriverExt;
+        let st = AppState::new("antares".into());
+        let tenant = TenantId::new("watchgap").expect("tenant");
+        let doc = |id: &str, v: i64| {
+            json!({"id": id, "type": "Subscription", "v": v,
+                   "entities": [{"type": "https://x/T"}]})
+        };
+        for id in ["urn:sub:changed", "urn:sub:same"] {
+            st.store
+                .create(&tenant, Kind::Subscription, id, doc(id, 1))
+                .await
+                .expect("create");
+        }
+        let mirror = antares_api::mirror::SubMirror::default();
+        antares_api::notify::seed_mirror(&*st.store, &mirror, Kind::Subscription)
+            .await
+            .expect("hydrate");
+        mirror.apply(
+            tenant.as_str(),
+            "urn:sub:gone",
+            Some(doc("urn:sub:gone", 1)),
+        );
+        // the gap: one changed, one created, `gone` was deleted before it
+        st.store
+            .mutate::<(), ()>(&tenant, Kind::Subscription, "urn:sub:changed", |d| {
+                *d = doc("urn:sub:changed", 2);
+                Ok(())
+            })
+            .await
+            .expect("update");
+        st.store
+            .create(
+                &tenant,
+                Kind::Subscription,
+                "urn:sub:new",
+                doc("urn:sub:new", 1),
+            )
+            .await
+            .expect("create");
+        resync_subscriptions(&*st.store, &mirror)
+            .await
+            .expect("resync");
+        let mut held: Vec<(String, serde_json::Value)> = mirror
+            .docs(tenant.as_str())
+            .iter()
+            .map(|d| {
+                (
+                    d["id"].as_str().unwrap_or_default().to_owned(),
+                    d["v"].clone(),
+                )
+            })
+            .collect();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            held,
+            vec![
+                ("urn:sub:changed".to_owned(), json!(2)),
+                ("urn:sub:new".to_owned(), json!(1)),
+                ("urn:sub:same".to_owned(), json!(1)),
+            ]
         );
     }
 
