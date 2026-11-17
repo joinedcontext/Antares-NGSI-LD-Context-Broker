@@ -576,7 +576,7 @@ fn haversine((lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)) -> f64 {
 const SHORTEST: Duration = Duration::from_secs(60);
 const LONGEST: Duration = Duration::from_hours(87_600);
 
-/// A duration as ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or in short
+/// A duration as ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1W`, `P1DT12H`) or in short
 /// form (`90s`, `5m`, `8h`, `14d`), between one minute and ten years.
 ///
 /// # Errors
@@ -596,38 +596,12 @@ pub fn parse_duration_within(
     longest: Duration,
 ) -> Result<Duration, String> {
     let bad = || format!("{raw:?} is not a duration such as PT5M, PT8H, P30D, 5m, 8h or 14d");
-    let secs = if let Some(iso) = raw.strip_prefix('P') {
-        let (days, time) = match iso.split_once('T') {
-            Some((d, t)) if !t.is_empty() => (d, Some(t)),
-            Some(_) => return Err(bad()),
-            None => (iso, None),
-        };
-        let mut total = 0u64;
-        if !days.is_empty() {
-            total = days
-                .strip_suffix('D')
-                .and_then(|n| n.parse::<u64>().ok())
-                .ok_or_else(bad)?
-                .checked_mul(86_400)
-                .ok_or_else(bad)?;
-        } else if time.is_none() {
-            return Err(bad());
-        }
-        let mut rest = time.unwrap_or_default();
-        for (unit, scale) in [('H', 3600u64), ('M', 60), ('S', 1)] {
-            if let Some((n, tail)) = rest.split_once(unit) {
-                let n = n.parse::<u64>().map_err(|_| bad())?;
-                total = n
-                    .checked_mul(scale)
-                    .and_then(|n| total.checked_add(n))
-                    .ok_or_else(bad)?;
-                rest = tail;
-            }
-        }
-        if !rest.is_empty() {
-            return Err(bad());
-        }
-        total
+    // the ISO 8601 grammar every other duration of the broker reads
+    // (entityMapLifetime, refreshRate): a year 365 days, a month 30
+    let secs = if raw.starts_with('P') {
+        crate::entity_map::iso8601_secs(raw)
+            .and_then(|s| u64::try_from(s).ok())
+            .ok_or_else(bad)?
     } else {
         let split = raw.len().checked_sub(1).ok_or_else(bad)?;
         let (n, unit) = (

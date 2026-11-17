@@ -46,6 +46,9 @@ fn a_duration_is_read_in_both_forms_within_its_bounds() {
         ("PT1H30M", 5400),
         ("P1DT12H", 129_600),
         ("PT90S", 90),
+        // the grammar of every other ISO 8601 duration the broker reads
+        ("P1W", 604_800),
+        ("P1M", 2_592_000),
         ("90s", 90),
         ("5m", 300),
         ("8h", 28_800),
@@ -54,7 +57,7 @@ fn a_duration_is_read_in_both_forms_within_its_bounds() {
         assert_eq!(parse_duration(raw), Ok(Duration::from_secs(secs)), "{raw}");
     }
     for bad in [
-        "", "P", "PT", "P1DT", "P1W", "PTxM", "PT5M3", "5", "5w", "xm", "PT5S",
+        "", "P", "PT", "P1DT", "PT1.5H", "PTxM", "PT5M3", "5", "5w", "xm", "PT5S",
     ] {
         assert!(
             parse_duration(bad).is_err(),
