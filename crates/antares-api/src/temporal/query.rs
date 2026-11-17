@@ -160,20 +160,11 @@ fn show_ids(params: &mut HashMap<String, String>) {
 /// both: split here on `,` alone, `pick=id|speed` was one term, gained a
 /// second `id` and was refused as a duplicate member.
 fn top_level_terms(projection: &str) -> Vec<&str> {
-    let (mut terms, mut depth, mut start) = (Vec::new(), 0usize, 0usize);
-    for (i, c) in projection.char_indices() {
-        match c {
-            '{' => depth = depth.saturating_add(1),
-            '}' => depth = depth.saturating_sub(1),
-            ',' | '|' if depth == 0 => {
-                terms.push(projection.get(start..i).unwrap_or_default().trim());
-                start = i.saturating_add(1);
-            }
-            _ => {}
-        }
-    }
-    terms.push(projection.get(start..).unwrap_or_default().trim());
-    terms
+    crate::repr::split_top(projection)
+        .unwrap_or_else(|| vec![projection])
+        .into_iter()
+        .map(str::trim)
+        .collect()
 }
 
 /// The request's headers with the answer asked for as plain JSON, whose
