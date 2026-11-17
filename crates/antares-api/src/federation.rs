@@ -2156,6 +2156,7 @@ pub async fn fed_retrieve(
                     proxy: true,
                     update: None,
                     conflict: false,
+                    kind: None,
                 });
             }
             continue;
@@ -2821,6 +2822,9 @@ pub struct Part {
     /// An exclusive registration refused the operation ([`conflict_part`]): a 409 Conflict, not
     /// AlreadyExists.
     pub conflict: bool,
+    /// The error type of a local part that failed with an error of its own
+    /// ([`Part::local_error`]).
+    pub kind: Option<&'static str>,
 }
 
 /// 5.2.18 UpdateResult a source answered for a forwarded attribute write.
@@ -2837,6 +2841,15 @@ impl Part {
         Part {
             status,
             detail: detail.into(),
+            ..Part::default()
+        }
+    }
+    /// A local part that failed with `e`: its own status, type and detail.
+    pub fn local_error(e: &NgsiError) -> Self {
+        Part {
+            status: e.status(),
+            detail: e.to_string(),
+            kind: Some(e.kind()),
             ..Part::default()
         }
     }
@@ -2867,6 +2880,9 @@ impl Part {
     /// an unsupported-operation part is the Conflict error type; an
     /// entity-exists part stays AlreadyExists.
     fn problem(&self, status: u16) -> (&'static str, &'static str) {
+        if let (Some(kind), true) = (self.kind, status == self.status) {
+            return (kind, kind);
+        }
         match status {
             409 if self.conflict => ("Conflict", "Conflict"),
             409 => ("AlreadyExists", "Conflict"),
@@ -3186,6 +3202,7 @@ pub async fn forward_part(
         proxy: reg.is_proxy(),
         update: (status == 207).then(|| remote_update(&answer)).flatten(),
         conflict: false,
+        kind: None,
     }
 }
 
@@ -3308,6 +3325,7 @@ pub fn conflict_part(op: &str, reg: &FedReg) -> Part {
         proxy: true,
         update: None,
         conflict: true,
+        kind: None,
     }
 }
 
