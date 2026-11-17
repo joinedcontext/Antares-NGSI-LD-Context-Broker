@@ -345,6 +345,11 @@ def write(results, baseline_path):
     run = read_run(results)
     if not run:
         sys.exit(f"{results}/tp-status.csv: no TPs")
+    # a baseline names every failing TP: one from a run with a robot that
+    # died would pass those TPs off as green
+    broken = incomplete_runs(results)
+    if broken:
+        sys.exit(f"{results}: no output.xml for {', '.join(broken)} — not a whole run")
     failing = sorted(tp for tp, e in run.items() if e["status"] != "PASS")
     cell = os.path.splitext(os.path.basename(baseline_path))[0]
     lines = [
@@ -681,6 +686,14 @@ def selftest():
         )
         header, entries, errors = read_baseline(out)
         assert not errors and header["commit"] == b, (header, errors)
+        (r / "Broken-console.log").write_text("robot died\n")
+        refused = subprocess.run(
+            [*me, "write", str(r), str(tmp / "never.txt")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert refused.returncode != 0 and not (tmp / "never.txt").exists(), refused
         assert entries == {
             "001_02": ("our-bug", "notify order"),
             "003_01": ("our-bug", "unclassified"),
