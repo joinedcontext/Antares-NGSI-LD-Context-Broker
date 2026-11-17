@@ -1727,3 +1727,40 @@ async fn a_listing_judges_expiry_at_the_callers_instant() {
     assert_eq!(s.list_slice(&t, 0, 10, after).await.expect("slice").1, 0);
     let _ = s.delete(&t, id).await;
 }
+
+/// 4.22 with `q=!location`: an Entity whose only `location` instance has
+/// expired has no location to a read, and the store keeps it, although the
+/// stored geometry column is set until the prune rewrites the row.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_location_instance_counts_as_no_location() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgunlocatedexpired").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let loc = "https://uri.etsi.org/ngsi-ld/location";
+    let id = "urn:ngsi-ld:T:unlocatedexpired";
+    let _ = s.delete(&t, id).await;
+    let doc = json!({"id": id, "type": ["https://e.org/T"],
+        "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+        loc: [{"type": "GeoProperty", "value": {"type": "Point", "coordinates": [1.0, 2.0]},
+               "expiresAt": "2020-01-01T00:00:00Z"}]});
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+    let ast = antares_ql::parse_q("!location").expect("q");
+    let expand = |term: &str| {
+        if term == "location" {
+            loc.to_owned()
+        } else {
+            format!("https://uri.etsi.org/ngsi-ld/default-context/{term}")
+        }
+    };
+    let f = pg::entity::EntityFilter {
+        q: Some(&ast),
+        expand: &expand,
+        ..Default::default()
+    };
+    let out = s.query(&t, &f).await.expect("query");
+    let ids: Vec<&str> = out.rows.iter().filter_map(|d| d["id"].as_str()).collect();
+    assert_eq!(ids, [id], "decided={}", out.decided);
+    let _ = s.delete(&t, id).await;
+}
