@@ -65,26 +65,15 @@ fn context_base(configured: Option<&str>, headers: &HeaderMap) -> String {
     )
 }
 
-/// Validate the `details` query param: absent | true | false (053_05 sends
-/// `True`); anything else is 400 (052_04_02).
-fn details_param(params: &HashMap<String, String>) -> Result<bool, NgsiError> {
-    match params.get("details").map(|s| s.to_ascii_lowercase()) {
+/// Validate a boolean query param (`details`, `reload`): absent | true |
+/// false, any case (053_05 sends `True`); anything else is 400 (052_04_02).
+fn bool_param(params: &HashMap<String, String>, name: &str) -> Result<bool, NgsiError> {
+    match params.get(name).map(|s| s.to_ascii_lowercase()) {
         None => Ok(false),
         Some(v) if v == "true" => Ok(true),
         Some(v) if v == "false" => Ok(false),
         Some(v) => Err(NgsiError::BadRequestData(format!(
-            "invalid details value {v:?}"
-        ))),
-    }
-}
-
-fn reload_param(params: &HashMap<String, String>) -> Result<bool, NgsiError> {
-    match params.get("reload").map(|s| s.to_ascii_lowercase()) {
-        None => Ok(false),
-        Some(v) if v == "true" => Ok(true),
-        Some(v) if v == "false" => Ok(false),
-        Some(v) => Err(NgsiError::BadRequestData(format!(
-            "invalid reload value {v:?}"
+            "invalid {name} value {v:?}"
         ))),
     }
 }
@@ -327,8 +316,7 @@ async fn find_entry(st: &AppState, tenant: &TenantId, id: &str) -> ApiResult<Opt
 /// name (a view showing every name hides no term, rule 12), and not to
 /// a caller the engine narrows (`policy::NAME_READS`), since one may define a
 /// term for an Attribute that caller may not see.
-fn shows_stored(st: &AppState, narrowing: &crate::policy::Filter) -> bool {
-    let _ = st;
+fn shows_stored(narrowing: &crate::policy::Filter) -> bool {
     narrowing.is_empty()
 }
 
@@ -428,7 +416,7 @@ pub async fn list_contexts(
         check_params(&params, &["kind", "details", "local"])?;
         let narrowing = gate!(st, &tenant, &headers, "5.13.3").await?;
 
-        let details = details_param(&params)?;
+        let details = bool_param(&params, "details")?;
         let kind_filter = params.get("kind");
         if let Some(k) = kind_filter {
             if !["Hosted", "Cached", "ImplicitlyCreated"].contains(&k.as_str()) {
@@ -448,7 +436,7 @@ pub async fn list_contexts(
         // a term for an Attribute a view hides, so through a view that hides
         // a name the list is the core @context alone (the pinned entries
         // below). The same for a caller the engine narrows.
-        let stored = if !shows_stored(&st, &narrowing) {
+        let stored = if !shows_stored(&narrowing) {
             Vec::new()
         } else {
             st.store.context_list_meta(Some(&tenant)).await?
@@ -541,7 +529,7 @@ pub async fn serve_context(
         let tenant = tenant_from(&headers)?;
         check_params(&params, &["details", "local", "core"])?;
         let narrowing = gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
-        let details = details_param(&params)?;
+        let details = bool_param(&params, "details")?;
         // TS 104 175 13.4.4: `core` with `details` is a BadRequest, and so is
         // a `core` that names no NGSI-LD version this build has a core for
         let core = match params.get("core") {
@@ -556,7 +544,7 @@ pub async fn serve_context(
         let entry = match find_entry(&st, &tenant, &id).await? {
             // a stored @context the list hides from this caller is as absent
             // here, under a view and under a narrowing engine
-            Some(CtxEntry::Stored(_)) if !shows_stored(&st, &narrowing) => None,
+            Some(CtxEntry::Stored(_)) if !shows_stored(&narrowing) => None,
             entry => entry,
         }
         .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
@@ -662,7 +650,7 @@ pub async fn delete_context(
         check_params(&params, &["reload", "local"])?;
         gate!(st, &tenant, &headers, "5.13.5", ids: &[&id]).await?;
 
-        let reload = reload_param(&params)?;
+        let reload = bool_param(&params, "reload")?;
         // an unknown id is 404 before any reload bullet (5.13.5.4, 051_04_01)
         let Some(entry) = find_entry(&st, &tenant, &id).await? else {
             return Err(NgsiError::ResourceNotFound(format!("@context {id} not found")).into());
