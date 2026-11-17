@@ -818,11 +818,11 @@ fn ngsi_of(e: ApiError) -> NgsiError {
         ApiError::Overloaded(_) => {
             NgsiError::InternalError(antares_model::error::DB_OVERLOADED.into())
         }
-        // The policy gate runs once per request, before the array is
-        // touched, so a refusal is the whole array's 403 and never one
-        // entry's — this arm is exhaustiveness, not a path. If a per-item
-        // gate is ever added, 422 is the nearest thing Table 6.3.2-1 has:
-        // the entry was refused, and the reason travels with it.
+        // The policy gate decides each member before the array is touched
+        // (BatchRun::decide) and reports a refused one with the AccessDenied
+        // problem itself, so no item error reaches here as Denied — this arm
+        // is exhaustiveness, not a path. 422 is the nearest thing Table
+        // 6.3.2-1 has: the entry was refused, and the reason travels with it.
         ApiError::Denied(why) => NgsiError::OperationNotSupported(why),
     }
 }

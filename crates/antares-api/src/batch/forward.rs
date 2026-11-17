@@ -454,7 +454,7 @@ impl BatchFwd {
             created: true,
         }
     }
-    /// 5.6.4 Replace Entity.
+    /// 5.6.18 Replace Entity.
     fn replace() -> Self {
         Self {
             path: FwdPath::Entity,
