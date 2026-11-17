@@ -23,6 +23,8 @@ use crate::{subjects, ChangeEvent};
 pub use async_nats::jetstream::consumer::PullConsumer;
 /// The handle [`NatsBus::subs_kv`] answers.
 pub use async_nats::jetstream::kv::Store as KvStore;
+/// The stream [`KvStore::watch_all`] answers.
+pub use async_nats::jetstream::kv::Watch as KvWatch;
 use async_nats::jetstream::{self, consumer, stream};
 use futures_util::StreamExt;
 
