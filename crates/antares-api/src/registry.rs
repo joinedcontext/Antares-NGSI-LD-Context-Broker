@@ -329,10 +329,19 @@ pub fn matching_infos<'a>(spec: &CsrSpec, doc: &'a Value, ctx: &Context) -> Vec<
 /// 5.10.2.4: the context source filter (csf, 4.9) evaluates over the
 /// registration document's own Context Source Properties — its members are
 /// wrapped as Property instances so the shared 4.9 evaluator applies.
+/// It reads the Registration as a reader is answered it
+/// ([`mask_registration`]): a filter cannot tell apart what a read masks.
 pub(crate) fn csf_matches(csf: &antares_ql::QNode, reg: &Value, ctx: &Context) -> bool {
     let Some(obj) = reg.as_object() else {
         return false;
     };
+    let mut shown = Value::Object(
+        ["endpoint", "contextSourceInfo"]
+            .into_iter()
+            .filter_map(|k| Some((k.to_owned(), obj.get(k)?.clone())))
+            .collect(),
+    );
+    mask_registration(&mut shown);
     let mut pseudo = Map::new();
     pseudo.insert("id".into(), obj.get("id").cloned().unwrap_or(Value::Null));
     pseudo.insert(
@@ -347,6 +356,7 @@ pub(crate) fn csf_matches(csf: &antares_ql::QNode, reg: &Value, ctx: &Context) -
         {
             continue;
         }
+        let v = shown.get(k).unwrap_or(v);
         // a Context Source Property stored in attribute form (5.2.9) is an
         // instance already — only bare scalars need the Property wrap
         let inst = match v {
@@ -609,6 +619,48 @@ mod tests {
         }
         let named = antares_ql::parse_q("n").unwrap_or_else(|e| panic!("{e}"));
         assert!(csf_matches(&named, &reg, &ctx), "a property still matches");
+    }
+
+    /// A csf reads a Registration as a read answers it: the endpoint's
+    /// userinfo and the unprocessed `contextSourceInfo` values are masked,
+    /// so no filter tells two Registrations apart by them. The endpoint's
+    /// host and path and a processed key still match.
+    #[test]
+    fn csf_reads_the_masked_credentials_only() {
+        let ctx = Loader::new().core();
+        let reg = |user: &str, token: &str| {
+            json!({
+                "id": "urn:ngsi-ld:ContextSourceRegistration:m",
+                "type": "ContextSourceRegistration",
+                "information": [{"entities": [{"type": "Car"}]}],
+                "endpoint": format!("http://{user}:pw@a.example.com/ld"),
+                "contextSourceInfo": [
+                    {"key": "Authorization", "value": token},
+                    {"key": "jsonldContext", "value": "http://ctx.example.com/c.jsonld"}
+                ]
+            })
+        };
+        let (alice, bob) = (reg("alice", "Bearer a1"), reg("bob", "Bearer b2"));
+        for q in [
+            "endpoint~=\"alice\"",
+            "endpoint~=\"^http://a\"",
+            "contextSourceInfo~=\"a1\"",
+            "contextSourceInfo==\"Bearer a1\"",
+        ] {
+            let csf = antares_ql::parse_q(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert_eq!(
+                csf_matches(&csf, &alice, &ctx),
+                csf_matches(&csf, &bob, &ctx),
+                "{q} tells the credentials apart"
+            );
+        }
+        for q in [
+            "endpoint~=\"a\\.example\\.com/ld$\"",
+            "contextSourceInfo==\"http://ctx.example.com/c.jsonld\"",
+        ] {
+            let csf = antares_ql::parse_q(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(csf_matches(&csf, &alice, &ctx), "{q}");
+        }
     }
 
     #[test]
