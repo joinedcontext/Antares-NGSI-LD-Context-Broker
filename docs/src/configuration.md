@@ -105,6 +105,15 @@ here).
 | `ANTARES_TELEMETRY` | off | Any value but an off spelling enables the metrics recorder and, with the endpoint, the OTLP span and log pipelines. |
 | `ANTARES_OTLP_ENDPOINT` | unset | OTLP/HTTP collector for traces and logs, e.g. `http://collector:4318/v1/traces`; log records go to the `v1/logs` twin of that URL with the same resource attributes. Unset costs nothing. |
 
+The request and delivery caps above (`ANTARES_MAX_BODY_BYTES`,
+`ANTARES_MAX_BATCH_ITEMS`, `ANTARES_MAX_LIMIT`, `ANTARES_DEFAULT_LIMIT`,
+`ANTARES_TEMPORAL_INSTANCE_LIMIT`, `ANTARES_TEMPORAL_DEFAULT_INSTANCES`,
+`ANTARES_MAX_FED_RESPONSE_BYTES`, `ANTARES_FED_INFLIGHT`, `ANTARES_FED_FANOUT`,
+`ANTARES_DISCOVERY_SCAN_MAX`, `ANTARES_DELIVERY_LANE_BYTES`,
+`ANTARES_BATCH_INFLIGHT_BYTES`, `ANTARES_BATCH_INFLIGHT`,
+`ANTARES_DELIVERY_WIDTH`, `ANTARES_DELIVERY_WIDTH_PER_TENANT`) are positive
+integers: any other value (`4MB`, `0`) is fatal at startup.
+
 Compile-time bounds (no variable sets them; spec-shaped rejections): URI
 8 KiB → 414, JSON depth 64 → 400. The body cap is `ANTARES_MAX_BODY_BYTES`
 above. Every bound in force is reported live by `GET /q/health` under

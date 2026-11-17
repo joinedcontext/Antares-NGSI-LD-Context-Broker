@@ -18,13 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// → bare 413 (6.3.4). Deployment knob (ANTARES_MAX_BODY_BYTES): the spec
 /// names no ceiling; 4 MiB is the DoS bound, raised where a trusted
 /// producer legitimately sends bigger batches. Read once at first use.
-pub static MAX_BODY_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(4 * 1024 * 1024)
-});
+pub static MAX_BODY_BYTES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_MAX_BODY_BYTES", 4 * 1024 * 1024, usize::MAX));
 pub const MAX_URI_BYTES: usize = 8 * 1024; // → bare 414
 pub const MAX_JSON_DEPTH: usize = 64; // → 400 BadRequestData
 /// → 403 TooManyResults (5.5.6) on the NGSI-LD API, 413 on a surface
@@ -48,34 +43,18 @@ pub use antares_ql::geo::MAX_GEO_VERTICES;
 /// spec sets no batch ceiling — 1000 is this broker's DoS-bounds default,
 /// raised where a trusted producer legitimately batches larger (e.g. a
 /// full-fleet upsert). Read once at first use.
-pub static MAX_BATCH_ITEMS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_MAX_BATCH_ITEMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1_000)
-});
+pub static MAX_BATCH_ITEMS: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_MAX_BATCH_ITEMS", 1_000, usize::MAX));
 /// Deployment knob (ANTARES_MAX_LIMIT): the most Entities one query page
 /// answers (`limit`, 6.3.9; past it 403 TooManyResults). 1,000 unless set;
 /// read once at first use.
-pub static MAX_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_MAX_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1_000)
-});
+pub static MAX_LIMIT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_MAX_LIMIT", 1_000, usize::MAX));
 /// Deployment knob (ANTARES_DEFAULT_LIMIT): the Entities a query page answers
 /// when the request names no `limit` (6.3.9 leaves it to the broker); the
 /// next page is Linked. 100 unless set, never above [`MAX_LIMIT`].
-pub static DEFAULT_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_DEFAULT_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(100)
-        .min(*MAX_LIMIT)
-});
+pub static DEFAULT_LIMIT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_DEFAULT_LIMIT", 100, *MAX_LIMIT));
 /// Deployment knob (ANTARES_TEMPORAL_INSTANCE_LIMIT): NGSI-LD 6.3.10, the
 /// most instances of one Attribute a temporal response serves; past it the
 /// representation is cut and answered 206 with a Content-Range. 1,000 unless
@@ -84,13 +63,8 @@ pub static DEFAULT_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(
 /// answer stays bounded by [`MAX_ANSWER_BYTES`]. Read once at first use into
 /// `AppState::temporal_instance_limit`, which a test or the wasm broker
 /// (no process env; it reads `globalThis`) sets per state.
-pub static TEMPORAL_INSTANCE_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_TEMPORAL_INSTANCE_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1_000)
-});
+pub static TEMPORAL_INSTANCE_LIMIT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_TEMPORAL_INSTANCE_LIMIT", 1_000, usize::MAX));
 
 /// [`TEMPORAL_INSTANCE_LIMIT`].
 pub fn temporal_instance_limit() -> usize {
@@ -105,12 +79,11 @@ pub fn temporal_instance_limit() -> usize {
 /// `AppState::temporal_default_instances`.
 pub static TEMPORAL_DEFAULT_INSTANCES: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| {
-        std::env::var("ANTARES_TEMPORAL_DEFAULT_INSTANCES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(100)
-            .min(temporal_instance_limit())
+        env_count(
+            "ANTARES_TEMPORAL_DEFAULT_INSTANCES",
+            100,
+            temporal_instance_limit(),
+        )
     });
 
 /// [`TEMPORAL_DEFAULT_INSTANCES`].
@@ -123,35 +96,30 @@ pub fn temporal_default_instances() -> usize {
 // ballooning broker memory — one misbehaving peer must not break the
 // 500 MB RSS budget. Read once at first use.
 pub static MAX_FED_RESPONSE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_MAX_FED_RESPONSE_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(16 * 1024 * 1024)
+    env_count(
+        "ANTARES_MAX_FED_RESPONSE_BYTES",
+        16 * 1024 * 1024,
+        usize::MAX,
+    )
 });
 // Deployment knob (ANTARES_FED_INFLIGHT): forwarded requests in flight for
 // the whole process. Per-request fan-out is bounded below; across requests
 // nothing was, and 6 000 open federated queries × 34 sources each held
 // 7.7 GB of buffers and connections. Callers over the cap wait their turn.
 pub static MAX_FED_INFLIGHT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_FED_INFLIGHT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(256)
+    env_count(
+        "ANTARES_FED_INFLIGHT",
+        256,
+        tokio::sync::Semaphore::MAX_PERMITS,
+    )
 });
 pub static FED_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*MAX_FED_INFLIGHT));
 // Deployment knob (ANTARES_FED_FANOUT): concurrent forwards per distributed
 // read. 4.3.6.1 orders the MERGE (4.5.5), never the requests, so forwards
 // run concurrently; this bounds how many at once per request.
-pub static MAX_FED_FANOUT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_FED_FANOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(8)
-});
+pub static MAX_FED_FANOUT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_FED_FANOUT", 8, usize::MAX));
 /// 6.3.17: `NGSILD-Warning` values relayed from ONE Context Source. The
 /// clause makes a peer's warnings part of this broker's answer (4.3.6.4 puts
 /// a deeper hop's abnormality on the response that survived it), so the list
@@ -200,13 +168,8 @@ pub use antares_ql::MAX_Q_NODES;
 /// and pages second, so the page cannot be pushed down). Without it one
 /// request over a tenant at the 100 000-registration target holds every match
 /// at once. Read once at first use.
-pub static MAX_FOLD_DOCS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::env::var("ANTARES_DISCOVERY_SCAN_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(100_000)
-});
+pub static MAX_FOLD_DOCS: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_DISCOVERY_SCAN_MAX", 100_000, usize::MAX));
 
 /// The ceilings on the notification pipeline. Not input bounds: no request
 /// names them and none is rejected against them. They are published beside
@@ -236,11 +199,7 @@ pub const DELIVERY_LANE: usize = 64;
 /// leaves room for a running batch, which costs as much again.
 /// Deployment knob (ANTARES_DELIVERY_LANE_BYTES), read once at first use.
 pub static DELIVERY_LANE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    count_from(
-        std::env::var("ANTARES_DELIVERY_LANE_BYTES").ok().as_deref(),
-        128 * 1024 * 1024,
-        usize::MAX,
-    )
+    env_count("ANTARES_DELIVERY_LANE_BYTES", 128 * 1024 * 1024, usize::MAX)
 });
 /// Batch write bodies in flight at once, in bytes. One batch costs about a
 /// hundred times its body while it runs: the parsed items, their expansion
@@ -253,10 +212,8 @@ pub static DELIVERY_LANE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock
 /// always admitted alone, however large. Deployment knob
 /// (ANTARES_BATCH_INFLIGHT_BYTES), read once at first use.
 pub static BATCH_INFLIGHT_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    count_from(
-        std::env::var("ANTARES_BATCH_INFLIGHT_BYTES")
-            .ok()
-            .as_deref(),
+    env_count(
+        "ANTARES_BATCH_INFLIGHT_BYTES",
         4 * 1024 * 1024,
         u32::MAX as usize,
     )
@@ -275,13 +232,8 @@ static BATCH_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// minutes held all 20 of a broker's and a visitor's read waited 4 s for
 /// one. Deployment knob (ANTARES_BATCH_INFLIGHT), read once at first
 /// use; keep it under `ANTARES_PG_POOL`.
-pub static BATCH_INFLIGHT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    count_from(
-        std::env::var("ANTARES_BATCH_INFLIGHT").ok().as_deref(),
-        8,
-        u32::MAX as usize,
-    )
-});
+pub static BATCH_INFLIGHT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_BATCH_INFLIGHT", 8, u32::MAX as usize));
 static BATCH_RUNNING: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*BATCH_INFLIGHT));
 
@@ -366,13 +318,8 @@ async fn admit(
 /// fleet of remote endpoints sitting at their 30 s timeout (Table 5.2.15-1)
 /// are served by different numbers, and the one that fits is measured
 /// against a deployment rather than compiled in. Read once at first use.
-pub static DELIVERY_WIDTH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    count_from(
-        std::env::var("ANTARES_DELIVERY_WIDTH").ok().as_deref(),
-        64,
-        usize::MAX,
-    )
-});
+pub static DELIVERY_WIDTH: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_DELIVERY_WIDTH", 64, usize::MAX));
 /// Of that width, what one tenant may hold. A Subscription belongs to one
 /// tenant (5.2.12), and a delivery to an endpoint that accepts and never
 /// answers holds its slot for the endpoint's whole timeout — up to 30 s
@@ -386,15 +333,52 @@ pub static DELIVERY_WIDTH: std::sync::LazyLock<usize> = std::sync::LazyLock::new
 /// width above: a share larger than the width is not a share, and
 /// publishing one would name a ceiling that can never fire. Read once at
 /// first use.
-pub static DELIVERY_WIDTH_PER_TENANT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    count_from(
-        std::env::var("ANTARES_DELIVERY_WIDTH_PER_TENANT")
-            .ok()
-            .as_deref(),
-        8,
-        *DELIVERY_WIDTH,
-    )
-});
+pub static DELIVERY_WIDTH_PER_TENANT: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| env_count("ANTARES_DELIVERY_WIDTH_PER_TENANT", 8, *DELIVERY_WIDTH));
+
+/// The counts the caps above read from the environment. Each is a positive
+/// integer; [`check_counts`] refuses anything else at startup.
+pub const COUNT_KEYS: &[&str] = &[
+    "ANTARES_MAX_BODY_BYTES",
+    "ANTARES_MAX_BATCH_ITEMS",
+    "ANTARES_MAX_LIMIT",
+    "ANTARES_DEFAULT_LIMIT",
+    "ANTARES_TEMPORAL_INSTANCE_LIMIT",
+    "ANTARES_TEMPORAL_DEFAULT_INSTANCES",
+    "ANTARES_MAX_FED_RESPONSE_BYTES",
+    "ANTARES_FED_INFLIGHT",
+    "ANTARES_FED_FANOUT",
+    "ANTARES_DISCOVERY_SCAN_MAX",
+    "ANTARES_DELIVERY_LANE_BYTES",
+    "ANTARES_BATCH_INFLIGHT_BYTES",
+    "ANTARES_BATCH_INFLIGHT",
+    "ANTARES_DELIVERY_WIDTH",
+    "ANTARES_DELIVERY_WIDTH_PER_TENANT",
+];
+
+/// Every [`COUNT_KEYS`] value the process environment sets is a positive
+/// integer. The caps read their key lazily and fall back to the default on
+/// anything else, so a typo (`4MB`) would run silently at the default; the
+/// broker calls this before it serves, and a malformed value fails startup.
+pub fn check_counts() -> Result<(), String> {
+    check_counts_in(|k| std::env::var(k).ok())
+}
+
+fn check_counts_in(get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    for key in COUNT_KEYS {
+        if let Some(v) = get(key) {
+            if !v.parse::<usize>().is_ok_and(|n| n > 0) {
+                return Err(format!("{key} must be a positive integer, got {v:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`count_from`] over the process environment.
+fn env_count(key: &str, default: usize, ceiling: usize) -> usize {
+    count_from(std::env::var(key).ok().as_deref(), default, ceiling)
+}
 
 /// One configured count: the default stands in for anything unset,
 /// unparseable or zero — a zero would mint a semaphore that admits nobody
@@ -910,6 +894,22 @@ mod tests {
             4,
             "the ceiling binds the default too"
         );
+    }
+
+    /// A malformed count fails startup instead of running at the default:
+    /// every cap key is checked, unset keys pass.
+    #[test]
+    fn a_malformed_count_is_refused_at_startup() {
+        let with =
+            |key: &'static str, v: &'static str| move |k: &str| (k == key).then(|| v.to_owned());
+        assert!(check_counts_in(|_| None).is_ok(), "unset keys pass");
+        assert!(check_counts_in(with("ANTARES_MAX_LIMIT", "500")).is_ok());
+        for key in COUNT_KEYS {
+            for bad in ["4MB", "0", "-1", ""] {
+                let e = check_counts_in(with(key, bad)).expect_err("refused");
+                assert!(e.contains(key), "{e}");
+            }
+        }
     }
 
     /// A guard on the compiled defaults rather than on the clamp: both

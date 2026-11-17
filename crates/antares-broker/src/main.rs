@@ -412,6 +412,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sweep_secs = parse_sweep_secs(std::env::var("ANTARES_SWEEP_SECS").ok().as_deref())?;
     // Same: validated here, read again where the state is built.
     antares_api::DeliveryPolicy::from_env()?;
+    // The request and delivery caps are read lazily at first use, where a
+    // malformed value could only fall back to the default.
+    antares_api::bounds::check_counts()?;
     let drain_delay = shutdown::drain_delay()?;
     let drain_deadline = shutdown::drain_deadline()?;
     // Validated here so a typo fails startup; the value itself is read again
