@@ -1170,6 +1170,29 @@ pub(crate) async fn forward_in(
     ctx_url: &str,
     body: Option<Value>,
 ) -> (ForwardAnswer, Option<std::sync::Arc<Context>>) {
+    let (answer, answered_in, _) =
+        forward_counted(st, method, url, query, headers, tenant, reg, ctx_url, body).await;
+    (answer, answered_in)
+}
+
+/// [`forward_in`], and the `NGSILD-Results-Count` (6.3.13) the source
+/// answered, when it answered one over HTTP.
+#[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
+async fn forward_counted(
+    st: &AppState,
+    method: reqwest::Method,
+    url: String,
+    query: &[(String, String)],
+    headers: &HeaderMap,
+    tenant: &TenantId,
+    reg: &FedReg,
+    ctx_url: &str,
+    body: Option<Value>,
+) -> (
+    ForwardAnswer,
+    Option<std::sync::Arc<Context>>,
+    Option<usize>,
+) {
     let built = build_forward(st, method, url, query, headers, tenant, reg, ctx_url, body).await;
     let answered_in = built.answered_in.clone();
     // Process-wide slot (bounds::MAX_FED_INFLIGHT) around the send only: the
@@ -1177,9 +1200,11 @@ pub(crate) async fn forward_in(
     // and building the forward (an @context resolution among it) holds none.
     let _slot = crate::bounds::FED_INFLIGHT.acquire().await;
     if let Some(answer) = ask_transport(st, &built).await {
-        return (answer, answered_in);
+        return (answer, answered_in, None);
     }
-    (send_http(st, built).await, answered_in)
+    let mut count = None;
+    let answer = send_http(st, built, &mut count).await;
+    (answer, answered_in, count)
 }
 
 /// The forward through the registered transport, or `None` when there is
@@ -1205,22 +1230,86 @@ async fn ask_transport(st: &AppState, built: &BuiltForward<'_>) -> Option<Forwar
 /// make one query hold.
 const FED_QUERY_PAGES: usize = 10;
 
+/// The bytes one distributed read holds of its Context Sources' answers:
+/// every page of every source draws on it, so what the merge holds stays
+/// within the answer one request buffers (`AppState::max_answer_bytes`).
+struct FedBudget(std::sync::atomic::AtomicUsize);
+
+impl FedBudget {
+    fn new(bytes: usize) -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(bytes))
+    }
+
+    /// Takes `n` bytes, or nothing when fewer are left.
+    fn take(&self, n: usize) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0
+            .try_update(SeqCst, SeqCst, |left| left.checked_sub(n))
+            .is_ok()
+    }
+}
+
+/// The size of `v` serialized, without holding the serialization.
+fn json_len(v: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    // writing into a counter cannot fail, and a Value always serializes
+    let _ = serde_json::to_writer(&mut n, v);
+    n.0
+}
+
+/// How [`forward_pages`] reads one Context Source.
+struct PageRead<'b> {
+    /// The page size the source is asked for.
+    page: usize,
+    /// The matches the client's page can draw from the source
+    /// (`usize::MAX`: all of them).
+    need: usize,
+    /// The count is asked: the source is asked for its own, and read only
+    /// up to `need` when it answers one; otherwise it is read whole.
+    count: bool,
+    /// The request's bytes, shared by every source.
+    budget: &'b FedBudget,
+}
+
+/// What [`forward_pages`] learned beside the Entities it read.
+#[derive(Default)]
+struct PagesRead {
+    /// The read stopped at the page ceiling or the byte budget while the
+    /// source still had matches: the merge lacks some of them.
+    cut: bool,
+    /// The matches the source counted (6.3.13) that were not read.
+    unread: usize,
+}
+
 /// The page size a distributed query asks a Context Source for, and how
 /// many matches of that source it reads: what the client's page can draw
 /// from it (offset + limit, one more to know a next page exists, every id
-/// the request names), or all of them when the count is asked or the
-/// filters are applied here rather than at the source (5.7.2.4 split
-/// entities, a registered jsonldContext). The third value says the
-/// ceiling ([`FED_QUERY_PAGES`]) set the amount rather than the request.
-fn fed_read_bounds(
+/// the request names), or all of them when the filters are applied here
+/// rather than at the source (5.7.2.4 split entities, a registered
+/// jsonldContext). With `counted` a request for the count asks the source
+/// for its own count; without it the count needs every match read. The
+/// page ceiling ([`FED_QUERY_PAGES`]) and the byte budget bound the read.
+fn fed_read_bounds<'b>(
     st: &AppState,
     params: &HashMap<String, String>,
     filters_pushed: bool,
-) -> (usize, usize, bool) {
+    counted: bool,
+    budget: &'b FedBudget,
+) -> PageRead<'b> {
     let page = st.max_limit.max(1);
-    let cap = page.saturating_mul(FED_QUERY_PAGES);
     let num = |k: &str, d: usize| params.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
-    let wanted = if params.get("count").map(String::as_str) == Some("true") || !filters_pushed {
+    let count = params.get("count").map(String::as_str) == Some("true");
+    let need = if !filters_pushed || (count && !counted) {
         usize::MAX
     } else {
         let ids = params.get("id").map_or(0, |l| l.split(',').count());
@@ -1229,7 +1318,12 @@ fn fed_read_bounds(
             .saturating_add(1)
             .max(ids)
     };
-    (page, wanted.min(cap), wanted > cap)
+    PageRead {
+        page,
+        need,
+        count: count && counted && filters_pushed,
+        budget,
+    }
 }
 
 /// A forwarded read that pages the Context Source: 5.7.2.4 merges every
@@ -1237,7 +1331,10 @@ fn fed_read_bounds(
 /// is read past its own default page, `page` at a time, until it runs out
 /// or `need` matches arrived. The answer is the first page's status with
 /// every page's Entities; a later page that fails keeps what arrived and
-/// adds its own warning. The flag is set when the source still had more.
+/// adds its own warning. One source is read up to
+/// ANTARES_MAX_FED_RESPONSE_BYTES over all its pages and every source draws
+/// on the request's budget: a page past either is not kept and the read
+/// stops, reported as cut.
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 async fn forward_pages(
     st: &AppState,
@@ -1249,21 +1346,31 @@ async fn forward_pages(
     reg: &FedReg,
     ctx_url: &str,
     body: Option<Value>,
-    (page, need): (usize, usize),
-) -> (ForwardAnswer, Option<std::sync::Arc<Context>>, bool) {
+    read: PageRead<'_>,
+) -> (ForwardAnswer, Option<std::sync::Arc<Context>>, PagesRead) {
+    let page = read.page;
+    let cap = page.saturating_mul(FED_QUERY_PAGES);
+    let per_source = *crate::bounds::MAX_FED_RESPONSE_BYTES;
+    let mut need = read.need;
+    let mut counted: Option<usize> = None;
+    let mut held = 0usize;
     let mut got: Vec<Value> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
     let mut first: Option<(u16, Option<std::sync::Arc<Context>>)> = None;
     let mut offset = 0usize;
-    let mut more = false;
+    let mut cut = false;
     loop {
-        let lim = page.min(need.saturating_sub(got.len())).max(1);
+        let want = need.min(cap);
+        let lim = page.min(want.saturating_sub(got.len())).max(1);
         let mut q = query.to_vec();
         q.push(("limit".into(), lim.to_string()));
         if offset > 0 {
             q.push(("offset".into(), offset.to_string()));
         }
-        let ((status, answer, w), actx) = forward_in(
+        if read.count && first.is_none() {
+            q.push(("count".into(), "true".into()));
+        }
+        let ((status, answer, w), actx, total) = forward_counted(
             st,
             method.clone(),
             url.clone(),
@@ -1276,11 +1383,12 @@ async fn forward_pages(
         )
         .await;
         warns.extend(w);
+        let size = json_len(&answer);
         let items = match answer {
             Value::Array(items) if (200..300).contains(&status) => items,
             other => {
                 if first.is_none() {
-                    return ((status, other, warns), actx, false);
+                    return ((status, other, warns), actx, PagesRead::default());
                 }
                 if let Some((code, text)) = read_warning(status, &other) {
                     warns.push(warning(code, &alias_for(&st.host_alias, tenant), text));
@@ -1288,24 +1396,42 @@ async fn forward_pages(
                 break;
             }
         };
-        let n = items.len();
-        got.extend(items);
+        if read.count && first.is_none() {
+            // a source that does not count is read whole for the count
+            match total {
+                Some(n) => counted = Some(n),
+                None => need = usize::MAX,
+            }
+        }
         first.get_or_insert((status, actx));
+        let n = items.len();
+        held = held.saturating_add(size);
+        if held > per_source || !read.budget.take(size) {
+            cut = true;
+            break;
+        }
+        got.extend(items);
         if n != lim {
             break;
         }
-        if got.len() >= need {
-            more = true;
+        if got.len() >= want {
+            cut = need > cap;
             break;
         }
         offset = offset.saturating_add(n);
     }
     let (status, actx) = first.unwrap_or((200, None));
-    ((status, Value::Array(got), warns), actx, more)
+    let unread = counted.map_or(0, |n| n.saturating_sub(got.len()));
+    (
+        (status, Value::Array(got), warns),
+        actx,
+        PagesRead { cut, unread },
+    )
 }
 
-/// 6.3.17 for a source [`forward_pages`] stopped reading at its ceiling:
-/// the merged answer lacks some of its matches, and the client is told.
+/// 6.3.17 for a source [`forward_pages`] stopped reading at its page
+/// ceiling or byte budget: the merged answer lacks some of its matches, and
+/// the client is told.
 fn cut_warning(st: &AppState, tenant: &TenantId) -> String {
     warning(
         199,
@@ -1629,7 +1755,11 @@ async fn build_forward<'a>(
 
 /// One forward over HTTP: the egress policy, the breaker and the cooldown
 /// first, then the request `built` describes.
-async fn send_http(st: &AppState, built: BuiltForward<'_>) -> ForwardAnswer {
+async fn send_http(
+    st: &AppState,
+    built: BuiltForward<'_>,
+    count: &mut Option<usize>,
+) -> ForwardAnswer {
     let BuiltForward {
         method,
         url,
@@ -1727,6 +1857,11 @@ async fn send_http(st: &AppState, built: BuiltForward<'_>) -> ForwardAnswer {
                         crate::bounds::MAX_PEER_WARNINGS
                     );
                 }
+                *count = resp
+                    .headers()
+                    .get("NGSILD-Results-Count")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse().ok());
                 let body = read_body_capped(resp).await;
                 (status, body, peer_warnings)
             }
@@ -2475,6 +2610,37 @@ pub async fn fed_query(
     params: &HashMap<String, String>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
+    Ok(
+        fed_query_in(st, tenant, headers, ctx, params, warnings, false)
+            .await?
+            .0,
+    )
+}
+
+/// [`fed_query`] for a caller that answers the count (6.3.13): a source
+/// that counts its own matches is read only as far as the client's page
+/// needs, and the second value is the matches the sources counted but were
+/// not read, for the caller to add to its count.
+pub(crate) async fn fed_query_counted(
+    st: &AppState,
+    tenant: &TenantId,
+    headers: &HeaderMap,
+    ctx: &Context,
+    params: &HashMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> Result<(Vec<(bool, Value)>, usize), NgsiError> {
+    fed_query_in(st, tenant, headers, ctx, params, warnings, true).await
+}
+
+async fn fed_query_in(
+    st: &AppState,
+    tenant: &TenantId,
+    headers: &HeaderMap,
+    ctx: &Context,
+    params: &HashMap<String, String>,
+    warnings: &mut Vec<String>,
+    counted: bool,
+) -> Result<(Vec<(bool, Value)>, usize), NgsiError> {
     let spec = query_spec(ctx, params);
     let ctx_url = ctx_link_url(headers, &ctx.source);
     let ctx_url = &ctx_url;
@@ -2483,9 +2649,10 @@ pub async fn fed_query(
         .into_iter()
         .filter(|r| r.query_op().is_some())
         .collect();
+    let budget = &FedBudget::new(st.max_answer_bytes);
     let fetched = fan_out(regs, move |reg| async move {
         let Some(op) = reg.query_op() else {
-            return (reg, 0, Value::Null, Vec::new(), None, false);
+            return (reg, 0, Value::Null, Vec::new(), None, PagesRead::default());
         };
         // The forwarded selection is decided ONCE and then rendered either as
         // query parameters (Query Entities, 5.7.2) or as a Query body
@@ -2536,9 +2703,9 @@ pub async fn fed_query(
                 .filter(|v| forwardable(k, v))
                 .map(String::to_owned)
         };
-        let bounds = fed_read_bounds(st, params, push_filters);
+        let read = fed_read_bounds(st, params, push_filters, counted, budget);
         let types = forward_types(&reg, ctx, params);
-        let ((status, body, peer_warns), actx, more) = if op == "queryBatch" {
+        let ((status, body, peer_warns), actx, pages) = if op == "queryBatch" {
             let mut sel = Map::new();
             if let Some(t) = &types {
                 sel.insert("type".into(), Value::String(t.clone()));
@@ -2602,7 +2769,7 @@ pub async fn fed_query(
                 &reg,
                 ctx_url,
                 Some(Value::Object(q_body)),
-                (bounds.0, bounds.1),
+                read,
             )
             .await
         } else {
@@ -2647,19 +2814,21 @@ pub async fn fed_query(
                 &reg,
                 ctx_url,
                 None,
-                (bounds.0, bounds.1),
+                read,
             )
             .await
         };
-        (reg, status, body, peer_warns, actx, more && bounds.2)
+        (reg, status, body, peer_warns, actx, pages)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns, actx, cut) in fetched {
+    let mut unread = 0usize;
+    for (reg, status, body, peer_warns, actx, pages) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
         }
-        if cut {
+        unread = unread.saturating_add(pages.unread);
+        if pages.cut {
             warnings.push(cut_warning(st, tenant));
         }
         if let Value::Array(a) = &body {
@@ -2679,7 +2848,7 @@ pub async fn fed_query(
             }
         }
     }
-    Ok(out)
+    Ok((out, unread))
 }
 
 /// 5.14.4.4 / 5.14.5.4: forward EntityMap creation to matching registrations
@@ -2907,6 +3076,7 @@ pub async fn fed_query_temporal(
         .into_iter()
         .filter(|reg| reg.supports("queryTemporal"))
         .collect();
+    let budget = &FedBudget::new(st.max_answer_bytes);
     let fetched = fan_out(regs, move |reg| async move {
         let mut query = temporal_window(params);
         query.extend(forward_types(&reg, ctx, params).map(|t| ("type".into(), t)));
@@ -2939,8 +3109,8 @@ pub async fn fed_query_temporal(
         } else if let Some(a) = params.get("attrs") {
             query.push(("attrs".into(), a.clone()));
         }
-        let bounds = fed_read_bounds(st, params, push_filters);
-        let ((status, body, peer_warns), actx, more) = forward_pages(
+        let read = fed_read_bounds(st, params, push_filters, false, budget);
+        let ((status, body, peer_warns), actx, pages) = forward_pages(
             st,
             reqwest::Method::GET,
             format!("{}/ngsi-ld/v1/temporal/entities", reg.endpoint),
@@ -2950,18 +3120,18 @@ pub async fn fed_query_temporal(
             &reg,
             ctx_url,
             None,
-            (bounds.0, bounds.1),
+            read,
         )
         .await;
-        (reg, status, body, peer_warns, actx, more && bounds.2)
+        (reg, status, body, peer_warns, actx, pages)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns, actx, cut) in fetched {
+    for (reg, status, body, peer_warns, actx, pages) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
         }
-        if cut {
+        if pages.cut {
             warnings.push(cut_warning(st, tenant));
         }
         if let Value::Array(a) = &body {

@@ -789,8 +789,14 @@ async fn query_entities_inner(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
     );
+    // the matches the Context Sources counted but were not read, for the count
+    let mut unread = 0usize;
     let fed = if crate::federation::active(params) && !looped {
-        crate::federation::fed_query(st, &tenant, headers, &ctx, params, &mut warnings).await?
+        let (fed, n) =
+            crate::federation::fed_query_counted(st, &tenant, headers, &ctx, params, &mut warnings)
+                .await?;
+        unread = n;
+        fed
     } else {
         if crate::federation::active(params)
             && looped
@@ -870,6 +876,7 @@ async fn query_entities_inner(
         true => whole_page(st, &tenant, params, &ctx, &repr, page).await?,
         false => page,
     };
+    let count_hdr = count_hdr.map(|n| n.saturating_add(unread));
     let links = match keyset {
         true => crate::paging::with_next_cursor(
             links,
