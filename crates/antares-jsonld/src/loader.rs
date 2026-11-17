@@ -51,12 +51,16 @@ const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// sanitizer (ANTARES_TEST_SANITIZER, set by the strict workflow):
 /// ThreadSanitizer slows every thread, and hundreds of tests sharing one
 /// runner pushed loopback fetches past their limits. Production is 1.
+/// Read once per process: it is asked on every delivery and every check.
 pub fn slow_factor() -> u64 {
-    if std::env::var_os("ANTARES_TEST_SANITIZER").is_some() {
-        10
-    } else {
-        1
-    }
+    static FACTOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FACTOR.get_or_init(|| {
+        if std::env::var_os("ANTARES_TEST_SANITIZER").is_some() {
+            10
+        } else {
+            1
+        }
+    })
 }
 
 /// `ANTARES_CONTEXT_RESOLVE_TIMEOUT_MS`: a positive integer of
