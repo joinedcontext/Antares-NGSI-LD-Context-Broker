@@ -548,6 +548,7 @@ async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
                         // 3.5 ack_waits on the first message
                         tokio::time::sleep(Duration::from_millis(3_500)).await;
                     }
+                    true
                 }
             },
         )
@@ -561,6 +562,69 @@ async fn a_message_worked_on_past_ack_wait_is_not_redelivered() {
     assert_eq!(seen, ["0", "1", "2"], "worked on more than once");
     assert_eq!(info.num_redelivered, 0, "the server redelivered");
     assert_eq!(info.num_ack_pending, 0, "a message was left unacked");
+}
+
+/// Work that cannot finish now (a store error that may pass) asks for a
+/// retry: the message is NAKed, not acked, and comes back for a second
+/// attempt instead of its change being lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn work_that_asks_for_a_retry_gets_the_message_again() {
+    use async_nats::jetstream::{self, stream};
+    let url = require_nats!();
+    let js = jetstream::new(async_nats::connect(&url).await.expect("connect"));
+    let n = nonce();
+    let name = format!("ANTARES_TEST_RETRY_{n}");
+    let subject = format!("retrywork{n}");
+    let s = js
+        .create_stream(stream::Config {
+            name: name.clone(),
+            subjects: vec![format!("{subject}.>")],
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    let consumer: antares_bus::nats::PullConsumer = s
+        .create_consumer(antares_bus::nats::balanced_config("worker"))
+        .await
+        .expect("consumer");
+    js.publish(format!("{subject}.m"), "only".into())
+        .await
+        .expect("publish")
+        .await
+        .expect("ack");
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = attempts.clone();
+    let runner = tokio::spawn(async move {
+        let _ = antares_bus::nats::run_balanced(
+            &consumer,
+            &std::sync::atomic::AtomicBool::new(false),
+            |_msg| {
+                // the first attempt fails, the second one is done
+                let first = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                async move { !first }
+            },
+        )
+        .await;
+    });
+    let deadline =
+        tokio::time::Instant::now() + antares_bus::nats::RETRY_DELAY + Duration::from_secs(10);
+    while attempts.load(std::sync::atomic::Ordering::SeqCst) < 2
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // give the second attempt's ack a moment to land
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    runner.abort();
+    let info = s.consumer_info("worker").await.expect("info");
+    let _ = js.delete_stream(&name).await;
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a retry was asked for once and the message came back once"
+    );
+    assert_eq!(info.num_ack_pending, 0, "the second attempt was acked");
+    assert_eq!(info.num_pending, 0, "nothing left on the stream");
 }
 
 /// A draining pod (#64) makes no new pull, and works and acks everything
@@ -606,7 +670,7 @@ async fn a_stopped_consumer_works_what_its_pull_delivered_and_pulls_no_more() {
                 .push(String::from_utf8_lossy(&msg.payload).into_owned());
             // the SIGTERM lands while the first change is being delivered
             flag.store(true, Ordering::SeqCst);
-            async {}
+            async { true }
         }),
     )
     .await;
@@ -689,6 +753,7 @@ async fn a_stopped_consumer_hands_back_what_a_closed_pull_left_it_holding() {
                 flag.store(true, Ordering::SeqCst);
                 // slow enough for the full pull to arrive and close behind it
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                true
             }
         }),
     )
@@ -769,7 +834,10 @@ async fn a_batch_of_short_messages_longer_than_ack_wait_is_not_redelivered() {
                 log.lock()
                     .expect("lock")
                     .push(String::from_utf8_lossy(&msg.payload).into_owned());
-                tokio::time::sleep(Duration::from_millis(220))
+                async {
+                    tokio::time::sleep(Duration::from_millis(220)).await;
+                    true
+                }
             },
         )
         .await;

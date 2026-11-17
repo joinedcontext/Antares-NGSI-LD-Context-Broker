@@ -608,15 +608,27 @@ pub async fn wire_nats(
                     let ev = nats::decode(msg);
                     let st = st.clone();
                     async move {
-                        if let Some(ev) = ev {
-                            let (before, after) = resolve_payloads(&st, &ev).await;
-                            antares_api::notify::process_change(
-                                &st,
-                                ev.tenant.as_str(),
-                                before,
-                                after,
-                            )
-                            .await;
+                        let Some(ev) = ev else { return true };
+                        match resolve_payloads(&st, &ev).await {
+                            Ok((before, after)) => {
+                                antares_api::notify::process_change(
+                                    &st,
+                                    ev.tenant.as_str(),
+                                    before,
+                                    after,
+                                )
+                                .await;
+                                true
+                            }
+                            // the store did not answer: the change stays on
+                            // the stream for another attempt
+                            Err(e) => {
+                                tracing::warn!(
+                                    "claim-check read for seq {} failed, left for redelivery: {e}",
+                                    ev.seq
+                                );
+                                false
+                            }
                         }
                     }
                 })
@@ -919,12 +931,16 @@ fn open_sub_delta(key: Option<&SecretKey>, delta: &mut serde_json::Value) {
 /// changed and the change reaches no subscriber. It stays the fallback for
 /// `payload_ref` alone, where being newer than the referenced version is the
 /// ordinary at-least-once reality the matcher already tolerates.
+///
+/// `Err` when the store did not answer (a pool timeout, a cancelled
+/// statement): that says nothing about the row, so the change is left for
+/// redelivery rather than declared unrecoverable.
 async fn resolve_payloads(
     st: &AppState,
     ev: &ChangeEvent,
-) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), antares_model::NgsiError> {
     if ev.payload_ref.is_none() && ev.prev_payload_ref.is_none() {
-        return (ev.prev_payload.clone(), ev.payload.clone());
+        return Ok((ev.prev_payload.clone(), ev.payload.clone()));
     }
     // 0 is the local bus, which never claim-checks: it hands the payloads to
     // the matcher in process.
@@ -933,13 +949,11 @@ async fn resolve_payloads(
         seq => st
             .store
             .outbox_event(seq, &ev.tenant)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .and_then(|v| serde_json::from_value::<ChangeEvent>(v).ok()),
     };
     if let Some(kept) = kept {
-        return (kept.prev_payload, kept.payload);
+        return Ok((kept.prev_payload, kept.payload));
     }
     // Past the retention window, or a deployment whose store keeps no outbox.
     // The after-image is still recoverable; the before-image is not, and a
@@ -953,21 +967,20 @@ async fn resolve_payloads(
             ev.seq,
             ev.entity_id.as_str()
         );
-        return (None, None);
+        return Ok((None, None));
     }
     let after = match ev.payload.clone() {
         Some(v) => Some(v),
         None => match ev.payload_ref.as_ref() {
-            Some(r) => st
-                .store
-                .get(&ev.tenant, Kind::Entity, r.entity_id.as_str())
-                .await
-                .ok()
-                .flatten(),
+            Some(r) => {
+                st.store
+                    .get(&ev.tenant, Kind::Entity, r.entity_id.as_str())
+                    .await?
+            }
             None => None,
         },
     };
-    (ev.prev_payload.clone(), after)
+    Ok((ev.prev_payload.clone(), after))
 }
 
 #[cfg(test)]
@@ -1170,8 +1183,9 @@ mod tests {
         let doc = json!({"id": "urn:ngsi-ld:T:1", "type": "T"});
         let st = state_with(Some(doc.clone())).await;
 
-        let (before, after) =
-            resolve_payloads(&st, &event(Some(json!({"inline": true})), None)).await;
+        let (before, after) = resolve_payloads(&st, &event(Some(json!({"inline": true})), None))
+            .await
+            .expect("resolved");
         assert_eq!(after, Some(json!({"inline": true})), "inline payload wins");
         assert_eq!(before, None);
 
@@ -1179,7 +1193,9 @@ mod tests {
             entity_id: EntityId::new("urn:ngsi-ld:T:1").expect("id"),
             version: 1,
         };
-        let (_, after) = resolve_payloads(&st, &event(None, Some(r.clone()))).await;
+        let (_, after) = resolve_payloads(&st, &event(None, Some(r.clone())))
+            .await
+            .expect("resolved");
         assert_eq!(
             after.as_ref().and_then(|a| a["id"].as_str()),
             Some("urn:ngsi-ld:T:1"),
@@ -1188,11 +1204,15 @@ mod tests {
 
         // The row was deleted between publish and consumption.
         let gone = state_with(None).await;
-        let (before, after) = resolve_payloads(&gone, &event(None, Some(r))).await;
+        let (before, after) = resolve_payloads(&gone, &event(None, Some(r)))
+            .await
+            .expect("resolved");
         assert_eq!(after, None, "a dangling reference must resolve to None");
         assert_eq!(before, None);
 
-        let (before, after) = resolve_payloads(&st, &event(None, None)).await;
+        let (before, after) = resolve_payloads(&st, &event(None, None))
+            .await
+            .expect("resolved");
         assert!(before.is_none() && after.is_none(), "no payload, no fetch");
     }
 
@@ -1210,15 +1230,51 @@ mod tests {
         for after in [Some(json!({"id": "urn:ngsi-ld:T:1", "type": "T"})), None] {
             let mut ev = event(after.clone(), after.is_none().then(|| r.clone()));
             ev.prev_payload_ref = Some(r.clone());
-            let (before, after) = resolve_payloads(&st, &ev).await;
+            let (before, after) = resolve_payloads(&st, &ev).await.expect("resolved");
             assert_eq!((before.as_ref(), after.as_ref()), (None, None), "{ev:?}");
         }
         // negative: an inline before-image is no reference and is handed on
         let mut ev = event(Some(json!({"after": 1})), None);
         ev.prev_payload = Some(json!({"before": 1}));
-        let (before, after) = resolve_payloads(&st, &ev).await;
+        let (before, after) = resolve_payloads(&st, &ev).await.expect("resolved");
         assert_eq!(before, Some(json!({"before": 1})));
         assert_eq!(after, Some(json!({"after": 1})));
+    }
+
+    /// A store that does not answer says nothing about the kept row: the
+    /// claim-check read is an error the matcher leaves for redelivery, not
+    /// a row declared gone and a change dropped. Skips without
+    /// ANTARES_TEST_DATABASE_URL (the outbox is a Postgres table).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_error_on_the_claim_check_read_is_no_missing_row() {
+        let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = antares_sql::store::pg::connect(&url, 2)
+            .await
+            .expect("connect");
+        let st = AppState::with_store(
+            "antares".into(),
+            std::sync::Arc::new(antares_sql::store::any::AnyStore::Pg(
+                antares_sql::store::any::PgBackend::new(pool.clone()),
+            )),
+            "postgres",
+        );
+        let r = PayloadRef {
+            entity_id: EntityId::new("urn:ngsi-ld:T:1").expect("id"),
+            version: 1,
+        };
+        let mut ev = event(None, Some(r.clone()));
+        ev.prev_payload_ref = Some(r);
+        ev.seq = 1;
+        // every statement now fails, as under a pool timeout
+        pool.close().await;
+        let out = resolve_payloads(&st, &ev).await;
+        assert!(
+            out.is_err(),
+            "a failed read was taken for a gone row: {out:?}"
+        );
     }
 
     /// A claim-check fetch is scoped to the EVENT's tenant: a reference must
@@ -1234,7 +1290,7 @@ mod tests {
             }),
         );
         ev.tenant = TenantId::new("other").expect("tenant");
-        let (_, after) = resolve_payloads(&st, &ev).await;
+        let (_, after) = resolve_payloads(&st, &ev).await.expect("resolved");
         assert_eq!(
             after, None,
             "a reference resolved another tenant's entity: {after:?}"
@@ -1321,7 +1377,7 @@ mod tests {
             wire.prev_payload_ref.is_some() && wire.payload_ref.is_some(),
             "the fixture must be over the claim-check ceiling"
         );
-        let (before, after) = resolve_payloads(&st, &wire).await;
+        let (before, after) = resolve_payloads(&st, &wire).await.expect("resolved");
         assert_eq!(before.as_ref(), Some(&before_doc), "before-image lost");
         assert_eq!(after.as_ref(), Some(&after_doc));
         assert_ne!(
