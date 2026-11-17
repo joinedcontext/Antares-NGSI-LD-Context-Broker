@@ -174,3 +174,26 @@ async fn attribute_writes_set_expires_at_as_an_entity_member() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(get_entity(&st, id).await.get("expiresAt").is_none());
 }
+
+/// 5.6.21 Purge with `drop`: the Entity it changes moves its modifiedAt, as
+/// every other Attribute delete does.
+#[tokio::test]
+async fn a_purge_that_drops_an_attribute_moves_modified_at() {
+    let st = state();
+    let id = "urn:ngsi-ld:T:purge";
+    create(
+        &st,
+        &format!(r#"{{"id":"{id}","type":"T","speed":{{"type":"Property","value":1}}}}"#),
+    )
+    .await;
+    let before = get_entity(&st, id).await["modifiedAt"].clone();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let req = Request::delete("/ngsi-ld/v1/entities?type=T&drop=speed")
+        .body(Body::empty())
+        .expect("req");
+    let resp = send(&st, req).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let after = get_entity(&st, id).await;
+    assert!(after.get("speed").is_none(), "{after}");
+    assert_ne!(after["modifiedAt"], before, "{after}");
+}
