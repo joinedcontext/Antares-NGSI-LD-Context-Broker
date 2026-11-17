@@ -723,3 +723,16 @@ async fn upsert_update_mode_replaces_the_named_instance() {
     let doc = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
     assert_instances_replaced(&before, &doc);
 }
+
+/// 5.6.7.4: every forwarded Entity lands in S or E. A source's 207 that
+/// names one of them in neither array reports it in E.
+#[test]
+fn a_207_that_omits_a_sent_id_reports_it() {
+    let (mut ok, mut err) = (Vec::new(), Vec::new());
+    let body = json!({"success": ["urn:ngsi-ld:T:1"], "errors": []});
+    let sent = ["urn:ngsi-ld:T:1".to_owned(), "urn:ngsi-ld:T:2".to_owned()];
+    merge_remote_batch(207, &body, &sent, false, &mut ok, &mut err);
+    assert_eq!(ok, [("urn:ngsi-ld:T:1".to_owned(), false)]);
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert_eq!(err[0]["entityId"], "urn:ngsi-ld:T:2");
+}

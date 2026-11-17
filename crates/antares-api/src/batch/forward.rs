@@ -91,6 +91,22 @@ pub(super) fn merge_remote_batch(
                     ));
                 }
             }
+            // 5.6.7.4: every forwarded Entity lands in S or E; one the
+            // source's answer names in neither is reported as an error
+            let named = |id: &str| {
+                ok.iter().any(|(o, _)| o == id)
+                    || err
+                        .iter()
+                        .any(|e| e.get("entityId").and_then(Value::as_str) == Some(id))
+            };
+            let unreported: Vec<&String> = sent_ids.iter().filter(|id| !named(id)).collect();
+            for id in unreported {
+                err.push(err_remote(
+                    Some(id),
+                    502,
+                    "forwarded batch operation did not report this entity",
+                ));
+            }
         }
         _ => {
             for id in sent_ids {
