@@ -2191,19 +2191,19 @@ impl antares_store::TemporalDriver for AnyStore {
                 // an instance goes when it was observed at or before the cut;
                 // a cut that is no DateTime erases nothing
                 let cut = before.map(instant);
+                // the instant an instance is keyed by: its observedAt, else
+                // the stamps the Postgres arm's observed_at falls back to
                 let goes = |i: &Value| match cut {
                     None => true,
                     Some(cut) => {
-                        let at = i
-                            .get("observedAt")
-                            .and_then(Value::as_str)
-                            .and_then(instant);
+                        let at = super::mem::instance_instant(i).and_then(instant);
                         cut.zip(at).is_some_and(|(cut, at)| at <= cut)
                     }
                 };
                 let erased = AnyStore::mutate(self, tenant, Kind::Temporal, entity_id, |doc| {
                     let o = doc.as_object_mut().ok_or(())?;
                     let mut n = 0u64;
+                    let mut emptied_attrs = Vec::new();
                     for (k, v) in o.iter_mut() {
                         let named = attrs.is_none_or(|a| a.contains(k));
                         let Some(list) = v.as_array_mut().filter(|_| named) else {
@@ -2216,6 +2216,14 @@ impl antares_store::TemporalDriver for AnyStore {
                         list.retain(|i| !goes(i));
                         let gone = was.saturating_sub(list.len());
                         n = n.saturating_add(u64::try_from(gone).unwrap_or(u64::MAX));
+                        if gone > 0 && list.is_empty() {
+                            emptied_attrs.push(k.clone());
+                        }
+                    }
+                    // an Attribute with no instance left is gone, as it is
+                    // from the Postgres arm, whose Attributes are its rows
+                    for k in emptied_attrs {
+                        o.remove(&k);
                     }
                     let emptied = o
                         .values()
@@ -2233,9 +2241,18 @@ impl antares_store::TemporalDriver for AnyStore {
                 Ok(n)
             }
             #[cfg(feature = "postgres")]
+            // 4.6.3: a comma seconds-fraction is legal and `::timestamptz`
+            // refuses it
             AnyStore::Pg(p) => p
                 .temporal
-                .erase(tenant, entity_id, attrs, before)
+                .erase(
+                    tenant,
+                    entity_id,
+                    attrs,
+                    before
+                        .map(antares_store::filter::canonical_datetime)
+                        .as_deref(),
+                )
                 .await
                 .map_err(db),
         }
