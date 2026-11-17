@@ -97,6 +97,14 @@ impl MqttEndpoint {
                 "mqtt endpoint {safe:?}: a topic to publish to holds no wildcard ('+', '#')"
             )));
         }
+        // MQTT 3.1.1 1.5.3 / MQTT 5 1.5.4: a UTF-8 string MUST NOT hold
+        // U+0000 and SHOULD NOT hold the other control characters; the
+        // escapes are decoded above, so the decoded topic is the one checked
+        if topic.chars().any(char::is_control) {
+            return Err(bad(format!(
+                "mqtt endpoint {safe:?}: a topic holds no control character"
+            )));
+        }
         // Deliberately no IPv6-literal hosts — the binding's URI convention
         // (i.19) and the ETSI suite use hostnames; add bracket parsing when a
         // deployment needs it.
@@ -771,9 +779,10 @@ NnXaMvcbRHGLmtb5/8L1jT0DUwrxMvXhsg==
         assert!(client_id("antares-in", &SEQ).contains(nonce));
     }
 
-    /// A Topic Name to publish to may hold no wildcard, so such an endpoint
-    /// is refused when the subscription is created, not on every delivery;
-    /// userinfo and topic are percent-decoded (RFC 3986 2.1).
+    /// A Topic Name to publish to may hold no wildcard and no control
+    /// character, so such an endpoint is refused when the subscription is
+    /// created, not on every delivery; userinfo and topic are
+    /// percent-decoded (RFC 3986 2.1).
     #[test]
     fn wildcard_topic_is_refused_and_escapes_are_decoded() {
         assert!(MqttEndpoint::parse("mqtt://broker/a/+/b").is_err());
@@ -792,6 +801,17 @@ NnXaMvcbRHGLmtb5/8L1jT0DUwrxMvXhsg==
             "mqtt://u:p%ff@broker/t",
         ] {
             assert!(MqttEndpoint::parse(bad).is_err(), "{bad}");
+        }
+        // a control character, escaped or not, is no part of a topic
+        for bad in [
+            "mqtt://broker/t%00",
+            "mqtt://broker/t%0Ax",
+            "mqtt://broker/t%1F",
+            "mqtt://broker/t%7F",
+            "mqtt://broker/t%C2%85",
+            "mqtt://broker/t\tx",
+        ] {
+            assert!(MqttEndpoint::parse(bad).is_err(), "{bad:?}");
         }
         // negative: an ordinary multi-level topic is untouched
         assert_eq!(
