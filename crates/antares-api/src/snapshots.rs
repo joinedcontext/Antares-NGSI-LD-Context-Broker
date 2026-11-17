@@ -1158,6 +1158,45 @@ async fn finish(
     }
 }
 
+/// A Snapshot still `preparing` when this process starts has no fill
+/// running: fills run in the process that created them, and a single
+/// process (the local bus) has just started. Each such Snapshot is
+/// finished as a failure, the status 5.16 gives a fill that did not
+/// complete, so it does not stay `preparing` until it expires and its
+/// clones settle instead of waiting on it. The number finished is returned.
+pub async fn fail_unfinished_snapshots(st: &AppState) -> usize {
+    let Ok(tenants) = st.store.tenant_ids().await else {
+        return 0;
+    };
+    let mut n: usize = 0;
+    for name in tenants {
+        let Ok(tenant) = TenantId::new(&name) else {
+            continue;
+        };
+        let mut preparing = Vec::new();
+        let walked = crate::csource::walk_docs(st, &tenant, Kind::Snapshot, |meta| {
+            if is_snapshot(&meta)
+                && meta.get("snapshotStatus").and_then(Value::as_str) == Some("preparing")
+            {
+                if let Some(id) = meta.get("id").and_then(Value::as_str) {
+                    preparing.push(id.to_owned());
+                }
+            }
+            Ok(())
+        })
+        .await;
+        if let Err(e) = walked {
+            tracing::warn!("snapshots of tenant {name} not walked at start: {e}");
+            continue;
+        }
+        for id in preparing {
+            finish(st, &tenant, &id, "failure", None).await;
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 /// 5.16.6 / 5.3.4 SnapshotNotification (sent only when endpoint is set).
 async fn send_notification(st: &AppState, meta: &Value) {
     let Some(uri) = meta.get("endpoint").and_then(Value::as_str) else {
@@ -1744,6 +1783,44 @@ mod clause_5_16 {
 
     async fn state() -> AppState {
         crate::wired_state("antares-snapshots").await
+    }
+
+    /// A Snapshot left `preparing` by a previous life of a single-process
+    /// broker is finished as a failure at start; a finished one is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_snapshot_left_preparing_is_failed_at_start() {
+        let st = state().await;
+        let t = TenantId::default();
+        for (id, status) in [
+            ("urn:ngsi-ld:Snapshot:left", "preparing"),
+            ("urn:ngsi-ld:Snapshot:done", "success"),
+        ] {
+            st.store
+                .create(
+                    &t,
+                    Kind::Snapshot,
+                    id,
+                    json!({"id": id, "type": "Snapshot", "snapshotStatus": status,
+                           "expiresAt": "2999-01-01T00:00:00Z"}),
+                )
+                .await
+                .expect("seed");
+        }
+        assert_eq!(fail_unfinished_snapshots(&st).await, 1);
+        let status = |id: &'static str| {
+            let st = st.clone();
+            let t = t.clone();
+            async move {
+                st.store
+                    .get(&t, Kind::Snapshot, id)
+                    .await
+                    .expect("get")
+                    .expect("doc")["snapshotStatus"]
+                    .clone()
+            }
+        };
+        assert_eq!(status("urn:ngsi-ld:Snapshot:left").await, json!("failure"));
+        assert_eq!(status("urn:ngsi-ld:Snapshot:done").await, json!("success"));
     }
 
     /// 5.16 with RFC 9110 §9.2.1: reading an expired Snapshot must not
