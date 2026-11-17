@@ -766,17 +766,24 @@ impl AnyStore {
                 // Not doc kinds: they live in their own tables, behind their
                 // own readers, and `doc_kind` refuses them.
                 Kind::Entity => {
+                    // 4.22: the statement excludes expired ENTITIES at `now`,
+                    // so no document leaves this page afterwards and its
+                    // length still means what the caller reads it as; expired
+                    // INSTANCES are stripped here at the same instant.
+                    let now = now_utc();
                     let mut rows = p
                         .entities
-                        .list_page(tenant, after, i64::try_from(limit).unwrap_or(i64::MAX))
+                        .list_page(
+                            tenant,
+                            after,
+                            i64::try_from(limit).unwrap_or(i64::MAX),
+                            &now,
+                        )
                         .await
                         .map_err(db)?;
-                    // 4.22: the statement excluded expired ENTITIES, so no
-                    // document leaves this page and its length still means
-                    // what the caller reads it as; expired INSTANCES are
-                    // stripped here, at the read boundary, as everywhere else.
-                    let now = now_utc();
-                    rows.retain_mut(|d| !crate::store::filter::strip_expired(d, &now));
+                    for d in &mut rows {
+                        crate::store::filter::strip_expired_instances(d, &now);
+                    }
                     Ok(rows)
                 }
                 // ponytail: temporal is sliced from the whole list, so a
@@ -826,18 +833,21 @@ impl AnyStore {
                 // Not doc kinds: each reads its own window in SQL, so the
                 // whole-list ceiling never refuses a page.
                 Kind::Entity => {
+                    // 4.22 at one instant, as `list_page` does
+                    let now = now_utc();
                     let (mut rows, total) = p
                         .entities
                         .list_slice(
                             tenant,
                             i64::try_from(offset).unwrap_or(i64::MAX),
                             i64::try_from(limit).unwrap_or(i64::MAX),
+                            &now,
                         )
                         .await
                         .map_err(db)?;
-                    // 4.22 at the read boundary, as `list_page` does
-                    let now = now_utc();
-                    rows.retain_mut(|d| !crate::store::filter::strip_expired(d, &now));
+                    for d in &mut rows {
+                        crate::store::filter::strip_expired_instances(d, &now);
+                    }
                     Ok((rows, usize::try_from(total).unwrap_or(usize::MAX)))
                 }
                 // Temporal is sliced from the whole list, as in

@@ -1564,22 +1564,28 @@ impl PgEntityStore {
     /// 4.22 at the entity level is in the statement, so a full page is a
     /// full page: the caller reads a short page as the end of the tenant,
     /// and a filter applied after the LIMIT would end the walk early.
+    ///
+    /// `now` is the 4.22 instant the caller strips expired instances at: the
+    /// statement judges the Entities by it too, so a document it admits is
+    /// never dropped afterwards (a short page reads as the end of a walk).
     pub async fn list_page(
         &self,
         tenant: &TenantId,
         after: Option<&str>,
         limit: i64,
+        now: &str,
     ) -> Result<Vec<Value>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
             "SELECT entity FROM entities WHERE tenant_id = $1 AND id > $2
-                   AND (expires_at IS NULL OR expires_at > now())
+                   AND (expires_at IS NULL OR expires_at > $4::timestamptz)
              ORDER BY id LIMIT $3",
         )
         .bind(tenant.as_str())
         .bind(after.unwrap_or(""))
         .bind(limit)
+        .bind(now)
         .fetch_all(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1589,11 +1595,13 @@ impl PgEntityStore {
     /// One id-ordered `LIMIT`/`OFFSET` window of the Tenant's live Entities
     /// and their count, in one snapshot: the window bounds the read, so no
     /// row ceiling applies (`CurrentStateDriver::list_slice`).
+    /// `now` as in [`Self::list_page`].
     pub async fn list_slice(
         &self,
         tenant: &TenantId,
         offset: i64,
         limit: i64,
+        now: &str,
     ) -> Result<(Vec<Value>, i64), sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
@@ -1602,19 +1610,21 @@ impl PgEntityStore {
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
             "SELECT entity FROM entities WHERE tenant_id = $1
-                   AND (expires_at IS NULL OR expires_at > now())
+                   AND (expires_at IS NULL OR expires_at > $4::timestamptz)
              ORDER BY id LIMIT $2 OFFSET $3",
         )
         .bind(tenant.as_str())
         .bind(limit)
         .bind(offset)
+        .bind(now)
         .fetch_all(&mut *tx)
         .await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM entities WHERE tenant_id = $1
-                   AND (expires_at IS NULL OR expires_at > now())",
+                   AND (expires_at IS NULL OR expires_at > $2::timestamptz)",
         )
         .bind(tenant.as_str())
+        .bind(now)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;

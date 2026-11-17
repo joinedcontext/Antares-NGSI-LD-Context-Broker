@@ -898,7 +898,7 @@ async fn clause_5_5_6_a_page_is_served_where_the_whole_list_is_refused() {
     );
 
     let page = s
-        .list_page(&t, None, 1_000)
+        .list_page(&t, None, 1_000, &now())
         .await
         .expect("a page is never refused");
     assert_eq!(page.len(), 1_000, "a full page is a full page");
@@ -911,7 +911,7 @@ async fn clause_5_5_6_a_page_is_served_where_the_whole_list_is_refused() {
 
     // The cursor is exclusive and the walk keeps moving past the ceiling.
     let next = s
-        .list_page(&t, Some(first[999]), 3)
+        .list_page(&t, Some(first[999]), 3, &now())
         .await
         .expect("a page is never refused");
     let next: Vec<&str> = next.iter().filter_map(|d| d["id"].as_str()).collect();
@@ -930,6 +930,7 @@ async fn clause_5_5_6_a_page_is_served_where_the_whole_list_is_refused() {
             &t,
             Some(&format!("urn:ngsi-ld:Ceiling:{:06}", over - 2)),
             1_000,
+            &now(),
         )
         .await
         .expect("a page is never refused");
@@ -1688,4 +1689,41 @@ async fn a_slice_of_a_tenant_past_the_ceiling_is_served() {
             .map(|i| format!("urn:ngsi-ld:Test:{i:06}"))
             .collect::<Vec<_>>()
     );
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// 4.22 by one instant: the listing statement judges the Entities at the
+/// instant the caller strips instances at, so an Entity it admits is not
+/// dropped from the page afterwards (a short page reads as the end of a
+/// walk), whatever the database clock says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listing_judges_expiry_at_the_callers_instant() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pglistnow").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:T:listnow";
+    let _ = s.delete(&t, id).await;
+    let doc = json!({"id": id, "type": ["T"],
+                     "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+                     "expiresAt": "2099-01-01T00:00:00Z"});
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+    // before the expiry: listed; after it: gone, page and count alike
+    let before = "2098-12-31T23:59:59.999Z";
+    let after = "2099-01-01T00:00:00.001Z";
+    assert_eq!(
+        s.list_page(&t, None, 10, before).await.expect("page").len(),
+        1
+    );
+    assert_eq!(
+        s.list_page(&t, None, 10, after).await.expect("page").len(),
+        0
+    );
+    assert_eq!(s.list_slice(&t, 0, 10, before).await.expect("slice").1, 1);
+    assert_eq!(s.list_slice(&t, 0, 10, after).await.expect("slice").1, 0);
+    let _ = s.delete(&t, id).await;
 }
