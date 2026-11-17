@@ -193,6 +193,7 @@ for st, result, suites in upstream:
         ("regressions", "Regressions (passed at the baseline commit, file unchanged)"),
         ("shrink", "Baseline entries that pass now"),
         ("review", "Upstream change, review and baseline"),
+        ("outside", "Upstream change outside TP/, review and re-baseline"),
     ):
         items = result.get(key) or []
         if items:
