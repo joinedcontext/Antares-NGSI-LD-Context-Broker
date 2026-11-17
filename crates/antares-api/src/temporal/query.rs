@@ -272,6 +272,7 @@ pub(super) fn respond_aggregated(
         params,
         outcome.rows,
         "/ngsi-ld/v1/temporal/entities",
+        accept,
         total,
     )?;
     let timeprop = tq.map_or("observedAt", |t| t.timeproperty.as_str());
@@ -485,10 +486,17 @@ pub(crate) async fn query_temporal_collected(
             req.params,
             matches,
             "/ngsi-ld/v1/temporal/entities",
+            accept,
             total,
         )?
     } else {
-        crate::paging::paginate(st, req.params, matches, "/ngsi-ld/v1/temporal/entities")?
+        crate::paging::paginate(
+            st,
+            req.params,
+            matches,
+            "/ngsi-ld/v1/temporal/entities",
+            accept,
+        )?
     };
     if let Some(sink) = merged {
         sink.extend(page.iter().cloned());

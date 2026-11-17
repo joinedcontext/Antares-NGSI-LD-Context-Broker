@@ -27,14 +27,16 @@ pub fn attach_warnings(resp: &mut Response, warnings: &[String]) {
 /// most L elements per page; remaining elements are flagged with a next
 /// pointer carrying every parameter needed to fetch the page, prev on every
 /// iteration but the first, and only prev on the last. Shared by every
-/// paginated list operation (5.7.2, 5.7.4, 5.8.4, 5.10.2, 5.11.5).
+/// paginated list operation (5.7.2, 5.7.4, 5.8.4, 5.10.2, 5.11.5). The Links
+/// carry `accept`, the negotiated media type (6.3.10).
 pub fn paginate(
     st: &AppState,
     params: &HashMap<String, String>,
     matches: Vec<Value>,
     path: &str,
+    accept: Accept,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, matches, path, Accept::Json, None, false)
+    paginate_impl(st, params, matches, path, accept, None, false)
 }
 
 /// The store already applied ORDER BY id + LIMIT/OFFSET and counted the
@@ -44,9 +46,10 @@ pub fn paginate_pre(
     params: &HashMap<String, String>,
     page: Vec<Value>,
     path: &str,
+    accept: Accept,
     total: usize,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, page, path, Accept::Json, Some(total), false)
+    paginate_impl(st, params, page, path, accept, Some(total), false)
 }
 
 /// `paginate_pre` for a caller that negotiated a media type: the store
@@ -1147,7 +1150,14 @@ mod tests {
     #[test]
     fn next_and_prev_flag_remaining_elements() {
         let st = state();
-        let (page, _, links) = paginate(&st, &params(&[("limit", "1")]), items(3), "/e").unwrap();
+        let (page, _, links) = paginate(
+            &st,
+            &params(&[("limit", "1")]),
+            items(3),
+            "/e",
+            Accept::Json,
+        )
+        .unwrap();
         assert_eq!(page.len(), 1);
         assert!(links.iter().any(|l| l.contains("rel=\"next\"")));
         assert!(
@@ -1159,6 +1169,7 @@ mod tests {
             &params(&[("limit", "1"), ("offset", "1")]),
             items(3),
             "/e",
+            Accept::Json,
         )
         .unwrap();
         assert!(links.iter().any(|l| l.contains("rel=\"next\"")));
@@ -1168,6 +1179,7 @@ mod tests {
             &params(&[("limit", "1"), ("offset", "2")]),
             items(3),
             "/e",
+            Accept::Json,
         )
         .unwrap();
         assert!(
@@ -1183,7 +1195,7 @@ mod tests {
     fn default_page_size_applies() {
         let st = state();
         let n = st.default_limit + 5;
-        let (page, _, links) = paginate(&st, &params(&[]), items(n), "/e").unwrap();
+        let (page, _, links) = paginate(&st, &params(&[]), items(n), "/e", Accept::Json).unwrap();
         assert_eq!(page.len(), st.default_limit);
         assert!(links.iter().any(|l| l.contains("rel=\"next\"")));
     }
@@ -1196,9 +1208,23 @@ mod tests {
         // the ceiling is the one setting, 1,000 unless ANTARES_MAX_LIMIT says otherwise
         assert_eq!((st.max_limit, *crate::bounds::MAX_LIMIT), (1000, 1000));
         let at_max = st.max_limit.to_string();
-        assert!(paginate(&st, &params(&[("limit", &at_max)]), items(1), "/e").is_ok());
+        assert!(paginate(
+            &st,
+            &params(&[("limit", &at_max)]),
+            items(1),
+            "/e",
+            Accept::Json
+        )
+        .is_ok());
         let over = (st.max_limit + 1).to_string();
-        let err = paginate(&st, &params(&[("limit", &over)]), items(1), "/e").unwrap_err();
+        let err = paginate(
+            &st,
+            &params(&[("limit", &over)]),
+            items(1),
+            "/e",
+            Accept::Json,
+        )
+        .unwrap_err();
         assert!(format!("{err:?}").contains("TooManyResults"));
     }
 
@@ -1211,10 +1237,18 @@ mod tests {
             (st.default_limit, *crate::bounds::DEFAULT_LIMIT),
             (100, 100)
         );
-        let (page, _, links) = paginate(&st, &params(&[]), items(1001), "/e").unwrap();
+        let (page, _, links) =
+            paginate(&st, &params(&[]), items(1001), "/e", Accept::Json).unwrap();
         assert_eq!(page.len(), 100);
         assert!(links.iter().any(|l| l.contains("rel=\"next\"")));
-        let (page, _, _) = paginate(&st, &params(&[("limit", "1000")]), items(1001), "/e").unwrap();
+        let (page, _, _) = paginate(
+            &st,
+            &params(&[("limit", "1000")]),
+            items(1001),
+            "/e",
+            Accept::Json,
+        )
+        .unwrap();
         assert_eq!(page.len(), 1000);
     }
 
@@ -1224,10 +1258,16 @@ mod tests {
     fn count_is_returned_only_on_request() {
         let st = AppState::new("http://localhost:9090".into());
         let items: Vec<Value> = (0..3).map(|i| json!({"id": format!("urn:{i}")})).collect();
-        let (_, count, _) =
-            paginate(&st, &params(&[("count", "true")]), items.clone(), "/e").unwrap();
+        let (_, count, _) = paginate(
+            &st,
+            &params(&[("count", "true")]),
+            items.clone(),
+            "/e",
+            Accept::Json,
+        )
+        .unwrap();
         assert_eq!(count, Some(3));
-        let (_, count, _) = paginate(&st, &params(&[]), items, "/e").unwrap();
+        let (_, count, _) = paginate(&st, &params(&[]), items, "/e", Accept::Json).unwrap();
         assert_eq!(count, None, "no count member unless requested");
     }
 
@@ -1243,13 +1283,14 @@ mod tests {
             &params(&[("limit", "0"), ("count", "true")]),
             items.clone(),
             "/e",
+            Accept::Json,
         )
         .unwrap();
         assert!(page.is_empty());
         assert_eq!(count, Some(7));
         assert!(links.is_empty(), "limit=0 pages have no next/prev");
         assert!(
-            paginate(&st, &params(&[("limit", "0")]), items, "/e").is_err(),
+            paginate(&st, &params(&[("limit", "0")]), items, "/e", Accept::Json).is_err(),
             "limit=0 without count is rejected"
         );
     }
@@ -1388,12 +1429,20 @@ mod tests {
             let mut pairs = vec![("type", "T"), ("limit", "0"), ("count", "true")];
             pairs.extend(extra.iter().copied());
             let p = params(&pairs);
-            let scanned = paginate(&st, &p, matches.clone(), "/ngsi-ld/v1/entities").expect("scan");
+            let scanned = paginate(
+                &st,
+                &p,
+                matches.clone(),
+                "/ngsi-ld/v1/entities",
+                Accept::Json,
+            )
+            .expect("scan");
             let pushed = paginate_pre(
                 &st,
                 &p,
                 Vec::new(),
                 "/ngsi-ld/v1/entities",
+                Accept::Json,
                 // what the store's count(*) reports for the same query
                 matches.len(),
             )

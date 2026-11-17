@@ -921,12 +921,12 @@ async fn query_entities_inner(
         };
         matches.truncate(p_limit);
         let total = p_offset.saturating_add(total);
-        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
+        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", accept, total)?
     } else if filtered.paged {
         let total = filtered.total.unwrap_or(matches.len());
-        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
+        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", accept, total)?
     } else {
-        paginate(st, params, matches, "/ngsi-ld/v1/entities")?
+        paginate(st, params, matches, "/ngsi-ld/v1/entities", accept)?
     };
     let page = match trimmed {
         true => whole_page(st, &tenant, params, &ctx, &repr, page).await?,

@@ -81,6 +81,7 @@ async fn batch_query_inner(
         &page_params,
         matches,
         "/ngsi-ld/v1/entityOperations/query",
+        accept,
     )?;
     // body members (pick/omit/attrs/lang/datasetId) shape the representation
     // exactly like their 6.3.7 query-parameter twins
