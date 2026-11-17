@@ -2764,15 +2764,7 @@ impl KeptTypes<'_> {
     /// value). 10.2.9.4: a LanguageProperty sent "as a string" updates the
     /// key of the common language tag, so without `lang` there is no key.
     fn simplified_as(&self, iri: &str, stored: &str, v: &Value) -> Result<Value, NgsiError> {
-        let member = match stored {
-            "Relationship" => "object",
-            "ListProperty" => "valueList",
-            "ListRelationship" => "objectList",
-            "LanguageProperty" => "languageMap",
-            "VocabProperty" => "vocab",
-            "JsonProperty" => "json",
-            _ => "value",
-        };
+        let member = crate::repr::value_member(stored);
         let self_described = matches!(
             stored,
             "LanguageProperty" | "VocabProperty" | "JsonProperty"

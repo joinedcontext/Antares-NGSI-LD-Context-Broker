@@ -1366,15 +1366,7 @@ fn with_value(
     observed: Option<&str>,
 ) -> Result<Value, NgsiError> {
     let ty = si.get("type").and_then(Value::as_str).unwrap_or("Property");
-    let member = match ty {
-        "Relationship" => "object",
-        "LanguageProperty" => "languageMap",
-        "JsonProperty" => "json",
-        "VocabProperty" => "vocab",
-        "ListProperty" => "valueList",
-        "ListRelationship" => "objectList",
-        _ => "value",
-    };
+    let member = crate::repr::value_member(ty);
     let mut wrapper = Map::new();
     wrapper.insert(
         attr.to_owned(),
