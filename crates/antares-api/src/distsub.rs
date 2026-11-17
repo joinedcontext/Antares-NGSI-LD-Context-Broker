@@ -1129,28 +1129,32 @@ async fn remote_notify_inner(st: &AppState, body: &[u8]) -> ApiResult<Response> 
         // acknowledged; nothing the original Subscription selected
         return Ok(StatusCode::OK.into_response());
     }
-    // 5.8.6 splitEntities=true: the notified Entities are fragments —
-    // retrieve them locally and from all other Context Sources (except the
-    // origin), merge, and re-filter by the local Subscription's conditions.
-    if sub.get("splitEntities").and_then(Value::as_bool) == Some(true) {
-        data = split_merge(st, &tenant, &sub, origin_reg_id.as_deref(), data).await?;
-        if data.is_empty() {
-            // "If there are Entities in the data member of the Notification
-            // copy, the Notification copy shall be forwarded" — none left
-            return Ok(StatusCode::OK.into_response());
-        }
-    }
-    // 5.8.6: forward to the original subscriber under the OWN subscriptionId
+    // 5.8.6: forward to the original subscriber under the OWN subscriptionId.
+    // The source is answered first: with splitEntities the Entities are
+    // fragments, retrieved locally and from every other Context Source and
+    // merged before they are re-filtered, and that work runs after the
+    // acknowledgement, so a slow or failing other source never turns into a
+    // delivery failure (and a retry) at the notifying one.
     let split = sub.get("splitEntities").and_then(Value::as_bool) == Some(true);
     let (st2, sub2, t2) = (st.clone(), sub.clone(), tenant.clone());
     crate::spawn(async move {
-        let ctx = crate::notify::sub_context(&st2, &t2, &sub2).await;
-        // split_merge shaped its Entities already
         let data = if split {
-            data
+            match split_merge(&st2, &t2, &sub2, origin_reg_id.as_deref(), data).await {
+                // "If there are Entities in the data member of the
+                // Notification copy, the Notification copy shall be
+                // forwarded" — none left
+                Ok(data) if data.is_empty() => return,
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!("splitEntities merge failed, notification dropped: {e}");
+                    return;
+                }
+            }
         } else {
+            let ctx = crate::notify::sub_context(&st2, &t2, &sub2).await;
             project_forwarded(&sub2, data, &ctx)
         };
+        let ctx = crate::notify::sub_context(&st2, &t2, &sub2).await;
         crate::notify::deliver(&st2, &t2, &sub2, data, &ctx).await;
     });
     Ok(StatusCode::OK.into_response())
