@@ -221,9 +221,10 @@ impl NatsBus {
 
     /// Publish one change event with `Nats-Msg-Id` dedup. The id is
     /// the outbox seq so a drain retry after a crash is absorbed by the
-    /// stream's duplicate window, not delivered twice.
-    pub async fn publish(&self, ev: &ChangeEvent) -> Result<(), BusError> {
-        let ev = ev.clone().claim_check(crate::CLAIM_CHECK_BYTES);
+    /// stream's duplicate window, not delivered twice. `true` when a body
+    /// went by claim check: the publisher keeps the outbox row it references.
+    pub async fn publish(&self, ev: &ChangeEvent) -> Result<bool, BusError> {
+        let (bytes, checked) = ev.wire(crate::CLAIM_CHECK_BYTES).map_err(err)?;
         let subject = subjects::change_subject(
             &ev.tenant,
             ev.types.first().map(String::as_str).unwrap_or(""),
@@ -234,7 +235,6 @@ impl NatsBus {
             "Nats-Msg-Id",
             format!("{}:{}", ev.tenant.as_str(), ev.seq).as_str(),
         );
-        let bytes = serde_json::to_vec(&ev).map_err(err)?;
         // double-ack: await the JetStream publish ack, not just the TCP write
         self.js
             .publish_with_headers(subject, headers, bytes.into())
@@ -242,7 +242,7 @@ impl NatsBus {
             .map_err(err)?
             .await
             .map_err(err)?;
-        Ok(())
+        Ok(checked)
     }
 
     /// Publish one delta on the tenant's registry subject with no revision

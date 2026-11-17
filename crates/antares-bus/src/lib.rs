@@ -96,6 +96,26 @@ impl ChangeEvent {
         over(&self.payload, limit) || over(&self.prev_payload, limit)
     }
 
+    /// The bytes this event goes on the wire as under `limit`, and whether a
+    /// body was replaced by a reference ([`ChangeEvent::claim_check`]). The
+    /// common event fits whole and is serialized once, with no copy; only
+    /// an envelope over `limit` is copied and claim-checked.
+    ///
+    /// # Errors
+    /// The event does not serialize.
+    pub fn wire(&self, limit: usize) -> Result<(Vec<u8>, bool), serde_json::Error> {
+        let bytes = serde_json::to_vec(self)?;
+        if bytes.len() <= limit {
+            // every body is inside the envelope, so none is over the limit
+            return Ok((bytes, false));
+        }
+        let checked = self.claim_checked_at(limit);
+        Ok((
+            serde_json::to_vec(&self.clone().claim_check(limit))?,
+            checked,
+        ))
+    }
+
     /// Claim-check: replace any inline body over `limit` bytes with a
     /// reference. Oversized entities are rare; the common path is untouched.
     pub fn claim_check(mut self, limit: usize) -> Self {
@@ -160,6 +180,32 @@ mod tests {
         assert_eq!(back.version, 7);
         assert_eq!(back.op, ChangeOp::Create);
         assert_eq!(back.incarnation, "2026-08-05T00:00:00Z");
+    }
+
+    /// What goes on the wire is what the claim check makes of the event,
+    /// with the flag the drain keeps a row by; an event that fits is sent
+    /// as it is.
+    #[test]
+    fn wire_is_the_claim_checked_event_and_says_when_it_was() {
+        let small = event(3);
+        let (bytes, checked) = small.wire(512).expect("wire");
+        assert!(!checked);
+        assert_eq!(bytes, serde_json::to_vec(&small).expect("json"));
+        let mut big = event(4);
+        big.payload = Some(serde_json::json!({"x": "y".repeat(2048)}));
+        let (bytes, checked) = big.wire(512).expect("wire");
+        assert!(checked, "a body over the limit goes by reference");
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&big.clone().claim_check(512)).expect("json")
+        );
+        assert!(bytes.len() <= 512, "{}", bytes.len());
+        // an envelope over the limit whose bodies fit: trimmed, no reference
+        let mut wide = event(5);
+        wide.changed_attrs = (0..100).map(|i| format!("https://e.x/a{i}")).collect();
+        let (bytes, checked) = wide.wire(512).expect("wire");
+        assert!(!checked);
+        assert!(bytes.len() <= 512, "{}", bytes.len());
     }
 
     #[test]

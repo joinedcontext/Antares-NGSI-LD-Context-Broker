@@ -521,10 +521,9 @@ pub async fn wire_nats(
                         match serde_json::from_value::<ChangeEvent>(event) {
                             Ok(mut ev) => {
                                 ev.seq = seq;
-                                let checked = ev.claim_checked_at(antares_bus::CLAIM_CHECK_BYTES);
                                 match bus_for_drain.publish(&ev).await {
-                                    Ok(()) if checked => retained.push((ev.tenant, seq)),
-                                    Ok(()) => acked.push(seq),
+                                    Ok(true) => retained.push((ev.tenant, seq)),
+                                    Ok(false) => acked.push(seq),
                                     Err(e) => {
                                         tracing::warn!("outbox publish of seq {seq} failed: {e}");
                                         failed = true;
