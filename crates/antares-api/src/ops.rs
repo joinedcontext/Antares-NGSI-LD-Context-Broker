@@ -122,7 +122,6 @@ pub const GIT_HASH: &str = env!("ANTARES_GIT_HASH");
 /// listener stops accepting.
 pub(super) async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
-    headers: axum::http::HeaderMap,
 ) -> (StatusCode, axum::Json<serde_json::Value>) {
     // Drain: the load balancer decides on the STATUS CODE, so draining has
     // to be a 503 — a 200 body saying "DRAINING" would keep traffic arriving.
@@ -212,9 +211,6 @@ pub(super) async fn health(
     body.insert("notificationSchemes".into(), state.sinks.schemes().into());
     // Notifications the delivery policy gave up on (this process, since start).
     body.insert("deadLetters".into(), notify::dead_letters_written().into());
-    // Each stored view, loaded or invalid with the reason.
-    // only the view reports below read the credential
-    drop(headers);
     // Changes the bounded matcher queue dropped (this process, since start).
     body.insert("changesDropped".into(), notify::changes_dropped().into());
     // Panics absorbed at the notification-task boundary, each one a change
