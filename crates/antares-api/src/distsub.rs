@@ -22,13 +22,19 @@ fn ds_index_tenant() -> Option<TenantId> {
     TenantId::new_internal("distsub-index").ok()
 }
 
-async fn ds_get(st: &AppState, tenant: &TenantId, own_id: &str) -> Value {
-    st.store
-        .get(tenant, Kind::DistSub, own_id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| json!({}))
+/// The mapping document of one own Subscription, `{}` when it has none.
+/// `None` when the store cannot answer: read as "no mapping", a failed read
+/// made an update create a second internal Registration Subscription and
+/// write a document without the remotes over the stored one, orphaning the
+/// copies at the sources. A caller stops instead (logged here).
+async fn ds_get(st: &AppState, tenant: &TenantId, own_id: &str) -> Option<Value> {
+    match st.store.get(tenant, Kind::DistSub, own_id).await {
+        Ok(doc) => Some(doc.unwrap_or_else(|| json!({}))),
+        Err(e) => {
+            tracing::warn!("subscription {own_id}: distributed mapping unreadable: {e}");
+            None
+        }
+    }
 }
 
 async fn ds_put(st: &AppState, tenant: &TenantId, own_id: &str, doc: Value) {
@@ -271,7 +277,9 @@ pub(crate) async fn on_subscription_created(st: &AppState, tenant: &TenantId, su
             false
         });
     if created {
-        let mut doc = ds_get(st, tenant, own_id).await;
+        let Some(mut doc) = ds_get(st, tenant, own_id).await else {
+            return;
+        };
         if let Some(o) = doc.as_object_mut() {
             o.insert("csr_sub".into(), Value::String(csr_id.clone()));
         }
@@ -305,8 +313,10 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
         on_subscription_deleted(st, tenant, own_id).await;
         return;
     }
-    let csr_id = ds_get(st, tenant, own_id)
-        .await
+    let Some(mapping) = ds_get(st, tenant, own_id).await else {
+        return;
+    };
+    let csr_id = mapping
         .get("csr_sub")
         .and_then(Value::as_str)
         .map(str::to_owned);
@@ -367,11 +377,10 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
     }
     // the updated Registration Subscription decides which mapped copies
     // still match
-    let csr = match ds_get(st, tenant, own_id)
-        .await
-        .get("csr_sub")
-        .and_then(Value::as_str)
-    {
+    let Some(mapping) = ds_get(st, tenant, own_id).await else {
+        return;
+    };
+    let csr = match mapping.get("csr_sub").and_then(Value::as_str) {
         Some(csr_id) => st
             .store
             .get(tenant, Kind::DistSub, csr_id)
@@ -384,7 +393,10 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
         Some(c) => Some(crate::notify::sub_context(st, tenant, c).await),
         None => None,
     };
-    let remotes: Vec<(String, (String, String))> = ds_remotes(&ds_get(st, tenant, own_id).await);
+    let Some(mapping) = ds_get(st, tenant, own_id).await else {
+        return;
+    };
+    let remotes: Vec<(String, (String, String))> = ds_remotes(&mapping);
     // Read before the initial notification runs: a registration it maps now
     // is getting its copy by POST, and a PATCH raced against that create
     // reaches a remote subscription that may not exist yet.
@@ -452,7 +464,9 @@ pub(crate) async fn on_subscription_updated(st: &AppState, tenant: &TenantId, ow
 /// 5.8.5.4: delete the internal CSR subscription (5.11.6) and forward the
 /// delete to every mapped remote supporting deleteSubscription.
 pub(crate) async fn on_subscription_deleted(st: &AppState, tenant: &TenantId, own_id: &str) {
-    let doc = ds_get(st, tenant, own_id).await;
+    let Some(doc) = ds_get(st, tenant, own_id).await else {
+        return;
+    };
     let csr_id = doc
         .get("csr_sub")
         .and_then(Value::as_str)
@@ -578,7 +592,10 @@ pub(crate) async fn on_csource_notification(
         else {
             continue;
         };
-        let mapped = ds_remotes(&ds_get(st, tenant, own_id).await)
+        let Some(mapping) = ds_get(st, tenant, own_id).await else {
+            return;
+        };
+        let mapped = ds_remotes(&mapping)
             .into_iter()
             .find(|(r, _)| r == reg_id)
             .map(|(_, v)| v);
@@ -1046,7 +1063,12 @@ async fn remote_notify_inner(st: &AppState, body: &[u8]) -> ApiResult<Response> 
     };
     // the origin of this notification is the registration its remote
     // subscription was created at
-    let origin_reg_id = ds_remotes(&ds_get(st, &tenant, &own_id).await)
+    let mapping = ds_get(st, &tenant, &own_id).await.ok_or_else(|| {
+        ApiError::from(NgsiError::InternalError(
+            "distributed subscription mapping unreadable".into(),
+        ))
+    })?;
+    let origin_reg_id = ds_remotes(&mapping)
         .into_iter()
         .find(|(_, (_, rid))| rid.as_str() == sid)
         .map(|(reg_id, _)| reg_id);
@@ -1506,7 +1528,7 @@ mod tests {
             .await
             .expect("create");
         on_subscription_created(&st, &t, &sub).await;
-        let csr_id = ds_get(&st, &t, &own).await["csr_sub"]
+        let csr_id = ds_get(&st, &t, &own).await.expect("mapping")["csr_sub"]
             .as_str()
             .expect("csr_sub")
             .to_owned();
@@ -1561,7 +1583,11 @@ mod tests {
             .expect("create");
         on_subscription_created(&st, &t, &looped).await;
         assert!(
-            ds_get(&st, &t, &own).await.get("csr_sub").is_none(),
+            ds_get(&st, &t, &own)
+                .await
+                .expect("mapping")
+                .get("csr_sub")
+                .is_none(),
             "a looped copy must not create the internal Registration Subscription"
         );
         // positive control: a chain naming only OTHER brokers is not a loop
@@ -1581,6 +1607,7 @@ mod tests {
         assert!(
             ds_get(&st, &t, "urn:ngsi-ld:Subscription:chained")
                 .await
+                .expect("mapping")
                 .get("csr_sub")
                 .is_some(),
             "a pass-through chain (A->B->C) must keep the distributed half"
@@ -1612,7 +1639,7 @@ mod tests {
         // nothing at the source
         on_csource_notification(&st, &t, &own, Some("newlyMatching"), &[reg_doc()]).await;
         assert!(
-            ds_remotes(&ds_get(&st, &t, &own).await).is_empty(),
+            ds_remotes(&ds_get(&st, &t, &own).await.expect("mapping")).is_empty(),
             "a local-only Subscription forwards no copy"
         );
         on_subscription_updated(&st, &t, &own).await;
@@ -1666,7 +1693,7 @@ mod tests {
         inbound_put(&st, "urn:remote:nolonger", &t, &own).await;
         on_csource_notification(&st, &t, &own, Some("noLongerMatching"), &[reg]).await;
         assert!(
-            ds_remotes(&ds_get(&st, &t, &own).await).is_empty(),
+            ds_remotes(&ds_get(&st, &t, &own).await.expect("mapping")).is_empty(),
             "the mapping outlived noLongerMatching"
         );
         assert!(
@@ -1708,7 +1735,7 @@ mod tests {
             .await,
             "the registration already has a remote subscription"
         );
-        let got = ds_remotes(&ds_get(&st, &t, own).await);
+        let got = ds_remotes(&ds_get(&st, &t, own).await.expect("mapping"));
         assert_eq!(got.len(), 1);
         assert_eq!(
             got[0].1 .1, "urn:remote:1",
@@ -1799,12 +1826,19 @@ mod tests {
                    "remotes": {"urn:reg:1": ["http://s", "urn:remote:1"]}}),
         )
         .await;
-        assert_eq!(ds_remotes(&ds_get(&st, &a, own).await).len(), 1);
+        assert_eq!(
+            ds_remotes(&ds_get(&st, &a, own).await.expect("mapping")).len(),
+            1
+        );
         assert!(
-            ds_remotes(&ds_get(&st, &b, own).await).is_empty(),
+            ds_remotes(&ds_get(&st, &b, own).await.expect("mapping")).is_empty(),
             "another tenant must not read the remote mapping"
         );
-        assert!(ds_get(&st, &b, own).await.get("csr_sub").is_none());
+        assert!(ds_get(&st, &b, own)
+            .await
+            .expect("mapping")
+            .get("csr_sub")
+            .is_none());
         inbound_put(&st, "urn:remote:1", &a, own).await;
         assert_eq!(
             inbound_get(&st, "urn:remote:1").await,
@@ -2010,12 +2044,15 @@ mod tests {
             .await
         );
         assert_eq!(
-            ds_remotes(&ds_get(&st, &t, own).await).len(),
+            ds_remotes(&ds_get(&st, &t, own).await.expect("mapping")).len(),
             2,
             "a second registration's write must not drop the first"
         );
         assert!(ds_set_remote(&st, &t, own, "urn:reg:1", None).await);
-        assert_eq!(ds_remotes(&ds_get(&st, &t, own).await).len(), 1);
+        assert_eq!(
+            ds_remotes(&ds_get(&st, &t, own).await.expect("mapping")).len(),
+            1
+        );
         let _ = st.store.delete(&t, Kind::DistSub, own).await;
         assert!(
             !ds_set_remote(

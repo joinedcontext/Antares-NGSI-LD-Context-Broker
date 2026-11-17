@@ -33,6 +33,7 @@ mod dataset_none_4_5_5_1;
 mod dead_letters;
 mod discovery;
 mod discovery_5_7_5;
+mod distsub_mapping_failure_5_8;
 mod durable_state;
 mod egress_breaker_6_3_8;
 mod entity_map_paging_5_5_9;
