@@ -68,33 +68,6 @@ fn attribute_names(obj: &serde_json::Map<String, Value>) -> Vec<String> {
         .collect()
 }
 
-/// Drop attribute instances whose `expiresAt` passed (4.22) from an internal
-/// entity or temporal doc; an attribute whose last instance expired is
-/// removed entirely. Returns whether the doc changed.
-pub(crate) fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
-    let Some(obj) = doc.as_object_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    for k in attribute_names(obj) {
-        let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        let before = arr.len();
-        // 4.6.3 leaves the seconds-fraction separator open, so the two
-        // stamps have to be compared as instants and not as bytes — the rule
-        // lives in `filter::expired_at`, which the read boundary uses too.
-        arr.retain(|inst| !filter::expired_at(inst, now));
-        if arr.len() != before {
-            changed = true;
-            if arr.is_empty() {
-                obj.remove(&k);
-            }
-        }
-    }
-    changed
-}
-
 /// Whether an internal doc's types include `type_iri` (retention).
 fn typed(doc: &Value, type_iri: &str) -> bool {
     match doc.get("type") {
@@ -553,7 +526,7 @@ impl Store {
         ] {
             for (tenant, docs) in map.iter_mut() {
                 for (id, doc) in docs.iter_mut() {
-                    if prune_expired_instances(doc, now) {
+                    if filter::strip_expired_instances(doc, now) {
                         reaped = reaped.saturating_add(1);
                         self.stage(&mut staged, table, key_bytes(tenant, id), Some(doc));
                     }
@@ -1848,7 +1821,7 @@ mod tests {
             "https://a/attr": [{"value": 1, "expiresAt": "2026-09-01T12:00:00,500Z"}]
         });
         assert!(
-            !prune_expired_instances(&mut live, now),
+            !filter::strip_expired_instances(&mut live, now),
             "live instance kept"
         );
         assert_eq!(live["https://a/attr"].as_array().map(Vec::len), Some(1));
@@ -1859,7 +1832,7 @@ mod tests {
             "id": "urn:x", "type": ["T"],
             "https://a/attr": [{"value": 1, "expiresAt": "2026-09-01T11:59:59,500Z"}]
         });
-        assert!(prune_expired_instances(&mut gone, now));
+        assert!(filter::strip_expired_instances(&mut gone, now));
         assert!(gone.get("https://a/attr").is_none());
 
         // the entity-level sweep reads the same stamp the same way

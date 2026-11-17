@@ -283,26 +283,49 @@ pub fn strip_expired(doc: &mut Value, now: &str) -> bool {
 }
 
 /// 4.22 on a document a statement has already admitted as a live Entity:
-/// only its expired attribute instances go (an Attribute left with none is
-/// removed), the document itself stays, so a page keeps the length its
-/// statement gave it.
-pub fn strip_expired_instances(doc: &mut Value, now: &str) {
+/// only its expired attribute instances go, sub-attribute instances included
+/// (an Attribute left with none is removed), the document itself stays, so a
+/// page keeps the length its statement gave it. The one pruner: the read
+/// boundary strips with it and the stores' sweeps rewrite with it. Returns
+/// whether anything went.
+///
+/// An Entity's Attributes are its members other than
+/// `antares_model::ENTITY_META_KEYS`; inside an instance only an IRI-named
+/// member is a sub-attribute (a `value` may itself be an array of objects).
+pub fn strip_expired_instances(doc: &mut Value, now: &str) -> bool {
+    strip_instances(doc, now, &|k: &str| {
+        !antares_model::ENTITY_META_KEYS.contains(&k)
+    })
+}
+
+fn strip_instances(doc: &mut Value, now: &str, attribute: &dyn Fn(&str) -> bool) -> bool {
+    let mut changed = false;
     if let Some(obj) = doc.as_object_mut() {
         let mut empty: Vec<String> = Vec::new();
         for (k, v) in obj.iter_mut() {
-            let Some(arr) = v.as_array_mut().filter(|_| k.contains(':')) else {
+            let Some(arr) = v.as_array_mut().filter(|_| attribute(k)) else {
                 continue;
             };
             let before = arr.len();
-            arr.retain_mut(|inst| !strip_expired(inst, now));
-            if before > 0 && arr.is_empty() {
-                empty.push(k.clone());
+            arr.retain_mut(|inst| {
+                if expired_at(inst, now) {
+                    return false;
+                }
+                changed |= strip_instances(inst, now, &|k: &str| k.contains(':'));
+                true
+            });
+            if arr.len() != before {
+                changed = true;
+                if arr.is_empty() {
+                    empty.push(k.clone());
+                }
             }
         }
         for k in empty {
             obj.remove(&k);
         }
     }
+    changed
 }
 
 /// What a temporal query produced. `paged` = LIMIT/OFFSET (and the
