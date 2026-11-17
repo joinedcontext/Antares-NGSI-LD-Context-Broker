@@ -264,16 +264,32 @@ pub(super) fn redact_letter(l: &mut serde_json::Value) {
         let redacted = serde_json::Value::String(notify::redact_userinfo(u));
         letter.insert("uri".into(), redacted);
     }
+    let redacted = || serde_json::Value::String("[redacted]".into());
     for member in ["receiverInfo", "notifierInfo", "headers"] {
-        let Some(pairs) = letter
-            .get_mut(member)
-            .and_then(serde_json::Value::as_array_mut)
-        else {
+        let Some(held) = letter.get_mut(member) else {
+            continue;
+        };
+        // a pair is blanked in each shape it may be stored in; anything else
+        // is blanked whole, so an unexpected shape never lists a value
+        let Some(pairs) = held.as_array_mut() else {
+            *held = redacted();
             continue;
         };
         for pair in pairs {
-            if let Some(v) = pair.get_mut(1) {
-                *v = serde_json::Value::String("[redacted]".into());
+            match pair {
+                serde_json::Value::Array(kv) if kv.len() == 2 => {
+                    if let Some(v) = kv.get_mut(1) {
+                        *v = redacted();
+                    }
+                }
+                serde_json::Value::Object(o) if o.contains_key("key") => {
+                    for (k, v) in o.iter_mut() {
+                        if k != "key" {
+                            *v = redacted();
+                        }
+                    }
+                }
+                other => *other = redacted(),
             }
         }
     }
