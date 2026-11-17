@@ -19,16 +19,107 @@
 
 use antares_sql::store::pg;
 
+/// The URL of this suite's own database (see [`explain_database`]), and the
+/// session that keeps this test alone in it until the test ends.
 macro_rules! require_db {
     () => {
         match std::env::var("ANTARES_TEST_DATABASE_URL") {
-            Ok(url) => url,
+            Ok(url) => {
+                let own = explain_database(&url).await;
+                let alone = alone_in(&own).await;
+                (own, alone)
+            }
             Err(_) => {
                 eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
                 return;
             }
         }
     };
+}
+
+/// One test of this suite at a time in its database, whichever runner runs
+/// them and with how many threads: the tests create and attach partitions
+/// and seed under ACCESS EXCLUSIVE locks while others plan under the pool's
+/// lock_timeout. A session advisory lock, held until the returned
+/// connection drops at the end of the test. Taken by polling, never by a
+/// waiting statement: a waiter's snapshot is one the CREATE INDEX
+/// CONCURRENTLY of the test holding the lock would wait for.
+async fn alone_in(url: &str) -> sqlx::PgConnection {
+    let mut conn = <sqlx::PgConnection as sqlx::Connection>::connect(url)
+        .await
+        .expect("connect");
+    session_lock(&mut conn, 48522).await;
+    conn
+}
+
+/// The session advisory lock `key` on `conn`, polled: a statement waiting
+/// on it would hold a snapshot other sessions' concurrent index builds wait
+/// for.
+async fn session_lock(conn: &mut sqlx::PgConnection, key: i64) {
+    loop {
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("advisory lock");
+        if got {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// This suite's own database on the test server, created on first use and
+/// kept, so its 200 000-Entity seed is paid once. The plans here are taken
+/// under ACCESS SHARE locks with the pool's lock_timeout, and the shared
+/// database is where the other suites create and attach history partitions
+/// and seed and ANALYZE their own data in parallel: their DDL queued these
+/// reads into 55P03, and their rows moved the statistics the plans read.
+/// Nothing but this suite runs here. The server's TimescaleDB, when it has
+/// one, is created in it before the migrations, so the Timescale run still
+/// plans hypertables.
+async fn explain_database(url: &str) -> String {
+    const NAME: &str = "antares_pg_explain";
+    let (base, _) = url.rsplit_once('/').expect("a database URL");
+    let mut admin = <sqlx::PgConnection as sqlx::Connection>::connect(url)
+        .await
+        .expect("connect");
+    // CREATE DATABASE runs outside a transaction: a session lock serializes
+    // the test processes that race to create it
+    session_lock(&mut admin, 48521).await;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(NAME)
+            .fetch_one(&mut admin)
+            .await
+            .expect("catalog");
+    if !exists {
+        let timescale: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+        )
+        .fetch_one(&mut admin)
+        .await
+        .expect("extensions");
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {NAME}")))
+            .execute(&mut admin)
+            .await
+            .expect("own database");
+        if timescale {
+            let mut own =
+                <sqlx::PgConnection as sqlx::Connection>::connect(&format!("{base}/{NAME}"))
+                    .await
+                    .expect("connect the own database");
+            sqlx::query("CREATE EXTENSION IF NOT EXISTS timescaledb")
+                .execute(&mut own)
+                .await
+                .expect("timescaledb in the own database");
+        }
+    }
+    sqlx::query("SELECT pg_advisory_unlock(48521)")
+        .execute(&mut admin)
+        .await
+        .expect("unlock");
+    format!("{base}/{NAME}")
 }
 
 /// The plan the broker's role gets: `antares_app` (created and granted as
@@ -284,10 +375,21 @@ fn geo_where(
 #[tokio::test]
 async fn every_query_shape_reads_an_index_under_rls() {
     use antares_sql::compile::geo::Rel;
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
+    // The history range is anchored at the seed's newest instance, not at
+    // now(): the seed is kept between runs, and a window that slid past it
+    // would hold nothing (another suite's current instances used to fill it).
+    let newest: String = sqlx::query_scalar(
+        "SELECT max(observed_at)::text FROM attr_instances
+          WHERE tenant_id = $1 AND entity_id = 'urn:ngsi-ld:T1:00000001'",
+    )
+    .bind(RLS_A)
+    .fetch_one(&pool)
+    .await
+    .expect("the seed's newest instance");
     let speed = |cond: &str| {
         format!(r#"entity @? '$."https://x/speed"[*]."value" ? (@ {cond})'::jsonpath"#)
     };
@@ -436,7 +538,8 @@ async fn every_query_shape_reads_an_index_under_rls() {
             format!(
                 "SELECT data FROM attr_instances WHERE tenant_id = '{RLS_A}' \
                  AND entity_id = 'urn:ngsi-ld:T1:00000001' AND attr_id = 'https://x/speed' \
-                 AND observed_at >= now() - interval '20 minutes' AND observed_at < now() \
+                 AND observed_at > '{newest}'::timestamptz - interval '20 minutes' \
+                 AND observed_at <= '{newest}'::timestamptz \
                  ORDER BY observed_at"
             ),
             "Index Cond: ((tenant_id = 'pgexplain-rls-a'::text) AND (entity_id =",
@@ -464,7 +567,7 @@ async fn every_query_shape_reads_an_index_under_rls() {
 /// each, 0 rows).
 #[tokio::test]
 async fn an_and_group_under_rls_reads_the_multi_type_index() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
@@ -504,7 +607,7 @@ async fn an_and_group_under_rls_reads_the_multi_type_index() {
 /// 106 ms a statement at 1 000 req/s on 2 cores.
 #[tokio::test]
 async fn a_pooled_session_starts_no_parallel_workers() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let workers: String = sqlx::query_scalar("SHOW max_parallel_workers_per_gather")
@@ -538,7 +641,7 @@ async fn a_pooled_session_starts_no_parallel_workers() {
 /// builds (its unit tests pin the text).
 #[tokio::test]
 async fn deep_and_keyset_pages_read_ids_from_the_type_index() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
@@ -589,7 +692,7 @@ async fn deep_and_keyset_pages_read_ids_from_the_type_index() {
 /// and past a keyset, and no Seq Scan sweeps the Tenant for it.
 #[tokio::test]
 async fn an_id_pattern_probe_reads_its_type_through_the_type_index() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let w = format!(
@@ -619,7 +722,7 @@ async fn an_id_pattern_probe_reads_its_type_through_the_type_index() {
 /// planner walk i_entities_first_type_id through the whole type for them.
 #[tokio::test]
 async fn an_id_prefix_probe_seeks_its_byte_range() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let c = "id COLLATE \"C\"";
@@ -659,7 +762,7 @@ async fn an_id_prefix_probe_seeks_its_byte_range() {
 async fn an_id_pattern_page_reads_its_range_in_order() {
     const T: &str = "pgexplain-idpattern";
     const TREES: i64 = 164_000;
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     let mut tx = pool.begin().await.expect("tx");
     for stmt in [
@@ -738,7 +841,7 @@ async fn the_new_index_paths_read_one_tenant() {
     use antares_sql::compile::geo::{GeoSpec, Rel};
     use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
     use antares_sql::store::pg::temporal::PgTemporalStore;
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let admin = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&admin).await;
     app_role(&admin).await;
@@ -845,7 +948,7 @@ async fn the_new_index_paths_read_one_tenant() {
 /// every row, which is exactly what the index excludes.
 #[tokio::test]
 async fn the_expiry_sweep_stays_index_shaped() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     seed_rls(&pool).await;
     let plan = plan_as(
@@ -875,7 +978,7 @@ async fn the_expiry_sweep_stays_index_shaped() {
 /// flip that proves nothing.
 #[tokio::test]
 async fn registration_matching_uses_the_csource_index() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     let seed = async {
         let mut tx = pool.begin().await.expect("tx");
@@ -979,7 +1082,7 @@ async fn the_entity_query_is_not_left_prepared() {
     use antares_model::TenantId;
     use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
 
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     // one connection, so the statement cache read below is the query's own
     let pool = pg::connect(&url, 1).await.expect("connect");
     let tenant = TenantId::new("pgunprepared").expect("tenant");
@@ -1024,7 +1127,7 @@ async fn the_entity_query_is_not_left_prepared() {
 /// text); run as a non-superuser, since a superuser skips RLS and hides it.
 #[tokio::test]
 async fn a_type_page_reads_its_type_through_an_index_under_rls() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     let mut tx = pool.begin().await.expect("tx");
     sqlx::query("SELECT pg_advisory_xact_lock(4334)")
@@ -1163,7 +1266,7 @@ async fn a_type_page_reads_its_type_through_an_index_under_rls() {
 /// prepared statements get, run as the RLS-bound role.
 #[tokio::test]
 async fn the_history_write_probes_read_only_the_weeks_that_can_hold_the_instance() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     if pg::maintenance::detect_temporal_backend(&pool).await
         != Ok(pg::maintenance::TemporalBackend::Partitioned)
@@ -1274,7 +1377,7 @@ async fn the_history_write_probes_read_only_the_weeks_that_can_hold_the_instance
 /// a join with `iri_ids` would sort every row of the Attribute instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     const T: &str = "pgexplain-keyed";
     for stmt in [
@@ -1353,7 +1456,7 @@ async fn the_temporal_page_qualification_reads_each_station_newest_first() {
     use antares_sql::compile::temporal::{
         column_range_bound, compile_instance_range, InstanceRange,
     };
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     if pg::maintenance::detect_temporal_backend(&pool).await
         != Ok(pg::maintenance::TemporalBackend::Partitioned)
@@ -1471,7 +1574,7 @@ async fn a_busy_pool_fails_a_geoquery_once() {
     use antares_model::TenantId;
     use antares_sql::compile::geo::{GeoSpec, Rel};
     use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 1).await.expect("connect");
     let store = PgEntityStore::new(pool.clone());
     let t = TenantId::new("pgbusygeo").expect("tenant");
@@ -1520,7 +1623,7 @@ async fn a_busy_pool_fails_a_geoquery_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_history_reap_reads_the_expires_at_index_under_rls() {
     use antares_sql::store::pg::maintenance::{expired_history_sql, history_expiry_index};
-    let url = require_db!();
+    let (url, _alone) = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
     let (ta, tb) = ("pgexplain-reap-a", "pgexplain-reap-b");
     for stmt in [
