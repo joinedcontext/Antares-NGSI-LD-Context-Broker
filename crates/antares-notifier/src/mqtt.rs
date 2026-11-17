@@ -70,13 +70,33 @@ impl MqttEndpoint {
             Some((u, h)) => (Some(u), h),
             None => (None, authority),
         };
+        // RFC 3986 2.1: userinfo and path are percent-encoded, so a
+        // password holding `@` or `:` is written `%40` / `%3A`
+        let decoded = |part: &str, what: &str| {
+            percent_decoded(part).ok_or_else(|| {
+                bad(format!(
+                    "mqtt endpoint {safe:?}: {what} is not percent-encoded UTF-8"
+                ))
+            })
+        };
         let (username, password) = match userinfo {
             None => (None, None),
             Some(u) => match u.split_once(':') {
-                Some((user, pass)) => (Some(user.to_owned()), Some(pass.to_owned())),
-                None => (Some(u.to_owned()), None),
+                Some((user, pass)) => (
+                    Some(decoded(user, "the user")?),
+                    Some(decoded(pass, "the password")?),
+                ),
+                None => (Some(decoded(u, "the user")?), None),
             },
         };
+        let topic = decoded(topic, "the topic")?;
+        // MQTT 3.1.1 4.7.1 / MQTT 5 4.7.1: the Topic Name of a PUBLISH
+        // "MUST NOT contain wildcard characters": every delivery would fail
+        if topic.contains(['+', '#']) {
+            return Err(bad(format!(
+                "mqtt endpoint {safe:?}: a topic to publish to holds no wildcard ('+', '#')"
+            )));
+        }
         // Deliberately no IPv6-literal hosts — the binding's URI convention
         // (i.19) and the ETSI suite use hostnames; add bracket parsing when a
         // deployment needs it.
@@ -97,9 +117,31 @@ impl MqttEndpoint {
             password,
             host,
             port,
-            topic: topic.to_owned(),
+            topic,
         })
     }
+}
+
+/// `s` with its `%XX` escapes decoded; `None` for a malformed escape or a
+/// result that is not UTF-8.
+fn percent_decoded(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return Some(s.to_owned());
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        if c == b'%' {
+            let hex = std::str::from_utf8(b.get(i.saturating_add(1)..i.saturating_add(3))?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i = i.saturating_add(3);
+        } else {
+            out.push(c);
+            i = i.saturating_add(1);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Table 7.2-1 protocol parameters from `notification.endpoint.notifierInfo`.
@@ -746,6 +788,37 @@ mod tests {
         assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
         assert!(b.starts_with(&format!("antares-{nonce}-")), "{b}");
         assert!(client_id("antares-in", &SEQ).contains(nonce));
+    }
+
+    /// A Topic Name to publish to may hold no wildcard, so such an endpoint
+    /// is refused when the subscription is created, not on every delivery;
+    /// userinfo and topic are percent-decoded (RFC 3986 2.1).
+    #[test]
+    fn wildcard_topic_is_refused_and_escapes_are_decoded() {
+        assert!(MqttEndpoint::parse("mqtt://broker/a/+/b").is_err());
+        assert!(MqttEndpoint::parse("mqtt://broker/a/#").is_err());
+        assert!(
+            MqttEndpoint::parse("mqtt://broker/a/%23").is_err(),
+            "an escaped #"
+        );
+        let e = MqttEndpoint::parse("mqtt://us%65r:p%40ss%3Aw@broker/t%2Fx").expect("parse");
+        assert_eq!(e.username.as_deref(), Some("user"));
+        assert_eq!(e.password.as_deref(), Some("p@ss:w"));
+        assert_eq!(e.topic, "t/x");
+        for bad in [
+            "mqtt://broker/t%",
+            "mqtt://broker/t%zz",
+            "mqtt://u:p%ff@broker/t",
+        ] {
+            assert!(MqttEndpoint::parse(bad).is_err(), "{bad}");
+        }
+        // negative: an ordinary multi-level topic is untouched
+        assert_eq!(
+            MqttEndpoint::parse("mqtt://broker/city/air/no2")
+                .expect("parse")
+                .topic,
+            "city/air/no2"
+        );
     }
 
     #[test]
