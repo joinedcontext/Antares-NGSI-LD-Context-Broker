@@ -659,7 +659,7 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
         || crate::bounds::json_depth(s.as_bytes()) > crate::bounds::MAX_JOIN_LEVEL
         || !s
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_,.:{}#/%-+@|".contains(c))
+            .all(|c| c.is_alphanumeric() || "_,.:{}#/%-+@|".contains(c))
     {
         return Err(bad());
     }
@@ -698,7 +698,7 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
             if !head
                 .chars()
                 .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric() || "_:@#".contains(c))
+                .is_some_and(|c| c.is_alphanumeric() || "_:@#".contains(c))
             {
                 return Err(bad("projection member starts with a special character"));
             }
@@ -1957,6 +1957,20 @@ mod clause_4_21 {
         assert_eq!(kids.len(), 2, "pipe splits inside the braces too");
     }
 
+    /// 4.6.2: a projection member is an Attribute name, so a Unicode
+    /// letter is as valid in pick=/omit= as it is in a body.
+    #[test]
+    fn unicode_letter_names_are_projection_members() {
+        let ctx = Loader::new().core();
+        let p = parse_projection("température,温度{ü}", &ctx).expect("unicode names");
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].raw, "température");
+        assert!(
+            parse_projection("a\u{a0}b", &ctx).is_err(),
+            "no-break space"
+        );
+    }
+
     /// 4.21 grammar: an empty member or unbalanced braces are violations.
     #[test]
     fn grammar_rejections_hold_for_both_spellings() {
@@ -2530,16 +2544,30 @@ mod t3932_projection_edges {
     use antares_jsonld::Loader;
 
     /// the projection parser splits at the brace it found and counts
-    /// depth without overflow; a malformed or multi-byte term is a 400, never
-    /// a panic.
+    /// depth without overflow; a malformed term is a 400, never a panic, and
+    /// a multi-byte one (4.6.2 Unicode letters) splits at its char
+    /// boundaries.
     #[test]
     fn malformed_and_multibyte_projections_are_refused() {
         let ctx = Loader::new().core();
         let deep = parse_projection("a{b{c}}", &ctx).expect("nested");
         assert_eq!(proj_depth(&deep), 2);
         assert_eq!(deep[0].raw, "a");
-        for bad in ["a{b", "a}", "a{}", "{", "}", ",", "a,,b", "é{ü|ö}", "a{é}"] {
+        for bad in ["a{b", "a}", "a{}", "{", "}", ",", "a,,b", "é{}", "a{é,}"] {
             assert!(parse_projection(bad, &ctx).is_err(), "{bad} is refused");
         }
+        let multi = parse_projection("é{ü|ö}", &ctx).expect("multi-byte names");
+        assert_eq!(multi[0].raw, "é");
+        let kids: Vec<&str> = multi[0]
+            .children
+            .iter()
+            .flatten()
+            .map(|n| n.raw.as_str())
+            .collect();
+        assert_eq!(kids, ["ü", "ö"]);
+        assert_eq!(
+            proj_depth(&parse_projection("a{é}", &ctx).expect("nested")),
+            1
+        );
     }
 }

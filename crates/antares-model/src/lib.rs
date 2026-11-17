@@ -259,11 +259,13 @@ pub fn parse_iso_duration(s: &str) -> Option<IsoDuration> {
 
 /// Attribute names in paths must be valid terms/IRIs (4.6.2) — 400 otherwise.
 pub fn check_attr_name(attr: &str) -> Result<(), NgsiError> {
-    // 4.6.2 supported names: no '@' (keyword territory), no parens/quotes/etc.
+    // 4.6.2 supported names: unicodeLetter and unicodeNumber are the Unicode
+    // categories, as in the body-side grammar; no '@' (keyword territory),
+    // no parens/quotes/whitespace.
     let ok = !attr.is_empty()
         && attr
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_:.#/%-+".contains(c))
+            .all(|c| c.is_alphanumeric() || "_:.#/%-+".contains(c))
         && !has_dot_segment(attr);
     if ok {
         Ok(())
@@ -476,11 +478,20 @@ mod tests {
     #[test]
     fn attribute_names_and_dot_segments() {
         use super::{check_attr_name, has_dot_segment};
-        for ok in ["speed", "ngsi-ld:x", "https://e.org/a#b", "a%20b", "a.b"] {
+        for ok in [
+            "speed",
+            "ngsi-ld:x",
+            "https://e.org/a#b",
+            "a%20b",
+            "a.b",
+            "ü",
+            "température",
+            "温度2",
+        ] {
             assert!(check_attr_name(ok).is_ok(), "{ok:?}");
         }
         for bad in [
-            "", "@id", "a b", "a(b)", "..", "a/./b", "%2E%2e", "a%2F..", "ü",
+            "", "@id", "a b", "a(b)", "..", "a/./b", "%2E%2e", "a%2F..", "a\u{a0}b",
         ] {
             assert!(check_attr_name(bad).is_err(), "{bad:?}");
         }
