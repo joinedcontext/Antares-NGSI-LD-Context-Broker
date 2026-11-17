@@ -189,6 +189,14 @@ macro_rules! options {
     }};
 }
 
+/// A configuration error on the way to a connect (the mqtts trust store) is
+/// no timeout: the attempt failed without waiting on the broker.
+impl From<NgsiError> for crate::DeliveryError {
+    fn from(e: NgsiError) -> Self {
+        Self::failed(e.to_string())
+    }
+}
+
 /// An MQTT ClientID unique across every process that talks to one server.
 /// A server disconnects the older session when a second one claims its
 /// ClientID (MQTT 3.1.1 3.1.4, MQTT 5 3.1.4), and in a container every
@@ -257,9 +265,9 @@ async fn checked_addr(
     port: u16,
     policy: EgressPolicy,
     dns_timeout: Duration,
-) -> Result<std::net::SocketAddr, NgsiError> {
+) -> Result<std::net::SocketAddr, crate::DeliveryError> {
     let denied = || {
-        NgsiError::InternalError(format!(
+        crate::DeliveryError::failed(format!(
             "mqtt egress to {host}:{port} denied (instance metadata or private range)"
         ))
     };
@@ -272,9 +280,11 @@ async fn checked_addr(
         Err(_) => tokio::time::timeout(dns_timeout, tokio::net::lookup_host((host, port)))
             .await
             .map_err(|_| {
-                NgsiError::InternalError(format!("mqtt egress: resolving {host} timed out"))
+                crate::DeliveryError::timeout(format!("mqtt egress: resolving {host} timed out"))
             })?
-            .map_err(|e| NgsiError::InternalError(format!("mqtt egress: resolving {host}: {e}")))?
+            .map_err(|e| {
+                crate::DeliveryError::failed(format!("mqtt egress: resolving {host}: {e}"))
+            })?
             .collect(),
     };
     addrs
@@ -346,12 +356,19 @@ impl MqttSink {
 
     /// Deliver one notification message. `message` is the 7.2 wrapper from
     /// [`build_message`], serialized by the caller once per subscription.
+    ///
+    /// # Errors
+    /// `timed_out` only when a deadline passed (name resolution, ConnAck,
+    /// the publish and its acknowledgement): that is the class the caller's
+    /// breaker counts. A refused connect (a ConnAck refusal for bad
+    /// credentials among them), an egress denial or a lost connection is a
+    /// broker that answered.
     pub async fn publish_message(
         &self,
         ep: &MqttEndpoint,
         params: MqttParams,
         message: &[u8],
-    ) -> Result<(), NgsiError> {
+    ) -> Result<(), crate::DeliveryError> {
         let key = pool_key(ep, params);
         // one retry with a fresh connection: a pooled client whose broker
         // restarted fails the first publish; a dead broker fails both.
@@ -380,21 +397,23 @@ impl MqttSink {
                 }
                 _ if attempt == 0 => continue, // drop conn, retry fresh
                 Ok(Ok(())) => {
-                    return Err(NgsiError::InternalError(
-                        "mqtt connection lost during publish".into(),
+                    return Err(crate::DeliveryError::failed(
+                        "mqtt connection lost during publish",
                     ))
                 }
-                Ok(Err(e)) => return Err(NgsiError::InternalError(format!("mqtt publish: {e}"))),
+                Ok(Err(e)) => {
+                    return Err(crate::DeliveryError::failed(format!("mqtt publish: {e}")))
+                }
                 Err(_) => {
-                    return Err(NgsiError::InternalError(format!(
+                    return Err(crate::DeliveryError::timeout(format!(
                         "mqtt publish to {}:{} timed out",
                         ep.host, ep.port
                     )))
                 }
             }
         }
-        Err(NgsiError::InternalError(
-            "mqtt publish exhausted its retry without a verdict".into(),
+        Err(crate::DeliveryError::failed(
+            "mqtt publish exhausted its retry without a verdict",
         ))
     }
 
@@ -445,11 +464,18 @@ impl MqttSink {
 
     /// Connect and wait for ConnAck (a dead broker must fail delivery, not
     /// queue forever), then hand the event loop to a pump task.
-    async fn connect(&self, ep: &MqttEndpoint, params: MqttParams) -> Result<Conn, NgsiError> {
+    async fn connect(
+        &self,
+        ep: &MqttEndpoint,
+        params: MqttParams,
+    ) -> Result<Conn, crate::DeliveryError> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = client_id("antares", &SEQ);
         let refused = |e: String| {
-            NgsiError::InternalError(format!("mqtt connect {}:{}: {e}", ep.host, ep.port))
+            crate::DeliveryError::failed(format!("mqtt connect {}:{}: {e}", ep.host, ep.port))
+        };
+        let timed_out = |_| {
+            crate::DeliveryError::timeout(format!("mqtt connect {}:{}: timeout", ep.host, ep.port))
         };
         // Egress policy first: resolve once, judge the answer, dial what was
         // judged. Nothing below opens a socket to an unchecked destination.
@@ -470,7 +496,7 @@ impl MqttSink {
                 }
             })
             .await
-            .map_err(|_| refused("connect timeout".into()))?
+            .map_err(timed_out)?
             .map_err(refused)?;
             let (ack, acks) = tokio::sync::mpsc::channel(16);
             let pump = tokio::spawn(async move {
@@ -505,7 +531,7 @@ impl MqttSink {
                 }
             })
             .await
-            .map_err(|_| refused("connect timeout".into()))?
+            .map_err(timed_out)?
             .map_err(refused)?;
             let (ack, acks) = tokio::sync::mpsc::channel(16);
             let pump = tokio::spawn(async move {
@@ -564,7 +590,9 @@ pub async fn listen(
     use rumqttc::v5::Event;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = client_id("antares-in", &SEQ);
-    let addr = checked_addr(&ep.host, ep.port, egress_policy(), timeout).await?;
+    let addr = checked_addr(&ep.host, ep.port, egress_policy(), timeout)
+        .await
+        .map_err(|e| NgsiError::InternalError(e.message))?;
     let opts = options!(
         rumqttc::v5::MqttOptions,
         id,
@@ -669,10 +697,7 @@ impl crate::NotificationSink for MqttSink {
             };
             let msg = build_message(&out.body, &out.accept, Some(&out.link), &out.receiver_info);
             let bytes = antares_model::ordered_vec(&msg);
-            self.publish_message(&ep, params, &bytes)
-                .await
-                // broker/socket-level failure — keep the timeout guard
-                .map_err(|e| crate::DeliveryError::timeout(e.to_string()))
+            self.publish_message(&ep, params, &bytes).await
         })
     }
 }
@@ -920,7 +945,8 @@ mod tests {
             .publish_message(&silent, params, b"{}")
             .await
             .expect_err("no PUBACK, no delivery");
-        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(err.message.contains("timed out"), "{err:?}");
+        assert!(err.timed_out, "a silent broker ate the deadline");
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "{:?}",
@@ -946,7 +972,8 @@ mod tests {
             .publish_message(&ep, MqttParams::default(), b"{}")
             .await
             .expect_err("the metadata range must never be dialled");
-        let msg = err.to_string();
+        assert!(!err.timed_out, "a denial is no timeout for the breaker");
+        let msg = err.message;
         assert!(
             msg.contains("denied"),
             "expected an egress denial, got: {msg}"
@@ -954,6 +981,41 @@ mod tests {
         assert!(
             !msg.contains("hunter2"),
             "the endpoint password leaked into the delivery error: {msg}"
+        );
+    }
+
+    /// A broker that ANSWERS the CONNECT with a refusal (here "not
+    /// authorized", one tenant's wrong password) is alive: the failure is not
+    /// timeout-class, so it cannot trip the breaker other tenants' deliveries
+    /// to that broker share.
+    #[tokio::test]
+    async fn a_refused_connect_is_no_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                // CONNACK, return code 5: not authorized
+                let _ = s.write_all(&[0x20, 0x02, 0x00, 0x05]).await;
+                let _ = s.flush().await;
+            }
+        });
+        let sink = MqttSink::new(2, Duration::from_secs(5));
+        let ep = MqttEndpoint::parse(&format!("mqtt://u:wrong@127.0.0.1:{port}/t")).expect("parse");
+        let started = Instant::now();
+        let err = sink
+            .publish_message(&ep, MqttParams::default(), b"{}")
+            .await
+            .expect_err("a refused connect delivers nothing");
+        assert!(!err.timed_out, "{err:?}");
+        assert!(!err.message.contains("wrong"), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "answered, not waited out"
         );
     }
 
@@ -986,7 +1048,7 @@ mod tests {
             let e = checked_addr(host, 1883, OPEN, d)
                 .await
                 .expect_err("metadata range must be refused whatever the switch says");
-            assert!(e.to_string().contains("denied"), "{host}: {e}");
+            assert!(e.message.contains("denied"), "{host}: {e:?}");
         }
         // loopback and RFC 1918: allowed by default, refused when the
         // deployment turns private egress off
@@ -999,7 +1061,7 @@ mod tests {
         ] {
             let ok = checked_addr(host, 1883, OPEN, d)
                 .await
-                .unwrap_or_else(|e| panic!("{host} must be reachable by default: {e}"));
+                .unwrap_or_else(|e| panic!("{host} must be reachable by default: {e:?}"));
             assert_eq!(ok.port(), 1883);
             assert!(
                 checked_addr(host, 1883, CLOSED, d).await.is_err(),
