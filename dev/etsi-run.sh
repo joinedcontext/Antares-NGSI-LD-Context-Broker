@@ -62,8 +62,8 @@ case "${TESTSUITE:-ours}" in
     # its own venv from its own requirements.txt (they may pin other versions
     # than ours); HttpCtrl is an editable install out of the fetched tree, so
     # a venv that outlived its tree is rebuilt
-    { [ -x "$VENV/bin/robot" ] && "$VENV/bin/python" -c "import HttpCtrl" >/dev/null 2>&1; } \
-      || { rm -rf "$VENV"; dev/etsi-upstream.sh venv "$ETSI_SUITE" "$VENV"; } \
+    dev/etsi-upstream.sh venv-ok "$VENV" \
+      || dev/etsi-upstream.sh venv "$ETSI_SUITE" "$VENV" \
       || { echo "venv for the ETSI copy failed"; exit 1; }
     SUITES="${SUITES:-$(dev/etsi-upstream.sh suites "$ETSI_SUITE")}"
     # a copy whose own `url` names no /ngsi-ld/v1 adds the path itself
@@ -115,19 +115,16 @@ check_suites_complete "$SUITE" || exit 1
 # that predates a suite move keeps a working `robot` but a stale editable
 # path (easy-install.pth), and every mock-server keyword then fails with
 # "No keyword with name 'Start Server'" (two full runs
-# poisoned). Heal with a forced editable reinstall, not just presence checks.
+# poisoned). Heal by rebuilding, not just presence checks. The build is the
+# official copy's (dev/etsi-upstream.sh venv): pip 26.3 with the 7-day
+# release cooldown, so a venv from before it (stock pip ignores the
+# cooldown) is rebuilt once.
 VENV="$PWD/.venv"
-if [ ! -x "$VENV/bin/robot" ]; then
-  python3 -m venv "$VENV"
-  (cd "$SUITE" && "$VENV/bin/pip" -q install -r requirements.txt)
-fi
-if ! "$VENV/bin/python" -c "import HttpCtrl" >/dev/null 2>&1; then
-  echo "venv: vendored HttpCtrl not importable — reinstalling editable"
-  (cd "$SUITE" && "$VENV/bin/pip" -q install -r requirements.txt \
-    && "$VENV/bin/pip" -q install --no-deps --force-reinstall \
-         -e ./libraries/robotframework-httpctrl)
-  "$VENV/bin/python" -c "import HttpCtrl" \
-    || { echo "venv: HttpCtrl still broken — aborting"; exit 1; }
+if ! dev/etsi-upstream.sh venv-ok "$VENV"; then
+  echo "venv: (re)building $VENV under the release cooldown"
+  dev/etsi-upstream.sh venv "$SUITE" "$VENV" \
+    && "$VENV/bin/python" -c "import HttpCtrl" \
+    || { echo "venv: bootstrap failed (HttpCtrl not importable) — aborting"; exit 1; }
 fi
 
 # Point the suite at this broker (same sed recipe as Scorpio's runner).

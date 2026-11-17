@@ -16,8 +16,11 @@
 #                                                clone lacks it); exit 4 = <base>
 #                                                not reachable upstream
 #   dev/etsi-upstream.sh suites <suite>          the serial robot dirs of that copy
-#   dev/etsi-upstream.sh venv <suite> <venv>     a venv with that copy's own
-#                                                requirements.txt, release cooldown on
+#   dev/etsi-upstream.sh venv <suite> <venv>     a venv (re)built with that copy's
+#                                                own requirements.txt, release
+#                                                cooldown on; used for BOTH copies
+#   dev/etsi-upstream.sh venv-ok <venv>          exit 0 when the venv was built that
+#                                                way and its robot + HttpCtrl work
 #
 # Env: ETSI_UPSTREAM_URL (default the forge repo), ETSI_REF (branch, tag or
 # commit; default develop), ETSI_FETCH_TIMEOUT (seconds, default 300).
@@ -90,7 +93,7 @@ case "${1:-}" in
     ;;
   venv)
     suite="${2:?usage: venv <suite> <venv>}"; venv="${3:?usage: venv <suite> <venv>}"
-    python3 -m venv "$venv"
+    python3 -m venv --clear "$venv"
     "$venv/bin/python" -m pip -q install --disable-pip-version-check "$PIP_PIN"
     # pip runs FROM the suite dir: requirements.txt names the vendored HttpCtrl
     # by a relative editable path. The env form reaches the isolated build
@@ -103,6 +106,14 @@ case "${1:-}" in
     "$venv/bin/robot" --version >/dev/null 2>&1 || [ $? = 251 ] \
       || { echo "venv: robot not runnable after install" >&2; exit 1; }
     ;;
+  venv-ok)
+    venv="${2:?usage: venv-ok <venv>}"
+    # the pinned pip is the mark of a venv built under the cooldown; one from
+    # before (stock pip ignores it) is rebuilt, as is a stale HttpCtrl path
+    [ -x "$venv/bin/robot" ] \
+      && [ "$("$venv/bin/pip" --version 2>/dev/null | cut -d' ' -f1-2 | tr ' ' =)" = "${PIP_PIN/==/=}" ] \
+      && "$venv/bin/python" -c "import HttpCtrl" >/dev/null 2>&1
+    ;;
   *)
-    sed -n '2,29p' "$0"; exit 2 ;;
+    sed -n '2,33p' "$0"; exit 2 ;;
 esac

@@ -443,20 +443,13 @@ echo "IOP" > "$PHASE_FILE"
 # (CI cell SUITES=IOP) never executes. Without this, ../.venv/bin/robot is
 # absent, robot dies instantly, || true swallows it and the cell reports an
 # empty "0 passed — gate FAIL".
-# Same recipe as etsi-run.sh: pip runs FROM the suite dir (relative paths).
-if [ ! -x .venv/bin/robot ]; then
-  python3 -m venv .venv
-  (cd ngsi-ld-test-suite && ../.venv/bin/pip -q install -r requirements.txt)
-fi
-# Same HttpCtrl heal as etsi-run.sh: a stale editable path poisons every
-# mock-server keyword ("No keyword with name 'Start Server'").
-if ! .venv/bin/python -c "import HttpCtrl" >/dev/null 2>&1; then
-  echo "venv: vendored HttpCtrl not importable — reinstalling editable"
-  (cd ngsi-ld-test-suite && ../.venv/bin/pip -q install -r requirements.txt \
-    && ../.venv/bin/pip -q install --no-deps --force-reinstall \
-         -e ./libraries/robotframework-httpctrl)
-  .venv/bin/python -c "import HttpCtrl" \
-    || { echo "venv: HttpCtrl still broken — aborting"; exit 1; }
+# Same recipe as etsi-run.sh (release cooldown, rebuild on a stale HttpCtrl
+# path, which poisons every mock-server keyword).
+if ! dev/etsi-upstream.sh venv-ok .venv; then
+  echo "venv: (re)building .venv under the release cooldown"
+  dev/etsi-upstream.sh venv ngsi-ld-test-suite "$PWD/.venv" \
+    && .venv/bin/python -c "import HttpCtrl" \
+    || { echo "venv: bootstrap failed (HttpCtrl not importable) — aborting"; exit 1; }
 fi
 # A suite whose own `url` names no /ngsi-ld/v1 adds the path itself (forge's later commits), as
 # etsi-run.sh does: with it the IOP TPs sent /ngsi-ld/v1/ngsi-ld/v1 and every setup got 404.
