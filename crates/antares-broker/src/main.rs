@@ -1304,13 +1304,20 @@ async fn run(
                 // Same ANTARES_SWEEP_SECS cadence as the Mem arm — the job's 4.22
                 // reap is the sweep here; the partition/retention steps riding on
                 // the same tick are idempotent and SKIP LOCKED single-winner.
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+                // A pass claims only half a period after the last one began,
+                // whichever pod ran it: the cluster runs about one pass per
+                // period, not one per pod.
+                let period = std::time::Duration::from_secs(sweep_secs);
+                let mut tick = tokio::time::interval(period);
                 loop {
                     tick.tick().await; // first tick is immediate: partitions at boot
                     match wiring::contained(
                         "maintenance",
                         antares_sql::store::pg::maintenance::temporal_maintenance(
-                            &pool, backend, retention,
+                            &pool,
+                            backend,
+                            retention,
+                            period / 2,
                         ),
                     )
                     .await
