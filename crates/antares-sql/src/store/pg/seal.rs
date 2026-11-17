@@ -19,7 +19,9 @@
 //! its headers.
 //!
 //! A Snapshot's `receiverInfo` (Table 5.2.41-1) is the header set of its
-//! 5.16.6 notification and is sealed the same way. An endpoint URI that
+//! 5.16.6 notification and is sealed the same way, and so are a Context
+//! Source Registration's `contextSourceInfo` values (Table 5.2.9-1), the
+//! headers its forwarded requests carry (4.3.6.5). An endpoint URI that
 //! carries `user:password@` userinfo (7.2; an HTTP client sends it as Basic
 //! auth) is a credential as well: such a URI is sealed whole, in every kind
 //! above. A URI without userinfo stays readable.
@@ -136,11 +138,11 @@ pub struct Unreadable;
 impl From<Unreadable> for sqlx::Error {
     fn from(_: Unreadable) -> Self {
         tracing::error!(
-            "a stored notification credential (receiverInfo) cannot be opened: \
+            "a stored credential (receiverInfo, contextSourceInfo or endpoint userinfo) cannot be opened: \
              ANTARES_SECRET_KEY is unset or differs from the key it was sealed with"
         );
         sqlx::Error::Configuration(Box::new(antares_model::NgsiError::InternalError(
-            "a stored notification credential cannot be read".into(),
+            "a stored credential cannot be read".into(),
         )))
     }
 }
@@ -163,17 +165,37 @@ fn credential_uri(uri: &Value) -> bool {
     })
 }
 
-/// The `receiverInfo` KeyValuePair values (5.2.22) and the endpoint URI with
-/// userinfo of one endpoint object: `uri` names the URI member.
+/// `uri` without its userinfo (`scheme://user:pass@host/…` →
+/// `scheme://host/…`), [`credential_uri`]'s rule: the copy of a registration
+/// endpoint the `csource_index` keeps never holds the credential the sealed
+/// document does.
+pub(crate) fn without_userinfo(uri: &str) -> std::borrow::Cow<'_, str> {
+    let Some((scheme, rest)) = uri.split_once("//") else {
+        return std::borrow::Cow::Borrowed(uri);
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest.get(..end).and_then(|authority| authority.rfind('@')) {
+        Some(at) => std::borrow::Cow::Owned(format!(
+            "{scheme}//{}",
+            rest.get(at.saturating_add(1)..).unwrap_or_default()
+        )),
+        None => std::borrow::Cow::Borrowed(uri),
+    }
+}
+
+/// The header KeyValuePair values (5.2.22) and the endpoint URI with
+/// userinfo of one endpoint object: `uri` names the URI member, `pairs` the
+/// KeyValuePair list (`receiverInfo`, or a registration's `contextSourceInfo`).
 fn endpoint_credentials<'a>(
     endpoint: &'a mut serde_json::Map<String, Value>,
     uri: &str,
+    pairs: &str,
 ) -> Vec<&'a mut Value> {
     let mut out = Vec::new();
     for (k, v) in endpoint.iter_mut() {
         if k == uri && credential_uri(v) {
             out.push(v);
-        } else if k == "receiverInfo" {
+        } else if k == pairs {
             if let Some(pairs) = v.as_array_mut() {
                 out.extend(pairs.iter_mut().filter_map(|p| p.get_mut("value")));
             }
@@ -188,13 +210,19 @@ fn credentials(kind: DocKind, doc: &mut Value) -> Vec<&mut Value> {
         DocKind::Subscription | DocKind::CSourceSubscription => doc
             .pointer_mut("/notification/endpoint")
             .and_then(Value::as_object_mut)
-            .map(|ep| endpoint_credentials(ep, "uri"))
+            .map(|ep| endpoint_credentials(ep, "uri", "receiverInfo"))
             .unwrap_or_default(),
         // Table 5.2.41-1 keeps `endpoint` (the URI) and `receiverInfo` as
         // members of the Snapshot itself
         DocKind::Snapshot => doc
             .as_object_mut()
-            .map(|o| endpoint_credentials(o, "endpoint"))
+            .map(|o| endpoint_credentials(o, "endpoint", "receiverInfo"))
+            .unwrap_or_default(),
+        // Table 5.2.9-1: `endpoint` and `contextSourceInfo` are members of
+        // the Registration itself
+        DocKind::Registration => doc
+            .as_object_mut()
+            .map(|o| endpoint_credentials(o, "endpoint", "contextSourceInfo"))
             .unwrap_or_default(),
         // Outbound::receiver_info and the old rendered header list are
         // `[key, value]` pairs.
@@ -226,6 +254,7 @@ pub(crate) fn holds_credentials(kind: DocKind) -> bool {
             | DocKind::CSourceSubscription
             | DocKind::Snapshot
             | DocKind::DeadLetter
+            | DocKind::Registration
     )
 }
 
@@ -247,6 +276,7 @@ impl Row<'_> {
             DocKind::CSourceSubscription => "csource-subscription",
             DocKind::Snapshot => "snapshot",
             DocKind::DeadLetter => "dead-letter",
+            DocKind::Registration => "registration",
             _ => "other",
         };
         // NUL never occurs in a tenant name or an id, so the parts cannot
@@ -333,6 +363,10 @@ pub(crate) fn plaintext_path(kind: DocKind) -> Option<&'static str> {
             "$ ? (exists(@.receiverInfo[*].value ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
              || exists(@.endpoint ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\") && @ like_regex \"^([^/]|/[^/])*//[^/?#]*@\")))",
         ),
+        DocKind::Registration => Some(
+            "$ ? (exists(@.contextSourceInfo[*].value ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
+             || exists(@.endpoint ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\") && @ like_regex \"^([^/]|/[^/])*//[^/?#]*@\")))",
+        ),
         DocKind::DeadLetter => Some(
             "$ ? (exists(@.receiverInfo[*][1] ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
              || exists(@.headers[*][1] ? (@.type() == \"string\" && !(@ starts with \"enc:v1:\"))) \
@@ -389,6 +423,59 @@ mod tests {
         let mut back = again.clone();
         open(Some(&k), row(DocKind::Subscription), &mut back).expect("open");
         assert_eq!(value_of(&back), pasted);
+    }
+
+    /// Table 5.2.9-1: a registration's `contextSourceInfo` values (the
+    /// headers of its forwarded requests) and an endpoint with userinfo are
+    /// sealed like a subscription's `receiverInfo`, and open again in their
+    /// own row only.
+    #[test]
+    fn a_registration_seals_its_forwarding_credentials() {
+        let k = key(9);
+        let reg = json!({"id": "urn:ngsi-ld:ContextSourceRegistration:r", "type": "ContextSourceRegistration",
+                         "endpoint": "http://user:pw-in-uri@cs:9090/ngsi-ld",
+                         "contextSourceInfo": [{"key": "Authorization", "value": "Bearer tok-in-csi"}],
+                         "information": [{"entities": [{"type": "https://e.org/V"}]}]});
+        let row = Row {
+            kind: DocKind::Registration,
+            tenant: "t",
+            id: "urn:ngsi-ld:ContextSourceRegistration:r",
+        };
+        let stored = sealed(Some(&k), row, &reg).expect("seal").into_owned();
+        let text = stored.to_string();
+        assert!(
+            !text.contains("tok-in-csi") && !text.contains("pw-in-uri"),
+            "{text}"
+        );
+        assert!(holds_plaintext(DocKind::Registration, &reg));
+        assert!(!holds_plaintext(DocKind::Registration, &stored));
+        let mut back = stored.clone();
+        open(Some(&k), row, &mut back).expect("open");
+        assert_eq!(back, reg);
+        assert!(open(
+            Some(&k),
+            Row {
+                id: "urn:other",
+                ..row
+            },
+            &mut stored.clone()
+        )
+        .is_err());
+        // an endpoint without userinfo stays readable
+        let plain = json!({"endpoint": "http://cs:9090"});
+        assert_eq!(*sealed(Some(&k), row, &plain).expect("seal"), plain);
+    }
+
+    #[test]
+    fn userinfo_is_cut_from_an_endpoint_copy() {
+        for (uri, want) in [
+            ("http://u:p@cs:9090/x?a=b@c", "http://cs:9090/x?a=b@c"),
+            ("https://a@b@h", "https://h"),
+            ("http://cs:9090/p@th", "http://cs:9090/p@th"),
+            ("urn:x", "urn:x"),
+        ] {
+            assert_eq!(without_userinfo(uri), want, "{uri}");
+        }
     }
 
     fn value_of(doc: &Value) -> String {
