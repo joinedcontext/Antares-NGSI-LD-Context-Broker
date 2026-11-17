@@ -354,9 +354,11 @@ pub async fn wire_nats(
         // Registration write side: registration CUD → ANTARES_REGISTRY delta.
         let bus_for_reg = bus.clone();
         let store_for_reg = state.store.clone();
+        let key_for_reg = secret_key.clone();
         state.reg_sync = Some(Arc::new(move |tenant: &TenantId, id: &str, _doc| {
             let bus = bus_for_reg.clone();
             let store = store_for_reg.clone();
+            let secret = key_for_reg.clone();
             let (tenant, id) = (tenant.clone(), id.to_owned());
             tokio::spawn(async move {
                 // Same contract as the subscription mirror: the row is
@@ -387,6 +389,29 @@ pub async fn wire_nats(
                         Err(e) => {
                             tracing::warn!(
                                 "registry delta publish attempt {} failed: {e}",
+                                attempt + 1
+                            );
+                            tokio::time::sleep(mirror_sync_backoff(attempt)).await;
+                            continue;
+                        }
+                    };
+                    // The store answered the forwarding credentials
+                    // (contextSourceInfo, endpoint userinfo) opened; the
+                    // stream gets them sealed, as the row holds them.
+                    let row = seal::Row {
+                        kind: DocKind::Registration,
+                        tenant: tenant.as_str(),
+                        id: &id,
+                    };
+                    let doc = match doc
+                        .map(|d| seal::sealed(secret.as_deref(), row, &d).map(|c| c.into_owned()))
+                        .transpose()
+                    {
+                        Ok(d) => d,
+                        Err(_) => {
+                            tracing::warn!(
+                                "registry delta publish attempt {} failed: the credentials \
+                                 could not be sealed",
                                 attempt + 1
                             );
                             tokio::time::sleep(mirror_sync_backoff(attempt)).await;
@@ -461,6 +486,7 @@ pub async fn wire_nats(
             reg_mirror,
             state.store.clone(),
             state.egress.clone(),
+            secret_key.clone(),
         ));
 
         // The outbox drain. Runs on every api pod; concurrent drains are
@@ -729,6 +755,7 @@ async fn watch_registry(
     reg_mirror: Arc<antares_api::mirror::DocMirror>,
     store: Arc<dyn antares_store::CurrentStateDriver>,
     egress: Arc<antares_api::egress::Egress>,
+    key: Option<Arc<SecretKey>>,
 ) {
     // The consumer is ephemeral, so a NATS restart or an inactivity
     // gap deletes it server-side and the next pull errors. Ending the
@@ -743,7 +770,7 @@ async fn watch_registry(
     loop {
         match reg_consumer.messages().await {
             Ok(mut msgs) => {
-                while let Some(delta) = nats::next_delta(&mut msgs).await {
+                while let Some(mut delta) = nats::next_delta(&mut msgs).await {
                     // 5.2.34 read side: a cooldown stamp updates this pod's
                     // map (a marker delta has no tenant/id — apply_delta
                     // ignores it on pods that predate the member).
@@ -752,6 +779,7 @@ async fn watch_registry(
                         egress.reg_record(rid, delta["ok"].as_bool().unwrap_or(false));
                         continue;
                     }
+                    open_delta(key.as_deref(), DocKind::Registration, &mut delta);
                     apply_delta(reg_mirror.as_ref(), &delta);
                 }
                 tracing::warn!("registry broadcast consumer stream ended — reopening");
@@ -1012,6 +1040,14 @@ fn sub_doc_kind(csub: bool) -> DocKind {
 /// A plaintext entry (one put before the key was set) opens as it is.
 fn open_sub_delta(key: Option<&SecretKey>, delta: &mut serde_json::Value) {
     let csub = delta.get("csub").and_then(serde_json::Value::as_bool) == Some(true);
+    open_delta(key, sub_doc_kind(csub), delta);
+}
+
+/// Open the credentials of one `{tenant, id, doc}` delta of `kind` in place:
+/// a subscription KV entry or a registry stream delta. One this pod cannot
+/// open becomes a tombstone, so the document leaves the mirror rather than
+/// carry ciphertext into a notification or a forwarded request.
+fn open_delta(key: Option<&SecretKey>, kind: DocKind, delta: &mut serde_json::Value) {
     let (Some(tenant), Some(id)) = (
         delta.get("tenant").and_then(serde_json::Value::as_str),
         delta.get("id").and_then(serde_json::Value::as_str),
@@ -1023,16 +1059,16 @@ fn open_sub_delta(key: Option<&SecretKey>, delta: &mut serde_json::Value) {
         return;
     };
     let row = seal::Row {
-        kind: sub_doc_kind(csub),
+        kind,
         tenant: &tenant,
         id: &id,
     };
     if seal::open(key, row, doc).is_err() {
         tracing::error!(
             %tenant, %id,
-            "a mirrored subscription's notification credentials cannot be opened: \
+            "a mirrored document's credentials cannot be opened: \
              ANTARES_SECRET_KEY is unset or differs from the key it was sealed with; \
-             this pod drops the subscription from its mirror"
+             this pod drops it from its mirror"
         );
         *doc = serde_json::Value::Null;
     }
@@ -1620,6 +1656,7 @@ mod tests {
             mirror.clone(),
             st.store.clone(),
             st.egress.clone(),
+            None,
         ));
         let tenant = format!("regwatch{}", std::process::id());
         let delta = |id: &str| json!({"tenant": tenant, "id": id, "doc": {"id": id, "type": "ContextSourceRegistration"}});
@@ -1913,6 +1950,109 @@ mod tests {
         );
     }
 
+    /// With ANTARES_SECRET_KEY the registry stream carries a registration's
+    /// forwarding credentials (contextSourceInfo values, endpoint userinfo)
+    /// sealed, as the store's row holds them, never in plaintext; the
+    /// watcher of a pod with the key opens them into its mirror, and one
+    /// without the key drops the registration rather than forward with
+    /// ciphertext.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_registry_stream_holds_the_credentials_sealed() {
+        let Some(url) = nats_url() else { return };
+        let key = || Some(SecretKey::from_base64(TEST_KEY).expect("key"));
+        let mut st = AppState::new("antares".into());
+        let bus = wire_nats(&mut st, &url, Roles::parse("api").expect("roles"), key())
+            .await
+            .expect("wire");
+        let tenant = TenantId::new(&format!("regsealed{}", std::process::id())).expect("tenant");
+        let id = format!(
+            "urn:ngsi-ld:ContextSourceRegistration:sealed{}",
+            std::process::id()
+        );
+        let doc = json!({"id": id, "type": "ContextSourceRegistration",
+            "information": [{"entities": [{"type": "https://x/T"}]}],
+            "endpoint": "http://fwd:pa55word@localhost:1/",
+            "contextSourceInfo": [{"key": "Authorization", "value": "Bearer reg-token"}]});
+        st.store
+            .create(&tenant, Kind::Registration, &id, doc.clone())
+            .await
+            .expect("create");
+        let mut raw = bus
+            .consume_registry_broadcast()
+            .await
+            .expect("consumer")
+            .messages()
+            .await
+            .expect("messages");
+        let (keyed, keyed_task) = {
+            let m = Arc::new(DocMirror::default());
+            let c = bus.consume_registry_broadcast().await.expect("consumer");
+            let w = tokio::spawn(watch_registry(
+                bus.clone(),
+                c,
+                m.clone(),
+                st.store.clone(),
+                st.egress.clone(),
+                key().map(Arc::new),
+            ));
+            (m, w)
+        };
+        let (keyless, keyless_task) = {
+            let m = Arc::new(DocMirror::default());
+            let c = bus.consume_registry_broadcast().await.expect("consumer");
+            let w = tokio::spawn(watch_registry(
+                bus.clone(),
+                c,
+                m.clone(),
+                st.store.clone(),
+                st.egress.clone(),
+                None,
+            ));
+            (m, w)
+        };
+        let sync = st.reg_sync.clone().expect("api role installs the sync");
+        sync(&tenant, &id, Some(&doc));
+        // the delta as the stream carries it
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(d) = nats::next_delta(&mut raw).await {
+                if d["id"] == json!(id) {
+                    return Some(d);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+        .expect("the registration's delta on the stream");
+        let text = wire.to_string();
+        assert!(
+            !text.contains("reg-token") && !text.contains("pa55word"),
+            "plaintext credential on the registry stream: {text}"
+        );
+        assert!(text.contains(seal::PREFIX), "{text}");
+        wait_until("the registration in the keyed mirror", || {
+            let held = keyed.docs(tenant.as_str()).len() == 1;
+            async move { held }
+        })
+        .await;
+        let opened = &keyed.docs(tenant.as_str())[0];
+        assert_eq!(opened["endpoint"], doc["endpoint"]);
+        assert_eq!(opened["contextSourceInfo"], doc["contextSourceInfo"]);
+        // the keyless watcher saw the same delta; give it the time the
+        // keyed one needed, then some
+        tokio::time::sleep(std::time::Duration::from_millis(
+            500 * antares_api::state::slow_factor(),
+        ))
+        .await;
+        assert!(
+            keyless.docs(tenant.as_str()).is_empty(),
+            "mirrored without the key"
+        );
+        keyed_task.abort();
+        keyless_task.abort();
+    }
+
     /// 32 zero bytes in base64: a test key that is plainly not a secret.
     const TEST_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
@@ -2167,6 +2307,7 @@ mod tests {
             mirror.clone(),
             st.store.clone(),
             st.egress.clone(),
+            None,
         ));
         let held = || {
             let (m, t) = (mirror.clone(), tenant.as_str().to_owned());
