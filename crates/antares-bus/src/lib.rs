@@ -51,11 +51,11 @@ pub struct PayloadRef {
 pub const CLAIM_CHECK_BYTES: usize = 256 * 1024;
 
 /// One entity change. Self-contained: carries payload AND prev_payload so
-/// consumers (matcher, temporal recorder) never re-read the DB per event.
-/// `version` is the entity row version bumped under the write lock —
-/// state-projecting consumers apply last-writer-wins on
-/// `(incarnation, version)`; `incarnation` is the row's created_at, which
-/// disambiguates delete/recreate (the version restarts at 1).
+/// the matcher never re-reads the DB per event (a body over the bus ceiling
+/// travels by claim check instead). `version` is the entity row version
+/// bumped under the write lock and `incarnation` the row's created_at, which
+/// disambiguates delete/recreate (the version restarts at 1); the matcher
+/// does not order by them today.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeEvent {
     pub tenant: TenantId,

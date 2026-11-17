@@ -6,7 +6,8 @@
 //! (`antares_subscriptions`) for the compiled-subscription mirror.
 //!
 //! Consumer discipline, asserted not assumed (a lesson from Scorpio):
-//! *balanced* work (matcher, temporal recorder) = a shared DURABLE pull
+//! *balanced* work (the matcher; history is recorded in the api write path,
+//! ADR-0007) = a shared DURABLE pull
 //! consumer — instances joining the same durable load-balance; *broadcast*
 //! work (per-instance mirrors) = an EPHEMERAL pull consumer — every instance
 //! sees every message. The distinction is explicit in the method you call,
@@ -244,8 +245,10 @@ impl NatsBus {
         Ok(())
     }
 
-    /// Publish a registration CUD delta: the full registration document
-    /// (or a `{"deleted": id}` tombstone) on the tenant's registry subject.
+    /// Publish one delta on the tenant's registry subject with no revision
+    /// guard: the 5.2.34 cooldown stamps (`{"cooldownReg", "ok"}`) take
+    /// this; a registration's own CUD delta goes through
+    /// [`Self::publish_registration`] (`doc: null` for a deletion).
     /// The tenant is re-validated here because it becomes a subject token.
     pub async fn publish_registry(
         &self,
@@ -317,7 +320,7 @@ impl NatsBus {
         Ok(())
     }
 
-    /// BALANCED consumption (matcher, temporal recorder): a shared durable —
+    /// BALANCED consumption (the matcher): a shared durable —
     /// instances with the same `durable` name split the work. Explicit-ack,
     /// bounded prefetch; the caller acks AFTER processing.
     pub async fn consume_balanced(
