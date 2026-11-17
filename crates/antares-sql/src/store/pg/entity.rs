@@ -1658,7 +1658,8 @@ impl PgEntityStore {
         // 4.22: an expired row is invalid, so a patch of it is a 404 —
         // the same answer the retrieve it would follow already gives.
         let row = sqlx::query(
-            "SELECT entity FROM entities WHERE tenant_id = $1 AND id = $2
+            "SELECT entity, version, created_at::text FROM entities
+              WHERE tenant_id = $1 AND id = $2
                AND (expires_at IS NULL OR expires_at > now()) FOR NO KEY UPDATE",
         )
         .bind(tenant.as_str())
@@ -1670,8 +1671,21 @@ impl PgEntityStore {
             return Ok(None);
         };
         let mut doc: Value = row.get(0);
-        let before = self.outbox_on().then(|| doc.clone());
+        let before = doc.clone();
         match f(&mut doc) {
+            // A closure that left the document as it was writes nothing: no
+            // version bump and no outbox event, as the change hook and
+            // `batch_mutate_stamped` already treat it.
+            Ok(t) if doc == before => {
+                tx.commit().await?;
+                Ok(Some(Ok((
+                    t,
+                    ChangeVersion {
+                        version: row.get(1),
+                        incarnation: row.get(2),
+                    },
+                ))))
+            }
             Ok(t) => {
                 let e = extract(&doc);
                 let updated = sqlx::query(
@@ -1698,14 +1712,14 @@ impl PgEntityStore {
                 .bind(&e.attrs_expire)
                 .fetch_one(&mut *tx)
                 .await?;
-                if let Some(before) = &before {
+                if self.outbox_on() {
                     enqueue_change(
                         &mut tx,
                         tenant,
                         "update",
                         id,
                         &e.types,
-                        Some(before),
+                        Some(&before),
                         Some(&doc),
                         updated.get::<i64, _>(0),
                         updated.get::<&str, _>(1),

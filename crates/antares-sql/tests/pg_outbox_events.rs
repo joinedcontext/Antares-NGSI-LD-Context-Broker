@@ -146,3 +146,36 @@ async fn batch_writes_enqueue_the_hooks_change_version() {
         ]
     );
 }
+
+/// A closure that leaves the document as it was writes nothing: no version
+/// bump and no update event, as the change hook and the batch path already
+/// treat it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_mutate_writes_and_enqueues_nothing() {
+    let _ = require_db!();
+    let t = TenantId::new("pgoutboxver").expect("tenant");
+    let Some((pool, s)) = store(&t).await else {
+        return;
+    };
+    let id = format!("urn:ngsi-ld:T:noop{}", run_id());
+    let created = s
+        .create_stamped(&t, &id, &doc(&id, 1))
+        .await
+        .expect("create")
+        .expect("created");
+    let (_, v) = s
+        .mutate_stamped(&t, &id, |_| Ok::<(), ()>(()))
+        .await
+        .expect("mutate")
+        .expect("present")
+        .expect("closure");
+    assert_eq!(v, created, "the version an unchanged write reports");
+    assert_eq!(s.version(&t, &id).await.expect("version"), Some(1));
+    let ops: Vec<String> = events(&pool, &t, &id)
+        .await
+        .into_iter()
+        .map(|(op, _, _)| op)
+        .collect();
+    assert_eq!(ops, ["create"]);
+    s.delete(&t, &id).await.expect("cleanup");
+}
