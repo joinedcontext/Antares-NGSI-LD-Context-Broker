@@ -173,8 +173,10 @@ Every cell runs the ETSI test suite twice, from two copies:
 The official copy is never stored here. Each run clones `develop` (or
 `ETSI_REF`, a branch, tag or commit) into a temporary directory with
 `dev/etsi-upstream.sh`, builds a venv there from that copy's own
-`requirements.txt` (pip with a seven-day release cooldown,
-`--uploaded-prior-to P7D`), runs it and deletes both. Nothing in the clone
+`requirements.txt`, runs it and deletes both. Both copies' venvs are built
+the same way: pip 26.3 with a seven-day release cooldown
+(`--uploaded-prior-to P7D`), so no package younger than a week is
+installed; our `.venv` from before that rule is rebuilt once. Nothing in the clone
 is edited: the broker URL, the callback host the mocks bind and the five
 IOP broker URLs reach it as `robot --variable`, the values our copy gets
 by rewriting its `variables.py`. Its `@context` is the one it names on
