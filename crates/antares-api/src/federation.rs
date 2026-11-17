@@ -2052,10 +2052,7 @@ fn push_down_expires(doc: &mut Value) {
         return;
     };
     for (k, v) in o.iter_mut() {
-        if matches!(
-            k.as_str(),
-            "id" | "type" | "scope" | "expiresAt" | "createdAt" | "modifiedAt" | "deletedAt"
-        ) {
+        if antares_model::is_meta(k) {
             continue;
         }
         let Some(instances) = v.as_array_mut() else {
@@ -3510,10 +3507,8 @@ pub fn strip_covered_expanded(fragment: &Value, regs: &[FedReg]) -> Value {
         let covered: Vec<String> = o
             .keys()
             .filter(|k| {
-                !matches!(
-                    k.as_str(),
-                    "id" | "type" | "scope" | "createdAt" | "modifiedAt"
-                ) && regs.iter().any(|r| r.is_proxy() && r.covers_attr(k))
+                // the Entity's own members are no Attribute a source covers
+                !antares_model::is_meta(k) && regs.iter().any(|r| r.is_proxy() && r.covers_attr(k))
             })
             .cloned()
             .collect();
@@ -3580,6 +3575,26 @@ pub fn strip_proxied(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An unscoped proxy covers every Attribute, never the Entity's own
+    /// members: a local fragment keeps its expiresAt and deletedAt.
+    #[test]
+    fn a_covered_fragment_keeps_the_entity_members() {
+        let proxy = FedReg {
+            mode: "exclusive".into(),
+            ent_unrestricted: true,
+            ..fed_reg_of(
+                "urn:ngsi-ld:ContextSourceRegistration:p",
+                &json!({"endpoint": "http://peer:9090", "mode": "exclusive"}),
+            )
+        };
+        let fragment = json!({"id": "urn:x:1", "type": ["T"],
+            "expiresAt": "2999-01-01T00:00:00Z",
+            "https://example.org/speed": [{"type": "Property", "value": 1}]});
+        let kept = strip_covered_expanded(&fragment, &[proxy]);
+        assert_eq!(kept["expiresAt"], json!("2999-01-01T00:00:00Z"), "{kept}");
+        assert!(kept.get("https://example.org/speed").is_none(), "{kept}");
+    }
 
     /// Table 5.2.34-1: timeout and cooldown are Numbers; a fractional one
     /// is honoured (rounded up to whole milliseconds), not dropped.
