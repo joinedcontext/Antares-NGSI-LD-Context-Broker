@@ -1125,19 +1125,14 @@ impl AppState {
     }
 }
 
+/// Outbound timeouts stretch 10× under a sanitizer: the one switch, kept by
+/// the crate whose clients every outbound request uses.
+pub use antares_jsonld::slow_factor;
+
 /// The ONE outbound-client construction for this crate (timeouts at
 /// construction). Title-case headers are an http1 knob and timeouts are
 /// client-level knobs — both native-only; the browser's fetch supplies its
 /// own transport on wasm32.
-/// Outbound timeouts stretch 10× when the test binary runs under a
-/// sanitizer (ANTARES_TEST_SANITIZER, set by the strict workflow):
-/// ThreadSanitizer slows every thread, and 371 tests sharing one runner
-/// pushed loopback forwards past the 2 s connect / 5 s total limits —
-/// each run failing a different test with a 504. Production is unchanged.
-pub fn slow_factor() -> u64 {
-    antares_jsonld::slow_factor()
-}
-
 fn outbound_client(
     builder: reqwest::ClientBuilder,
     total: std::time::Duration,
