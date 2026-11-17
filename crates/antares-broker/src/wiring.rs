@@ -33,12 +33,23 @@ use antares_sql::store::Kind;
 use futures_util::StreamExt;
 use std::sync::Arc;
 
+/// `ANTARES_ROLES`. What each one wires under `ANTARES_BUS=nats`
+/// (docs/src/configuration.md says the same):
 #[derive(Clone, Copy, Debug)]
 pub struct Roles {
+    /// The HTTP API, the outbox drain, the subscription KV write side and
+    /// the registration mirror; history is recorded in its write path.
     pub api: bool,
+    /// The balanced matcher consumer and its deliveries: one consumer that
+    /// either of `matcher` and `notifier` wires.
     pub matcher: bool,
+    /// See `matcher`.
     pub notifier: bool,
+    /// Accepted, wires nothing of its own: history is recorded on the api
+    /// pods, and temporal maintenance runs on every Postgres pod.
     pub temporal: bool,
+    /// Accepted, wires nothing of its own: the registration mirror runs on
+    /// the api pods.
     pub registry: bool,
 }
 
