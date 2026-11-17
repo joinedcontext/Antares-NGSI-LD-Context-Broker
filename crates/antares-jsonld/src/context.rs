@@ -90,7 +90,7 @@ pub struct Context {
     /// The @context value to hand back in responses (Link header / body):
     /// what the client sent, before the implicit core merge.
     pub source: Value,
-    /// Total bytes of expanded term IRIs merged so far — see [`Context::charge`].
+    /// Total bytes the term definitions merged so far hold — see [`Context::charge`].
     bytes: usize,
 }
 
@@ -152,7 +152,7 @@ impl Context {
             match def {
                 Value::String(s) => {
                     let iri = self.expand_iri_for_def(s);
-                    self.charge(&iri)?;
+                    self.charge(term, &iri)?;
                     Arc::make_mut(&mut self.terms).insert(
                         term.clone(),
                         TermDef {
@@ -192,7 +192,7 @@ impl Context {
                             }
                         }
                     };
-                    self.charge(&id)?;
+                    self.charge(term, &id)?;
                     if let Some(scoped) = o.get("@context") {
                         let scope = self.scope_of(scoped);
                         Arc::make_mut(&mut self.scopes).insert(id.clone(), Arc::new(scope));
@@ -300,8 +300,19 @@ impl Context {
     /// IRIs are budgeted against the ceiling one @context document may
     /// occupy, on the Context rather than per call so a chain split across
     /// several documents cannot walk past it.
-    fn charge(&mut self, iri: &str) -> Result<(), NgsiError> {
-        self.bytes = self.bytes.saturating_add(iri.len());
+    ///
+    /// Each definition is charged what it holds in the term map, as
+    /// [`Context::heap_bytes`] models it: the term, its IRI and the fixed
+    /// slot cost. Charging the IRI alone let a document of many tiny
+    /// definitions build a term map tens of times its own size.
+    fn charge(&mut self, term: &str, iri: &str) -> Result<(), NgsiError> {
+        // a String header per key and value, hashbrown control bytes and
+        // load-factor slack, and the TermDef fields besides its IRI
+        const SLOT: usize = 2 * std::mem::size_of::<String>()
+            + 48
+            + (std::mem::size_of::<TermDef>() - std::mem::size_of::<String>());
+        let cost = SLOT.saturating_add(term.len()).saturating_add(iri.len());
+        self.bytes = self.bytes.saturating_add(cost);
         if self.bytes > crate::pinned::MAX_CONTEXT_BYTES {
             return Err(NgsiError::BadRequestData(
                 "@context term definitions exceed the maximum size".into(),
@@ -879,6 +890,28 @@ mod tests {
         );
     }
 
+    /// A definition costs the term map more than its IRI: the term, the slot
+    /// and the definition. Many tiny definitions whose IRIs alone fit the
+    /// budget are refused once what they hold passes it; the 20 000-term
+    /// vocabulary above still fits.
+    #[test]
+    fn many_tiny_definitions_are_charged_their_slot() {
+        let mut obj = Map::new();
+        for i in 0..60_000u32 {
+            obj.insert(format!("t{i}"), Value::String(format!("https://e.x/{i}")));
+        }
+        let iri_bytes: usize = obj.values().filter_map(Value::as_str).map(str::len).sum();
+        assert!(iri_bytes < crate::pinned::MAX_CONTEXT_BYTES);
+        let mut c = Context::default();
+        let err = c
+            .merge_object(&obj)
+            .expect_err("a term map past the budget must be refused");
+        assert!(
+            matches!(err, NgsiError::BadRequestData(_)),
+            "BadRequestData, got {err:?}"
+        );
+    }
+
     /// Self-referential and mutually-referential prefixes must terminate:
     /// term-definition IRI expansion resolves one level against the terms
     /// already merged, it never follows a chain recursively.
@@ -1103,7 +1136,9 @@ mod tests {
             c.freeze();
             c
         };
-        for noise in [0usize, 100_000] {
+        // 30 000 noise terms: three orders of magnitude past the five cases,
+        // and inside what one resolution may hold (`Context::charge`)
+        for noise in [0usize, 30_000] {
             let c = cases(noise);
             // longest match wins over the shorter one that also matches
             assert_eq!(
