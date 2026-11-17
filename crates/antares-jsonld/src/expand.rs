@@ -952,6 +952,12 @@ fn expand_instance(
     let obj = match v {
         Value::Object(o) => o,
         // concise: primitive / array value ⇒ Property
+        // a JSON null is no value in the concise form either (4.5.2)
+        Value::Null => {
+            return Err(bad(format!(
+                "attribute {name}: JSON null is not a valid value (use \"urn:ngsi-ld:null\")"
+            )))
+        }
         prim => {
             check_value_nulls(name, prim, opts)?;
             return Ok(json!({"type": "Property", "value": prim.clone()}));
@@ -4104,6 +4110,43 @@ mod reserved_member_guards {
         let out = expand_attr_fragment(frag.as_object().expect("obj"), &core())
             .expect("a URI datasetId is valid");
         assert_eq!(out["datasetId"], "urn:ngsi-ld:Dataset:a");
+    }
+
+    /// 4.2.2: "An NGSI-LD Value shall be either a rdfs:Literal or a node
+    /// object", and the normalized `{"value": null}` is refused for it: the
+    /// concise `"a": null` is the same Property and is refused the same way,
+    /// on every input, rather than stored with a null value.
+    #[test]
+    fn concise_json_null_is_not_stored_as_a_property_value() {
+        for opts in [
+            ExpandOpts::default(),
+            ExpandOpts {
+                fragment: true,
+                allow_null: true,
+                merge: true,
+                ..ExpandOpts::default()
+            },
+        ] {
+            for doc in [
+                json!({"id": "urn:ngsi-ld:T:1", "type": "T", "speed": null}),
+                json!({"id": "urn:ngsi-ld:T:1", "type": "T", "speed": {"type": "Property", "value": null}}),
+            ] {
+                let r = expand_entity(doc.as_object().expect("obj"), &core(), opts);
+                assert!(
+                    matches!(r, Err(NgsiError::BadRequestData(_))),
+                    "{doc} with {opts:?}: {r:?}"
+                );
+            }
+        }
+        // negative: a concise value that is not null is still a Property
+        let doc = json!({"id": "urn:ngsi-ld:T:1", "type": "T", "speed": 0});
+        let out = expand_entity(
+            doc.as_object().expect("obj"),
+            &core(),
+            ExpandOpts::default(),
+        )
+        .expect("a concise 0 is a value");
+        assert!(out.to_string().contains("\"value\":0"), "{out}");
     }
 
     /// 5.2.1: "In all other cases, implementations shall raise an error of
