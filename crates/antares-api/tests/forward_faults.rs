@@ -234,3 +234,33 @@ async fn each_forwarded_batch_item_travels_under_its_own_context() {
         assert!(req.contains(mine) && !req.contains(other), "{req}");
     }
 }
+
+/// Per-Entity delete forwards run concurrently (bounded by
+/// ANTARES_FED_FANOUT), so a batch holds its admission slot for about one
+/// round trip, not one per Entity.
+#[tokio::test(flavor = "multi_thread")]
+async fn per_entity_delete_forwards_run_concurrently() {
+    let st = state();
+    let ids: Vec<String> = (0..6)
+        .map(|i| format!("urn:ngsi-ld:Vehicle:d{i}"))
+        .collect();
+    for id in &ids {
+        create(&st, serde_json::json!({"id": id, "type": "Vehicle"})).await;
+    }
+    let delay = std::time::Duration::from_millis(300);
+    let (port, seen) = mock(NO_CONTENT, delay);
+    register(&st, port, &["deleteEntity"]).await;
+    let started = std::time::Instant::now();
+    let (status, _, answer) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/delete",
+        "application/json",
+        Some(serde_json::to_string(&ids).unwrap()),
+    )
+    .await;
+    let took = started.elapsed();
+    assert!(status < 300, "{status} {answer}");
+    assert_eq!(seen.lock().unwrap().len(), ids.len());
+    assert!(took < delay * 3, "took {took:?} for {} forwards", ids.len());
+}
