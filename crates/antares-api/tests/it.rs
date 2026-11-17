@@ -43,6 +43,7 @@ mod expiry_sub_attr_4_22;
 mod fed_entity_map_shape_5_2_39;
 mod fed_fanout_4_3_6;
 mod fed_query_entity_types_4_3_6_1;
+mod fed_query_paging_5_7_2;
 mod fed_warning_bounds_6_3_17;
 mod federation_loop;
 mod federation_store_failure_5_7;

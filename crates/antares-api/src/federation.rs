@@ -1171,6 +1171,121 @@ async fn ask_transport(st: &AppState, built: &BuiltForward<'_>) -> Option<Forwar
     Some((status, body, warnings))
 }
 
+/// Most full pages of one Context Source a distributed query reads. The
+/// merge (4.3.6.1) and the client's page are formed here, so a source is
+/// read past its own page size; this ceiling bounds what one source can
+/// make one query hold.
+const FED_QUERY_PAGES: usize = 10;
+
+/// The page size a distributed query asks a Context Source for, and how
+/// many matches of that source it reads: what the client's page can draw
+/// from it (offset + limit, one more to know a next page exists, every id
+/// the request names), or all of them when the count is asked or the
+/// filters are applied here rather than at the source (5.7.2.4 split
+/// entities, a registered jsonldContext). The third value says the
+/// ceiling ([`FED_QUERY_PAGES`]) set the amount rather than the request.
+fn fed_read_bounds(
+    st: &AppState,
+    params: &HashMap<String, String>,
+    filters_pushed: bool,
+) -> (usize, usize, bool) {
+    let page = st.max_limit.max(1);
+    let cap = page.saturating_mul(FED_QUERY_PAGES);
+    let num = |k: &str, d: usize| params.get(k).and_then(|v| v.parse().ok()).unwrap_or(d);
+    let wanted = if params.get("count").map(String::as_str) == Some("true") || !filters_pushed {
+        usize::MAX
+    } else {
+        let ids = params.get("id").map_or(0, |l| l.split(',').count());
+        num("offset", 0)
+            .saturating_add(num("limit", st.default_limit))
+            .saturating_add(1)
+            .max(ids)
+    };
+    (page, wanted.min(cap), wanted > cap)
+}
+
+/// A forwarded read that pages the Context Source: 5.7.2.4 merges every
+/// source's matches before the client's page is cut, so a source's answer
+/// is read past its own default page, `page` at a time, until it runs out
+/// or `need` matches arrived. The answer is the first page's status with
+/// every page's Entities; a later page that fails keeps what arrived and
+/// adds its own warning. The flag is set when the source still had more.
+#[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
+async fn forward_pages(
+    st: &AppState,
+    method: reqwest::Method,
+    url: String,
+    query: &[(String, String)],
+    headers: &HeaderMap,
+    tenant: &TenantId,
+    reg: &FedReg,
+    ctx_url: &str,
+    body: Option<Value>,
+    (page, need): (usize, usize),
+) -> (ForwardAnswer, Option<std::sync::Arc<Context>>, bool) {
+    let mut got: Vec<Value> = Vec::new();
+    let mut warns: Vec<String> = Vec::new();
+    let mut first: Option<(u16, Option<std::sync::Arc<Context>>)> = None;
+    let mut offset = 0usize;
+    let mut more = false;
+    loop {
+        let lim = page.min(need.saturating_sub(got.len())).max(1);
+        let mut q = query.to_vec();
+        q.push(("limit".into(), lim.to_string()));
+        if offset > 0 {
+            q.push(("offset".into(), offset.to_string()));
+        }
+        let ((status, answer, w), actx) = forward_in(
+            st,
+            method.clone(),
+            url.clone(),
+            &q,
+            headers,
+            tenant,
+            reg,
+            ctx_url,
+            body.clone(),
+        )
+        .await;
+        warns.extend(w);
+        let items = match answer {
+            Value::Array(items) if (200..300).contains(&status) => items,
+            other => {
+                if first.is_none() {
+                    return ((status, other, warns), actx, false);
+                }
+                if let Some((code, text)) = read_warning(status, &other) {
+                    warns.push(warning(code, &alias_for(&st.host_alias, tenant), text));
+                }
+                break;
+            }
+        };
+        let n = items.len();
+        got.extend(items);
+        first.get_or_insert((status, actx));
+        if n != lim {
+            break;
+        }
+        if got.len() >= need {
+            more = true;
+            break;
+        }
+        offset = offset.saturating_add(n);
+    }
+    let (status, actx) = first.unwrap_or((200, None));
+    ((status, Value::Array(got), warns), actx, more)
+}
+
+/// 6.3.17 for a source [`forward_pages`] stopped reading at its ceiling:
+/// the merged answer lacks some of its matches, and the client is told.
+fn cut_warning(st: &AppState, tenant: &TenantId) -> String {
+    warning(
+        199,
+        &alias_for(&st.host_alias, tenant),
+        "the registration endpoint holds more matches than one distributed query reads",
+    )
+}
+
 /// The request one forward sends: the 4.3.6.6 processing, the headers and
 /// the payload, exactly as the HTTP client puts them on the wire.
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
@@ -2311,7 +2426,7 @@ pub async fn fed_query(
         .collect();
     let fetched = fan_out(regs, move |reg| async move {
         let Some(op) = reg.query_op() else {
-            return (reg, 0, Value::Null, Vec::new(), None);
+            return (reg, 0, Value::Null, Vec::new(), None, false);
         };
         // The forwarded selection is decided ONCE and then rendered either as
         // query parameters (Query Entities, 5.7.2) or as a Query body
@@ -2362,7 +2477,8 @@ pub async fn fed_query(
                 .filter(|v| forwardable(k, v))
                 .map(String::to_owned)
         };
-        let ((status, body, peer_warns), actx) = if op == "queryBatch" {
+        let bounds = fed_read_bounds(st, params, push_filters);
+        let ((status, body, peer_warns), actx, more) = if op == "queryBatch" {
             let mut sel = Map::new();
             if let Some(t) = params.get("type") {
                 sel.insert("type".into(), Value::String(t.clone()));
@@ -2416,7 +2532,7 @@ pub async fn fed_query(
             if !geo.is_empty() {
                 q_body.insert("geoQ".into(), Value::Object(geo));
             }
-            forward_in(
+            forward_pages(
                 st,
                 reqwest::Method::POST,
                 format!("{}/ngsi-ld/v1/entityOperations/query", reg.endpoint),
@@ -2426,6 +2542,7 @@ pub async fn fed_query(
                 &reg,
                 ctx_url,
                 Some(Value::Object(q_body)),
+                (bounds.0, bounds.1),
             )
             .await
         } else {
@@ -2460,7 +2577,7 @@ pub async fn fed_query(
                     query.push((k.into(), v));
                 }
             }
-            forward_in(
+            forward_pages(
                 st,
                 reqwest::Method::GET,
                 format!("{}/ngsi-ld/v1/entities", reg.endpoint),
@@ -2470,16 +2587,20 @@ pub async fn fed_query(
                 &reg,
                 ctx_url,
                 None,
+                (bounds.0, bounds.1),
             )
             .await
         };
-        (reg, status, body, peer_warns, actx)
+        (reg, status, body, peer_warns, actx, more && bounds.2)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns, actx) in fetched {
+    for (reg, status, body, peer_warns, actx, cut) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
+        }
+        if cut {
+            warnings.push(cut_warning(st, tenant));
         }
         if let Value::Array(a) = &body {
             // Scope gate — see in_scope.
@@ -2711,7 +2832,8 @@ pub async fn fed_query_temporal(
         // filters are stripped from the forward and applied on the
         // aggregate; a registered jsonldContext cannot recompact q/scopeQ
         // terms, so push-down is skipped there too.
-        if !split_entities(params) && !has_reg_context(&reg) {
+        let push_filters = !split_entities(params) && !has_reg_context(&reg);
+        if push_filters {
             for k in [
                 "q",
                 "georel",
@@ -2730,7 +2852,8 @@ pub async fn fed_query_temporal(
         } else if let Some(a) = params.get("attrs") {
             query.push(("attrs".into(), a.clone()));
         }
-        let ((status, body, peer_warns), actx) = forward_in(
+        let bounds = fed_read_bounds(st, params, push_filters);
+        let ((status, body, peer_warns), actx, more) = forward_pages(
             st,
             reqwest::Method::GET,
             format!("{}/ngsi-ld/v1/temporal/entities", reg.endpoint),
@@ -2740,15 +2863,19 @@ pub async fn fed_query_temporal(
             &reg,
             ctx_url,
             None,
+            (bounds.0, bounds.1),
         )
         .await;
-        (reg, status, body, peer_warns, actx)
+        (reg, status, body, peer_warns, actx, more && bounds.2)
     })
     .await;
     let mut out = Vec::new();
-    for (reg, status, body, peer_warns, actx) in fetched {
+    for (reg, status, body, peer_warns, actx, cut) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
             continue;
+        }
+        if cut {
+            warnings.push(cut_warning(st, tenant));
         }
         if let Value::Array(a) = &body {
             // Same scope gate as the non-temporal query fan-out.
