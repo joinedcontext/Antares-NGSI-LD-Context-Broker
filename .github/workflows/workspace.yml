@@ -247,6 +247,11 @@ jobs:
       # plausible percentage rather than an error.
       - name: Coverage attribution self-check
         run: python3 dev/coverage-attribution.py --selftest
+      # The dependency vet (deps-vet.yml) is a gate whose wrong answer is a
+      # green check: a lockfile diff it misreads or a rule that stops firing
+      # passes everything. Its fixtures plant each rule once, offline.
+      - name: Dependency vet self-check
+        run: python3 dev/deps-vet.py selftest
       # Ledger integrity: a clause file that stops parsing silently
       # drops out of every count — make that (and status typos, robot drift)
       # a red build instead.
