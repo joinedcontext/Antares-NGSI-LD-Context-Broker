@@ -603,6 +603,29 @@ pub struct ProjNode {
     pub children: Option<Vec<ProjNode>>,
 }
 
+/// 4.21 projection: the terms of `s` split at `,` and `|` outside braces;
+/// None when a `}` closes nothing.
+pub(crate) fn split_top(s: &str) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth = depth.saturating_add(1),
+            '}' => depth = depth.checked_sub(1)?,
+            // 4.21 orOp = | / , — both split at the same depth
+            ',' | '|' if depth == 0 => {
+                out.push(&s[start..i]);
+                // the separator is one byte
+                start = i.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    Some(out)
+}
+
 /// Parse + validate a pick=/omit= value (4.21) into a projection tree.
 pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, NgsiError> {
     let bad = || NgsiError::BadRequestData(format!("invalid attribute projection {s:?} (4.21)"));
@@ -620,26 +643,6 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
             .all(|c| c.is_ascii_alphanumeric() || "_,.:{}#/%-+@|".contains(c))
     {
         return Err(bad());
-    }
-    fn split_top(s: &str) -> Option<Vec<&str>> {
-        let mut out = Vec::new();
-        let mut depth = 0usize;
-        let mut start = 0usize;
-        for (i, c) in s.char_indices() {
-            match c {
-                '{' => depth = depth.saturating_add(1),
-                '}' => depth = depth.checked_sub(1)?,
-                // 4.21 orOp = | / , — both split at the same depth
-                ',' | '|' if depth == 0 => {
-                    out.push(&s[start..i]);
-                    // the separator is one byte
-                    start = i.saturating_add(1);
-                }
-                _ => {}
-            }
-        }
-        out.push(&s[start..]);
-        Some(out)
     }
     fn parse_nodes(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, NgsiError> {
         let bad = |m: &str| NgsiError::BadRequestData(format!("invalid attribute projection: {m}"));
