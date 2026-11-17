@@ -123,6 +123,11 @@ impl NatsBus {
     /// Core NATS request/reply, no JetStream: `payload` to `subject`, the
     /// reply within `within`; `None` when nobody answered in time (no
     /// subscriber is an immediate `None`).
+    ///
+    /// With [`Self::reply`], a seam for code built on this crate outside
+    /// the broker (an out-of-tree role that asks the other pods a question
+    /// on one subject): the broker itself calls neither, and the pair is
+    /// held to its contract by the bus's own NATS suite.
     pub async fn request(
         &self,
         subject: String,
