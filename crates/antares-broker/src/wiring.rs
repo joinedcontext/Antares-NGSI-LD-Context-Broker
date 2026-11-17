@@ -93,21 +93,12 @@ impl Roles {
     }
 }
 
-/// ANTARES_OUTBOX_DRAIN: `on` (the default) or `off`, and nothing else. A
-/// typo'd `of` read as "on" under the old permissive parse, quietly defeating
-/// the dedicated-drainer split and the crash drill it exists for.
+/// ANTARES_OUTBOX_DRAIN: on (the default) or off, in the shared switch
+/// grammar, and nothing else. A typo'd `of` read as "on" under the old
+/// permissive parse, quietly defeating the dedicated-drainer split and the
+/// crash drill it exists for.
 pub fn outbox_drain_enabled() -> Result<bool, String> {
-    match std::env::var("ANTARES_OUTBOX_DRAIN") {
-        Err(std::env::VarError::NotPresent) => Ok(true),
-        Err(e) => Err(format!("ANTARES_OUTBOX_DRAIN is unreadable: {e}")),
-        Ok(v) => match v.as_str() {
-            "on" => Ok(true),
-            "off" => Ok(false),
-            other => Err(format!(
-                "ANTARES_OUTBOX_DRAIN must be on|off, got {other:?}"
-            )),
-        },
-    }
+    crate::switch("ANTARES_OUTBOX_DRAIN", true)
 }
 
 /// One iteration of a background loop with a panic in it contained: the
@@ -1574,7 +1565,11 @@ mod tests {
         assert!(!outbox_drain_enabled().expect("off"));
         std::env::set_var("ANTARES_OUTBOX_DRAIN", "on");
         assert!(outbox_drain_enabled().expect("on"));
-        for bad in ["", "of", "false", "0", "OFF", "no"] {
+        for off in ["false", "0", "OFF", "no"] {
+            std::env::set_var("ANTARES_OUTBOX_DRAIN", off);
+            assert!(!outbox_drain_enabled().expect("off"), "{off:?}");
+        }
+        for bad in ["of", "drain", "2"] {
             std::env::set_var("ANTARES_OUTBOX_DRAIN", bad);
             let err = outbox_drain_enabled()
                 .expect_err(&format!("ANTARES_OUTBOX_DRAIN={bad:?} must be fatal"));

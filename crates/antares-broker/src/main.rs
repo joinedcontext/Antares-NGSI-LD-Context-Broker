@@ -294,17 +294,26 @@ fn mem_history_warning(history: Option<&str>, cap: usize) -> Option<String> {
     })
 }
 
-/// An explicitly-off switch value, whatever the operator's spelling. Used by
-/// the knobs where the DEFAULT is off, so that only an off value keeps them
-/// off and a typo cannot silently disable a security control.
-fn is_off(v: &str) -> bool {
-    let v = v.trim();
-    v.is_empty()
-        || v == "0"
-        || v.eq_ignore_ascii_case("false")
-        || v.eq_ignore_ascii_case("off")
-        || v.eq_ignore_ascii_case("no")
+/// An on/off switch of the environment, read by the one grammar every
+/// `ANTARES_*` switch shares ([`antares_model::parse_switch`]): unset or
+/// empty is `default`, an unknown spelling is an error naming the key.
+fn switch(key: &str, default: bool) -> Result<bool, String> {
+    antares_model::parse_switch(key, std::env::var(key).ok().as_deref(), default)
 }
+
+/// The on/off switches this process reads, each with its default: parsed
+/// at the very start, so an unknown spelling fails the process before
+/// anything (the telemetry stack included) runs on a guess.
+const SWITCHES: &[(&str, bool)] = &[
+    ("ANTARES_TELEMETRY", false),
+    ("ANTARES_REQUIRE_RLS", false),
+    ("ANTARES_ALLOW_SHARED_LOCAL", false),
+    ("ANTARES_PG_BATCH_ASYNC_COMMIT", false),
+    ("ANTARES_OUTBOX_DRAIN", true),
+    ("ANTARES_EGRESS_ALLOW_PRIVATE", true),
+    ("ANTARES_MIGRATE", true),
+    ("ANTARES_TEMPORAL_DEDUP", true),
+];
 
 /// ANTARES_METRICS_PORT: unset or empty is no metrics listener; a port is
 /// one that differs from the API port (both binds would fail, the second
@@ -382,6 +391,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `client_builder`, which a dependency does not call.
     antares_jsonld::install_crypto_provider();
 
+    for (key, default) in SWITCHES {
+        switch(key, *default)?;
+    }
+
     // Tracing (fmt + env-gated OTLP [+ console feature]) and, with the
     // `telemetry` feature, the Prometheus recorder rendering /q/metrics.
     let metrics_render = telemetry::init()?;
@@ -457,8 +470,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bus_mode = std::env::var("ANTARES_BUS").unwrap_or_else(|_| "local".into());
     if bus_mode == "local"
         && shared_state(&store_name)
-        && !std::env::var("ANTARES_ALLOW_SHARED_LOCAL")
-            .is_ok_and(|v| matches!(v.as_str(), "1" | "true"))
+        && !switch("ANTARES_ALLOW_SHARED_LOCAL", false)?
     {
         return Err(format!(
             "ANTARES_BUS=local with ANTARES_STORE={store_name} double-fires notifications when \
@@ -538,24 +550,10 @@ fn parse_pg_statement_timeout(raw: Option<&str>) -> Result<std::time::Duration, 
 }
 
 /// ANTARES_PG_BATCH_ASYNC_COMMIT → batch writes commit asynchronously:
-/// absent or an off value = no; `1`/`true`/`on`/`yes` = yes;
-/// anything else is fatal, so a typo never silently picks a durability.
+/// absent or an off value = no, an on value = yes; anything else is fatal,
+/// so a typo never silently picks a durability.
 fn parse_pg_batch_async_commit(raw: Option<&str>) -> Result<bool, String> {
-    match raw.map(str::trim) {
-        None => Ok(false),
-        Some(v) if is_off(v) => Ok(false),
-        Some(v)
-            if v == "1"
-                || ["true", "on", "yes"]
-                    .iter()
-                    .any(|o| v.eq_ignore_ascii_case(o)) =>
-        {
-            Ok(true)
-        }
-        Some(v) => Err(format!(
-            "ANTARES_PG_BATCH_ASYNC_COMMIT must be true or false (got {v:?})"
-        )),
-    }
+    antares_model::parse_switch("ANTARES_PG_BATCH_ASYNC_COMMIT", raw, false)
 }
 
 /// ANTARES_SECRET_KEY: the key that seals the notification credentials, in
@@ -976,10 +974,9 @@ async fn build_builtin(
                             // A gate that only understands two spellings
                             // fails OPEN on `TRUE`/`yes`/`on`: the operator
                             // believes RLS is enforced and the broker serves
-                            // with a BYPASSRLS role. Anything but an explicit
-                            // off value turns it on.
-                            let strict =
-                                std::env::var("ANTARES_REQUIRE_RLS").is_ok_and(|v| !is_off(&v));
+                            // with a BYPASSRLS role. Every on spelling turns
+                            // it on, and an unknown one stopped the boot.
+                            let strict = switch("ANTARES_REQUIRE_RLS", false)?;
                             if strict {
                                 return Err(
                                     "ANTARES_REQUIRE_RLS=1 but the database role bypasses \
@@ -1842,24 +1839,37 @@ mod accept_loop_tests {
 
 #[cfg(test)]
 mod switch_tests {
-    use super::is_off;
+    use super::{switch, SWITCHES};
 
-    /// The knobs whose default is OFF (ANTARES_REQUIRE_RLS, ANTARES_TELEMETRY)
-    /// must fail SAFE on a spelling they do not know: recognizing only
-    /// `1|true` turned the RLS gate off on `TRUE`/`yes`/`on` while the
-    /// operator believed it was enforced.
+    /// Every switch reads the one grammar: the security gates whose default
+    /// is OFF (ANTARES_REQUIRE_RLS, ANTARES_ALLOW_SHARED_LOCAL) turn on with
+    /// every on spelling (`1|true` alone turned the RLS gate off on
+    /// `TRUE`/`yes`/`on`), and a spelling none of them knows stops the
+    /// process instead of picking a side.
     #[test]
-    fn only_an_explicit_off_value_reads_as_off() {
-        for off in [
-            "0", "false", "FALSE", "False", "off", "OFF", "no", "", " ", " 0\t",
-        ] {
-            assert!(is_off(off), "{off:?} must read as off");
+    fn every_switch_reads_one_grammar() {
+        let read = |key: &str, raw: &str, default: bool| {
+            antares_model::parse_switch(key, Some(raw), default)
+        };
+        for (key, default) in SWITCHES {
+            assert!(
+                super::known_keys().any(|k| k == *key),
+                "{key} is not a known key"
+            );
+            assert_eq!(read(key, "", *default), Ok(*default), "{key} empty");
+            for on in ["1", "TRUE", "on", "Yes", " 1 "] {
+                assert_eq!(read(key, on, *default), Ok(true), "{key}={on:?}");
+            }
+            for off in ["0", "false", "OFF", "no", " 0\t"] {
+                assert_eq!(read(key, off, *default), Ok(false), "{key}={off:?}");
+            }
+            for bad in ["of", "enabled", "2"] {
+                let e = read(key, bad, *default).expect_err(bad);
+                assert!(e.contains(key), "{e}");
+            }
         }
-        for on in [
-            "1", "true", "TRUE", "True", "on", "On", "yes", "YES", " 1 ", "enabled",
-        ] {
-            assert!(!is_off(on), "{on:?} must NOT read as off");
-        }
+        // the env-reading form answers the same: a key no test sets
+        assert_eq!(switch("ANTARES_TEST_UNSET_SWITCH", true), Ok(true));
     }
 }
 

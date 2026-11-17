@@ -27,12 +27,12 @@ use std::sync::Arc;
 /// identically with and without the `telemetry` feature.
 pub type MetricsRender = Arc<dyn Fn() -> String + Send + Sync>;
 
-/// Is the observability stack switched on for this process? The default is
-/// off, so ANY value that is not an explicit off spelling arms it — a knob
+/// Is the observability stack switched on for this process? Off by
+/// default; every on spelling of the shared switch grammar arms it (a knob
 /// that recognized only `1|true|on` disabled the whole stack on `TRUE`
-/// without a word.
+/// without a word). An unknown spelling stops `main` before this is read.
 pub fn enabled() -> bool {
-    std::env::var("ANTARES_TELEMETRY").is_ok_and(|v| !crate::is_off(&v))
+    crate::switch("ANTARES_TELEMETRY", false).unwrap_or(false)
 }
 
 // Strip `user:password@` userinfo (RFC 3986 clause 3.2.1) out of a URL before
