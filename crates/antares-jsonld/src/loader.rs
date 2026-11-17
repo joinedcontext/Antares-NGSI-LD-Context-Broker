@@ -660,11 +660,13 @@ fn ttl_from_headers(
         }
     }
     if let Some(exp) = expires {
-        // HTTP-date (RFC 7231); an unparsable or past Expires means "stale".
-        let when = chrono::DateTime::parse_from_rfc2822(exp).ok()?;
-        let delta = when
-            .with_timezone(&chrono::Utc)
-            .signed_duration_since(chrono::Utc::now());
+        // RFC 7234 5.3: "A cache recipient MUST interpret invalid date
+        // formats, especially the value "0", as representing a time in the
+        // past (i.e., already expired)". A past Expires is stale too.
+        let Some(when) = http_date(exp) else {
+            return Some(std::time::Duration::ZERO);
+        };
+        let delta = when.signed_duration_since(chrono::Utc::now());
         return Some(
             delta
                 .to_std()
@@ -673,6 +675,19 @@ fn ttl_from_headers(
         );
     }
     None
+}
+
+/// An HTTP-date (RFC 7231 7.1.1.1): the IMF-fixdate, and the two obsolete
+/// formats a recipient "MUST accept", RFC 850 and asctime, all in GMT.
+fn http_date(v: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let v = v.trim();
+    if let Ok(d) = chrono::DateTime::parse_from_rfc2822(v) {
+        return Some(d.with_timezone(&chrono::Utc));
+    }
+    ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+        .iter()
+        .find_map(|f| chrono::NaiveDateTime::parse_from_str(v, f).ok())
+        .map(|d| d.and_utc())
 }
 
 /// Cap on usage-registry entries (client-supplied URLs); past it, adding a
@@ -2069,6 +2084,23 @@ mod tests {
         );
         let future = ttl_from_headers(None, Some("Fri, 01 Jan 2100 00:00:00 GMT"));
         assert!(future.expect("parsed") > std::time::Duration::from_secs(3600));
+        // RFC 7234 5.3: an invalid Expires, "0" above all, is already expired,
+        // never "no lifetime" (which would cache until evicted).
+        for bad in ["0", "-1", "soon", ""] {
+            assert_eq!(
+                ttl_from_headers(None, Some(bad)),
+                Some(std::time::Duration::ZERO),
+                "Expires: {bad:?} = stale"
+            );
+        }
+        // the obsolete HTTP-date formats a recipient must accept still parse
+        for obsolete in ["Friday, 01-Jan-38 00:00:00 GMT", "Fri Jan  1 00:00:00 2100"] {
+            assert!(
+                ttl_from_headers(None, Some(obsolete)).expect("a lifetime")
+                    > std::time::Duration::from_secs(3600),
+                "{obsolete:?} is a future date"
+            );
+        }
         // Header values are remote input; an unclamped lifetime overflows
         // Instant arithmetic when added to now(). Both paths clamp to a year.
         let year = std::time::Duration::from_secs(31_536_000);
