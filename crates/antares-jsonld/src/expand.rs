@@ -1607,10 +1607,19 @@ fn check_ring(v: &Value) -> Result<(), String> {
     if a.len() < 4 {
         return Err(format!("linear ring has {} positions (minimum 4)", a.len()));
     }
-    if a.first() != a.last() {
+    a.iter().try_for_each(check_position)?;
+    // RFC 7946 3.1.6: the first and last positions "MUST contain identical
+    // values": compared as numbers, so `100` closes a ring opened at `100.0`
+    let same = |p: Option<&Value>, q: Option<&Value>| -> bool {
+        let coords = |v: Option<&Value>| -> Option<Vec<f64>> {
+            v?.as_array()?.iter().map(Value::as_f64).collect()
+        };
+        matches!((coords(p), coords(q)), (Some(x), Some(y)) if x == y)
+    };
+    if !same(a.first(), a.last()) {
         return Err("linear ring is not closed (first != last position)".into());
     }
-    a.iter().try_for_each(check_position)
+    Ok(())
 }
 
 fn each(v: &Value, what: &str, f: impl FnMut(&Value) -> Result<(), String>) -> Result<(), String> {
@@ -2262,6 +2271,19 @@ mod tests {
             let err = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default());
             assert!(err.is_err(), "{t}");
         }
+    }
+
+    /// RFC 7946 3.1.6: a ring is closed when its first and last positions
+    /// hold identical VALUES, whatever their JSON spelling; a ring that is
+    /// open is still refused.
+    #[test]
+    fn ring_closed_by_an_equal_number_in_another_spelling() {
+        let c = serde_json::json!([[[100, 0], [101, 0], [101, 1], [100.0, 0.0]]]);
+        assert!(check_geometry("Polygon", &c).is_ok());
+        let open = serde_json::json!([[[100, 0], [101, 0], [101, 1], [100.5, 0.0]]]);
+        assert!(check_geometry("Polygon", &open).is_err());
+        let short = serde_json::json!([[[100, 0], [101, 0], [101, 1], [100]]]);
+        assert!(check_geometry("Polygon", &short).is_err());
     }
 
     /// 4.6.3: the fraction separator is "a decimal point"; "In requests, also
