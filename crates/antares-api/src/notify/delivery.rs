@@ -303,7 +303,10 @@ pub(super) async fn deliver_as(
             .and_then(Value::as_array)
             .is_some_and(|ri| {
                 ri.iter().any(|kv| {
-                    kv.get("key").and_then(Value::as_str) == Some("Prefer")
+                    // a header name, so any case (RFC 9110 5.1)
+                    kv.get("key")
+                        .and_then(Value::as_str)
+                        .is_some_and(|k| k.eq_ignore_ascii_case("Prefer"))
                         && kv.get("value").and_then(Value::as_str) == Some("body=json")
                 })
             });
