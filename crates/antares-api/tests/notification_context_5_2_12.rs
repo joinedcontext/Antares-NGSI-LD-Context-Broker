@@ -134,3 +134,58 @@ async fn a_notification_falls_back_to_the_context_the_subscription_was_made_with
          it: {n}"
     );
 }
+
+/// 5.13.1: the ImplicitlyCreated @context a Subscription is hosted under is
+/// the one row of that @context in its Tenant: a second Subscription with
+/// the same inline @context, and a create refused as a duplicate, add none.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_inline_context_is_one_implicit_row_for_every_subscription() {
+    let st = AppState::new("test-implicit-row".into());
+    let sub = |id: &str| {
+        json!({
+            "id": id,
+            "type": "Subscription",
+            "entities": [{"type": "Vehicle"}],
+            "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}},
+            "@context": {"velocity": SPEED_IRI}
+        })
+        .to_string()
+    };
+    for id in [
+        "urn:ngsi-ld:Subscription:implicit-1",
+        "urn:ngsi-ld:Subscription:implicit-2",
+    ] {
+        let (status, body) = call(&st, "subscriptions", "application/ld+json", &sub(id)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = call(
+        &st,
+        "subscriptions",
+        "application/ld+json",
+        &sub("urn:ngsi-ld:Subscription:implicit-1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let get = |path: String| {
+        let st = st.clone();
+        async move {
+            let resp = antares_api::router(st)
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/ngsi-ld/v1/{path}"))
+                        .body(Body::empty())
+                        .expect("req"),
+                )
+                .await
+                .expect("resp");
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
+        }
+    };
+    let one = get("subscriptions/urn:ngsi-ld:Subscription:implicit-1".into()).await;
+    let two = get("subscriptions/urn:ngsi-ld:Subscription:implicit-2".into()).await;
+    assert!(one["jsonldContext"].is_string(), "{one}");
+    assert_eq!(one["jsonldContext"], two["jsonldContext"]);
+    let rows = get("jsonldContexts?kind=ImplicitlyCreated".into()).await;
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+}

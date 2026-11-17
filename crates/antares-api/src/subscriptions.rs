@@ -1094,28 +1094,26 @@ pub async fn create(
         if let Some(url) = one_url {
             norm.insert("jsonldContext".into(), Value::String(url));
         } else {
-            // 5.13.2.4: "a locally unique identifier (URI)"
-            let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-            let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
-            st.store
-                .context_put(
-                    Some(&tenant),
-                    &local_id,
-                    serde_json::json!({
-                        "url": url,
-                        "localId": local_id,
-                        "kind": "ImplicitlyCreated",
-                        "createdAt": ts,
-                        // owned by the tenant whose subscription created it
-                        "owner": tenant.as_str(),
-                        "body": {"@context": parsed.ctx.source.clone()},
-                    }),
+            // hosted as a read hosts one: one content-addressed row per
+            // distinct @context of the Tenant, under the Tenant's cap, so a
+            // refused or repeated create adds no row
+            let hosted = crate::contexts::linkable(
+                st,
+                &tenant,
+                headers,
+                &parsed.ctx,
+                crate::negotiate::Accept::Json,
+            )
+            .await?;
+            let Some(url) = hosted.source.as_str() else {
+                return Err(NgsiError::TooManyResults(
+                    "the Tenant holds the most ImplicitlyCreated @contexts it may; \
+                     name the Subscription's @context by URL"
+                        .into(),
                 )
-                .await?;
-            st.loader
-                .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
-                .await;
-            norm.insert("jsonldContext".into(), Value::String(url));
+                .into());
+            };
+            norm.insert("jsonldContext".into(), Value::String(url.to_owned()));
         }
     }
     let doc = Value::Object(norm);
