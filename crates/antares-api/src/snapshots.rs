@@ -206,6 +206,38 @@ async fn snap_put(
         .and_then(Result::ok)
 }
 
+/// 5.16.4.4 / 5.5.8: merge an Update Snapshot fragment onto the stored
+/// document: the updatable members, the expiry a new lifetime moves, the
+/// default priority again for a removed one.
+fn merge_update(o: &mut Map<String, Value>, mut frag: Map<String, Value>) -> Result<(), NgsiError> {
+    keep_receiver_info(&mut frag, o)?;
+    for k in [
+        "snapshotLifetime",
+        "snapshotPriority",
+        "endpoint",
+        "receiverInfo",
+    ] {
+        match frag.get(k) {
+            None => {}
+            Some(Value::Null) => {
+                o.remove(k);
+            }
+            Some(v) => {
+                o.insert(k.into(), v.clone());
+            }
+        }
+    }
+    if frag.contains_key("snapshotLifetime") {
+        // "it is possible to indirectly update expiresAt" (5.2.41)
+        o.insert("expiresAt".into(), Value::String(expires_at(o)?));
+    }
+    // a removed priority is the default one again (Table 5.2.41-1)
+    o.entry("snapshotPriority".to_owned())
+        .or_insert(Value::Number(5.into()));
+    o.insert("modifiedAt".into(), Value::String(now_iso()));
+    Ok(())
+}
+
 /// Remove a snapshot everywhere: doc, synth-tenant index, data purge.
 pub(crate) async fn snap_remove(st: &AppState, tenant: &TenantId, id: &str, meta: &Value) {
     let _ = st.store.delete(tenant, Kind::Snapshot, id).await;
@@ -1313,41 +1345,28 @@ pub async fn update_snapshot(
         let v = parse_body(&st, &headers, &body, BodyKind::MergePatch)
             .await?
             .value;
-        let mut frag = validate(&v, Mode::Update)?;
-        let mut meta = snap_get(&st, &tenant, &id)
+        let frag = validate(&v, Mode::Update)?;
+        let gone = || NgsiError::ResourceNotFound(format!("snapshot {id} not found"));
+        snap_get(&st, &tenant, &id).await?.ok_or_else(gone)?;
+        // merged onto the document as stored at the write, under its row
+        // lock: two updates of different members keep each other's
+        let meta = match st
+            .store
+            .mutate(&tenant, Kind::Snapshot, &id, |d| {
+                let Some(o) = d.as_object_mut() else {
+                    return Err(NgsiError::InternalError(
+                        "stored snapshot is not a JSON object".into(),
+                    ));
+                };
+                merge_update(o, frag.clone())?;
+                Ok(d.clone())
+            })
             .await?
-            .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
-        if let Some(o) = meta.as_object_mut() {
-            keep_receiver_info(&mut frag, o)?;
-            // 5.16.4.4 / 5.5.8 merge of the updatable members
-            for k in [
-                "snapshotLifetime",
-                "snapshotPriority",
-                "endpoint",
-                "receiverInfo",
-            ] {
-                match frag.get(k) {
-                    None => {}
-                    Some(Value::Null) => {
-                        o.remove(k);
-                    }
-                    Some(v) => {
-                        o.insert(k.into(), v.clone());
-                    }
-                }
-            }
-            if frag.contains_key("snapshotLifetime") {
-                // "it is possible to indirectly update expiresAt" (5.2.41)
-                o.insert("expiresAt".into(), Value::String(expires_at(o)?));
-            }
-            // a removed priority is the default one again (Table 5.2.41-1)
-            o.entry("snapshotPriority".to_owned())
-                .or_insert(Value::Number(5.into()));
-            o.insert("modifiedAt".into(), Value::String(now_iso()));
-        }
-        let meta = snap_put(&st, &tenant, &meta, UPDATE_MEMBERS)
-            .await
-            .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
+        {
+            None => return Err(gone().into()),
+            Some(Err(e)) => return Err(e.into()),
+            Some(Ok(meta)) => meta,
+        };
         // 5.16.6: notifications are also sent after any status update
         let (st2, meta2) = (st.clone(), meta.clone());
         crate::spawn(async move {
