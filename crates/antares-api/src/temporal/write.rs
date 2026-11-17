@@ -247,6 +247,7 @@ pub async fn delete_temporal(
             Err(refused) => return Ok(*refused),
         };
         let deleted = st.temporal.delete(&tenant, &id).await?;
+        crate::history::forget_last_rows(&st, &tenant, Some(&id));
         answer_temporal_attr_write(
             &st,
             &tenant,

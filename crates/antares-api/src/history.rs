@@ -334,9 +334,16 @@ pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> 
     has(&rules.ruled) || !rules.space_off.contains(tenant)
 }
 
-/// The last row each attribute recorded `onChange` wrote, by (Tenant,
-/// Entity, attribute, datasetId).
-type LastRows = std::collections::HashMap<(String, String, String, String), LastRow>;
+/// The last row each attribute recorded `onChange` wrote, by (broker,
+/// Tenant, Entity), then (attribute, datasetId): an Entity's rows go with it
+/// when it is deleted, so a recreated Entity records its first row again.
+#[derive(Default)]
+struct LastRows {
+    by_entity: std::collections::HashMap<(usize, String, String), EntityRows>,
+    /// Attributes remembered over every Entity.
+    len: usize,
+}
+type EntityRows = std::collections::HashMap<(String, String), LastRow>;
 
 /// An attribute's newest row, and the last late row written below it.
 struct LastRow {
@@ -457,8 +464,6 @@ pub(crate) fn admits_change(
     let at = observed_at(instance).unwrap_or_else(chrono::Utc::now);
     let payload = payload_of(instance);
     let key = (
-        tenant.as_str().to_owned(),
-        entity.to_owned(),
         attr.to_owned(),
         instance
             .get("datasetId")
@@ -466,9 +471,17 @@ pub(crate) fn admits_change(
             .unwrap_or_default()
             .to_owned(),
     );
-    let mut last = LAST_ROWS
+    let mut all = LAST_ROWS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if all.len >= LAST_ROWS_MAX {
+        *all = LastRows::default();
+    }
+    let all = &mut *all;
+    let last = all
+        .by_entity
+        .entry((st.broker(), tenant.as_str().to_owned(), entity.to_owned()))
+        .or_default();
     let admits = |was: &Value, when: chrono::DateTime<chrono::Utc>| {
         if at == when {
             return payload != *was;
@@ -490,20 +503,45 @@ pub(crate) fn admits_change(
         }
         Some(row) if !admits(&row.payload, row.at) => false,
         _ => {
-            if last.len() >= LAST_ROWS_MAX {
-                last.clear();
+            let row = LastRow {
+                payload,
+                at,
+                late: None,
+            };
+            if last.insert(key, row).is_none() {
+                all.len = all.len.saturating_add(1);
             }
-            last.insert(
-                key,
-                LastRow {
-                    payload,
-                    at,
-                    late: None,
-                },
-            );
             true
         }
     }
+}
+
+/// Forget the `onChange` rows this broker remembers for the Entity `id` of
+/// `tenant`, or for every Entity of it when `id` is None: what was deleted
+/// records its first row again when it comes back.
+pub(crate) fn forget_last_rows(st: &AppState, tenant: &TenantId, id: Option<&str>) {
+    let mut all = LAST_ROWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let all = &mut *all;
+    let broker = st.broker();
+    let mut dropped = 0usize;
+    match id {
+        Some(id) => {
+            let key = (broker, tenant.as_str().to_owned(), id.to_owned());
+            if let Some(rows) = all.by_entity.remove(&key) {
+                dropped = rows.len();
+            }
+        }
+        None => all.by_entity.retain(|(b, t, _), rows| {
+            let keep = *b != broker || t != tenant.as_str();
+            if !keep {
+                dropped = dropped.saturating_add(rows.len());
+            }
+            keep
+        }),
+    }
+    all.len = all.len.saturating_sub(dropped);
 }
 
 /// The instant `instance` was observed at, if it says.
@@ -776,6 +814,7 @@ pub(crate) async fn layer(
 /// representation too (suite configuration parity). Skipped on bus=nats
 /// api pods — the recorder applies the entityDeleted fence instead.
 pub(crate) async fn mirror_delete_entity(st: &AppState, tenant: &TenantId, id: &str) {
+    forget_last_rows(st, tenant, Some(id));
     if !st.record_locally() {
         return;
     }

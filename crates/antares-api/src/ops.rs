@@ -699,6 +699,7 @@ pub(super) async fn tenant_purge(
         // term mappings).
         crate::contexts::purge_tenant(&st, &tenant).await?;
         st.temporal.purge_tenant(&tenant).await?;
+        crate::history::forget_last_rows(&st, &tenant, None);
         st.store.purge_tenant(&tenant).await?;
         st.known_tenants.forget(&tenant);
         if let Some(sync) = &st.sub_sync {

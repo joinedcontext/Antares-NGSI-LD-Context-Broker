@@ -517,3 +517,39 @@ fn late_seconds_record_one_row_per_heartbeat_like_live_ones() {
         "a backfill an hour back is a row"
     );
 }
+
+/// The `onChange` memory belongs to one broker and one Entity's life: a
+/// second broker in the process, and an Entity recreated after a delete,
+/// each record their first row again.
+#[tokio::test]
+async fn on_change_memory_ends_with_the_entity_and_stays_with_its_broker() {
+    let (a, b) = (state(), state());
+    let tn = "history-forget";
+    let t = TenantId::new(tn).expect("tenant");
+    let ty = ["https://x/Silo"];
+    let mode = OnChange {
+        heartbeat: Duration::from_secs(3600),
+        deadband: Some(0.5),
+        min_distance: None,
+    };
+    recording(&a, tn, ty[0], &[(LEVEL, mode)]);
+    recording(&b, tn, ty[0], &[(LEVEL, mode)]);
+    let row = |st: &AppState, at| admits_change(st, &t, &ty, "urn:s", LEVEL, None, &level(5.0, at));
+    assert!(row(&a, "2026-01-01T00:00:00Z"), "the first value is a row");
+    assert!(!row(&a, "2026-01-01T00:01:00Z"), "the same value again");
+    assert!(
+        row(&b, "2026-01-01T00:01:00Z"),
+        "another broker has recorded nothing of this Entity yet"
+    );
+    crate::history::mirror_delete_entity(&a, &t, "urn:s").await;
+    assert!(
+        row(&a, "2026-01-01T00:02:00Z"),
+        "the recreated Entity records its first row"
+    );
+    assert!(!row(&a, "2026-01-01T00:03:00Z"));
+    crate::history::forget_last_rows(&a, &t, None);
+    assert!(
+        row(&a, "2026-01-01T00:04:00Z"),
+        "a purged Tenant starts over"
+    );
+}
