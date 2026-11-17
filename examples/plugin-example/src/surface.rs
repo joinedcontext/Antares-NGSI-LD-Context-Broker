@@ -40,6 +40,21 @@ impl ApiSurface for ExampleSurface {
     }
 }
 
+/// `s` percent-encoded for a query string: every byte but the RFC 3986
+/// unreserved ones, so no character of it reads as query syntax.
+fn query_encoded(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 /// Entities the plugin's store holds for the requesting tenant.
 ///
 /// Two rules a surface does not get to opt out of. The tenant comes from
@@ -81,7 +96,13 @@ async fn things(
     // `keyValues` (4.5.4) is the representation a façade wants: values
     // without the NGSI-LD envelope, which is most of the mapping already
     // done by the broker rather than by hand here.
-    let inner = format!("/ngsi-ld/v1/entities?type={kind}&options=keyValues");
+    // `kind` arrived decoded: written back into a query string as it is, a
+    // `&` in it would add parameters of the caller's choosing to the inner
+    // request. Encoded, it stays the one `type` value it was sent as.
+    let inner = format!(
+        "/ngsi-ld/v1/entities?type={}&options=keyValues",
+        query_encoded(kind)
+    );
     let Ok(req) = Request::get(&inner).body(Body::empty()) else {
         // Only an unbuildable URI reaches here — a `kind` with a character
         // no request line may carry. It is the caller's input, so it is the
@@ -90,7 +111,8 @@ async fn things(
     };
     let resp = st.call(&headers, req).await;
     let status = resp.status();
-    let Ok(body) = axum::body::to_bytes(resp.into_body(), usize::MAX).await else {
+    // the broker's own answer ceiling bounds what is buffered here
+    let Ok(body) = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes).await else {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the answer was not readable",
