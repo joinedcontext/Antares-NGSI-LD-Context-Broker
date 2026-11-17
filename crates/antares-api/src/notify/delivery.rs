@@ -615,6 +615,6 @@ pub(super) fn mirror_bookkeeping(
         return;
     }
     if let (Some(m), Some(doc)) = (&st.sub_mirror, doc) {
-        m.apply(tenant.as_str(), sub_id, Some(doc));
+        m.apply_booked(tenant.as_str(), sub_id, doc);
     }
 }
