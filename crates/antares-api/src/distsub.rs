@@ -855,6 +855,12 @@ fn reduced_copy(
         for k in ["attributes", "pick", "omit"] {
             n.remove(k);
         }
+        // the copy notifies this broker, which expands what it receives as
+        // normalized Entities and renders the subscriber's own format and
+        // join itself: the source is asked for the default form
+        for k in ["format", "join", "joinLevel"] {
+            n.remove(k);
+        }
         // Table 5.2.14.2-1: the delivery bookkeeping is this broker's own
         // record of notifying ITS subscriber. It lives inside `notification`,
         // it is output-only on a create ("implementations shall ignore
@@ -1227,6 +1233,25 @@ mod tests {
                 "lastFailure": "2026-01-02T00:00:00Z",
             },
         })
+    }
+
+    /// The copy asks the source for normalized notifications whatever
+    /// format and join the subscriber chose: this broker expands what the
+    /// source sends and renders the subscriber's form itself.
+    #[test]
+    fn a_reduced_copy_asks_for_normalized_notifications() {
+        let st = AppState::new("antares-ds-format".into());
+        let mut sub = sub_doc();
+        if let Some(n) = sub.get_mut("notification").and_then(Value::as_object_mut) {
+            n.insert("format".into(), json!("keyValues"));
+            n.insert("join".into(), json!("inline"));
+            n.insert("joinLevel".into(), json!(2));
+        }
+        let copy = reduced_copy(&st, &sub, &reg_doc(), "urn:x:fmt", &st.loader.core())
+            .expect("a copy the registration covers");
+        for k in ["format", "join", "joinLevel"] {
+            assert!(copy["notification"].get(k).is_none(), "{k}: {copy}");
+        }
     }
 
     /// 5.8.1.4: the copy keeps the subscriber's own id selector inside the
