@@ -49,7 +49,12 @@ async fn tenant(pool: &sqlx::PgPool, name: &str) -> TenantId {
 /// test, and a broker started there without this key fails each read of
 /// such a row (antares-broker upsert_transactions never went idle).
 async fn forget(pool: &sqlx::PgPool, name: &str) {
-    for table in ["subscriptions", "dead_letters", "snapshots"] {
+    for table in [
+        "subscriptions",
+        "dead_letters",
+        "snapshots",
+        "csource_registrations",
+    ] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE tenant_id = '{name}'"
         )))
@@ -397,4 +402,82 @@ async fn an_endpoint_uri_with_userinfo_is_sealed_at_rest_and_at_boot() {
     let text = raw(&pool, &t, "subscriptions", "subscription", bare).await;
     assert!(text.contains("https://h.example/n"), "{text}");
     forget(&pool, "pgsealuri").await;
+}
+
+/// Every `csource_index` column of a Tenant's rows as one text.
+async fn index_text(pool: &sqlx::PgPool, t: &TenantId) -> String {
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, t).await.expect("tenant");
+    let text: Option<String> = sqlx::query_scalar(
+        "SELECT string_agg(row_to_json(x)::text, ' ') FROM csource_index x WHERE tenant_id = $1",
+    )
+    .bind(t.as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("index");
+    tx.commit().await.expect("commit");
+    text.unwrap_or_default()
+}
+
+/// Table 5.2.9-1: a registration's `contextSourceInfo` values (the headers
+/// its forwarded requests carry) and an endpoint with userinfo are sealed in
+/// its row and kept out of its index rows; every read opens them, the
+/// matching read included. A row from before the key is sealed at boot,
+/// and its index rows lose the copies they were written with.
+#[tokio::test(flavor = "multi_thread")]
+async fn registration_credentials_are_sealed_and_kept_out_of_the_index() {
+    let url = require_db!();
+    let _pass = BOOT_PASS.lock().await;
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = tenant(&pool, "pgsealreg").await;
+    let reg = |id: &str| {
+        json!({"id": id, "type": "ContextSourceRegistration",
+               "endpoint": "http://user:pw-in-uri@cs:9090",
+               "contextSourceInfo": [{"key": "Authorization", "value": TOKEN}],
+               "information": [{"entities": [{"type": "https://e.org/V"}]}]})
+    };
+    let leaks = |s: &str| s.contains("the-webhook-token") || s.contains("pw-in-uri");
+    // a row and index rows as a release before the key wrote them
+    let legacy = "urn:ngsi-ld:ContextSourceRegistration:legacy";
+    PgDocStore::new(pool.clone())
+        .upsert(&t, DocKind::Registration, legacy, &reg(legacy))
+        .await
+        .expect("legacy");
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, &t).await.expect("tenant");
+    sqlx::query(
+        "UPDATE csource_index SET headers = $2, endpoint = 'http://user:pw-in-uri@cs:9090'
+          WHERE tenant_id = $1",
+    )
+    .bind(t.as_str())
+    .bind(&reg(legacy)["contextSourceInfo"])
+    .execute(&mut *tx)
+    .await
+    .expect("old index shape");
+    tx.commit().await.expect("commit");
+
+    let s = PgDocStore::new(pool.clone())
+        .with_secret_key(SecretKey::from_base64(TEST_KEY).expect("key"));
+    assert!(s.seal_plaintext().await.expect("seal") >= 1);
+    let fresh = "urn:ngsi-ld:ContextSourceRegistration:fresh";
+    s.upsert(&t, DocKind::Registration, fresh, &reg(fresh))
+        .await
+        .expect("upsert");
+    for id in [legacy, fresh] {
+        let text = raw(&pool, &t, "csource_registrations", "registration", id).await;
+        assert!(!leaks(&text) && text.contains("enc:v1:"), "{text}");
+        assert_eq!(
+            s.get(&t, DocKind::Registration, id).await.expect("get"),
+            Some(reg(id))
+        );
+    }
+    let index = index_text(&pool, &t).await;
+    assert!(!index.is_empty() && !leaks(&index), "{index}");
+    let mut matched = s
+        .matching_registrations(&t, None, Some(&["https://e.org/V".to_owned()]))
+        .await
+        .expect("matching");
+    matched.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    assert_eq!(matched, [reg(fresh), reg(legacy)]);
+    forget(&pool, "pgsealreg").await;
 }

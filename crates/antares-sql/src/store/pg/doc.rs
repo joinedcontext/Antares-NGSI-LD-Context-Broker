@@ -190,11 +190,11 @@ pub struct IndexShared<'a> {
     pub scopes: Option<Vec<&'a str>>,
     /// 4.6.3 comma fraction: cast with a bare `::timestamptz` in the INSERT.
     pub expires_at: Option<String>,
-    pub endpoint: &'a str,
+    /// Without its userinfo: the credential stays in the (sealed) document.
+    pub endpoint: std::borrow::Cow<'a, str>,
     pub mode: i16,
     pub ops: i64,
     pub tenant_at_peer: Option<&'a str>,
-    pub headers: Option<&'a Value>,
     /// Table 5.2.9-1 names this member `contextSourceAlias` — the peer's
     /// tenant-specific loop pseudonym. (`hostAlias` is the prose spelling
     /// 6.3.18 uses and the csource_index column name; it is not a payload
@@ -204,7 +204,7 @@ pub struct IndexShared<'a> {
 
 /// The registration members the index is derived from: a write that moves
 /// none of them leaves the index rows as they are.
-const INDEXED_MEMBERS: [&str; 10] = [
+const INDEXED_MEMBERS: [&str; 9] = [
     "information",
     "endpoint",
     "location",
@@ -213,7 +213,6 @@ const INDEXED_MEMBERS: [&str; 10] = [
     "mode",
     "operations",
     "tenant",
-    "contextSourceInfo",
     "contextSourceAlias",
 ];
 
@@ -237,9 +236,6 @@ pub fn index_shared(reg: &Value, rows: usize) -> IndexShared<'_> {
     let fits = |bytes: usize| bytes.saturating_mul(rows.max(1)) <= MAX_INDEX_BYTES;
     let location = location.filter(|g| fits(g.len()));
     let scopes = scopes.filter(|s| fits(s.iter().map(|x| x.len().saturating_add(1)).sum()));
-    let headers = reg
-        .get("contextSourceInfo")
-        .filter(|h| fits(serde_json::to_vec(h).map_or(usize::MAX, |b| b.len())));
     IndexShared {
         location,
         scopes,
@@ -247,14 +243,14 @@ pub fn index_shared(reg: &Value, rows: usize) -> IndexShared<'_> {
             .get("expiresAt")
             .and_then(Value::as_str)
             .map(|s| antares_store::filter::canonical_datetime(s).into_owned()),
-        endpoint: reg
-            .get("endpoint")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
+        endpoint: super::seal::without_userinfo(
+            reg.get("endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
         mode: mode_code(reg),
         ops: ops_mask(reg),
         tenant_at_peer: reg.get("tenant").and_then(Value::as_str),
-        headers,
         host_alias: reg.get("contextSourceAlias").and_then(Value::as_str),
     }
 }
@@ -366,10 +362,10 @@ async fn rebuild_csource_index(
          INSERT INTO csource_index
            (tenant_id, registration_id, entity_id, id_pattern, entity_type,
             property_name, relationship_name, scopes, expires_at, endpoint,
-            mode, ops, tenant_at_peer, headers, host_alias, location)
+            mode, ops, tenant_at_peer, host_alias, location)
          SELECT $1, $2, e.entity_id, e.id_pattern, e.entity_type,
                 e.property_name, e.relationship_name,
-                $9, $10::timestamptz, $11, $12, $13, $14, $15, $16, g.location
+                $9, $10::timestamptz, $11, $12, $13, $14, $15, g.location
          FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::text[])
                 AS e(entity_id, id_pattern, entity_type, property_name, relationship_name),
               g",
@@ -384,11 +380,10 @@ async fn rebuild_csource_index(
     .bind(shared.location.as_deref())
     .bind(shared.scopes.as_deref())
     .bind(shared.expires_at.as_deref())
-    .bind(shared.endpoint)
+    .bind(shared.endpoint.as_ref())
     .bind(shared.mode)
     .bind(shared.ops)
     .bind(shared.tenant_at_peer)
-    .bind(shared.headers)
     .bind(shared.host_alias)
     .execute(&mut **tx)
     .await
@@ -969,6 +964,7 @@ impl PgDocStore {
             DocKind::CSourceSubscription,
             DocKind::Snapshot,
             DocKind::DeadLetter,
+            DocKind::Registration,
         ] {
             let Some(path) = super::seal::plaintext_path(kind) else {
                 continue;
@@ -999,6 +995,27 @@ impl PgDocStore {
                     sealed = sealed.saturating_add(u64::from(written.is_some()));
                 }
             }
+        }
+        // The index rows of a registration written before it was sealed
+        // still carry its `contextSourceInfo` and endpoint userinfo, and the
+        // sealing write above rebuilds no index (the indexed members did not
+        // move): drop both from those rows. Nothing reads either column.
+        for raw in &tenants {
+            let tenant = TenantId::try_from(raw.clone())
+                .map_err(|e| sqlx::Error::Configuration(Box::new(e)))?;
+            let mut tx = super::begin(&self.pool).await?;
+            crate::store::pg::set_tenant(&mut tx, &tenant).await?;
+            sqlx::query(
+                "UPDATE csource_index
+                    SET headers = NULL,
+                        endpoint = regexp_replace(endpoint, '^(([^/]|/[^/])*//)[^/?#]*@', '\\1')
+                  WHERE tenant_id = $1
+                    AND (headers IS NOT NULL OR endpoint ~ '^([^/]|/[^/])*//[^/?#]*@')",
+            )
+            .bind(tenant.as_str())
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
         }
         Ok(sealed)
     }
@@ -1105,7 +1122,16 @@ impl PgDocStore {
         let rows = q.bind(MAX_UNDECIDED_ROWS).fetch_all(&mut *tx).await?;
         tx.commit().await?;
         check_ceiling(false, rows.len(), MAX_UNDECIDED_ROWS)?;
-        Ok(rows.into_iter().map(|r| r.get::<Value, _>(1)).collect())
+        rows.into_iter()
+            .map(|r| {
+                self.opened(
+                    DocKind::Registration,
+                    tenant,
+                    &r.get::<String, _>(0),
+                    r.get::<Value, _>(1),
+                )
+            })
+            .collect()
     }
 
     /// Bookkeeping columns straight from the row (test hook: rows are truth).
@@ -1429,7 +1455,7 @@ mod tests {
         // a member that every row would repeat past the ceiling is left out
         // (NULL = unconstrained); a small one is kept
         let shared = index_shared(&reg, MAX_INDEX_ROWS);
-        assert!(shared.location.is_none() && shared.headers.is_none());
+        assert!(shared.location.is_none());
         assert!(index_shared(&reg, 1).location.is_some());
         // long selectors and names are truncated by bytes, not only by count
         let long: Vec<String> = (0..100)
@@ -1440,6 +1466,22 @@ mod tests {
         let rows = index_rows(&reg);
         assert!(rows.iter().map(IndexRow::bytes).sum::<usize>() <= MAX_INDEX_BYTES);
         assert!(rows.len() < 200);
+    }
+
+    /// The index copy of a registration holds no credential: no
+    /// `contextSourceInfo` column value and the endpoint without userinfo.
+    #[test]
+    fn the_index_keeps_no_registration_credential() {
+        let reg = json!({"endpoint": "http://user:pw-in-uri@cs:9090",
+                         "contextSourceInfo": [{"key": "Authorization", "value": "Bearer tok-in-csi"}],
+                         "information": [{"entities": [{"type": "https://e.org/V"}]}]});
+        let shared = index_shared(&reg, index_rows(&reg).len());
+        assert_eq!(shared.endpoint, "http://cs:9090");
+        let text = format!("{shared:?} {:?}", index_rows(&reg));
+        assert!(
+            !text.contains("tok-in-csi") && !text.contains("pw-in-uri"),
+            "{text}"
+        );
     }
 
     #[test]
