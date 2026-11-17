@@ -179,3 +179,43 @@ async fn an_unchanged_mutate_writes_and_enqueues_nothing() {
     assert_eq!(ops, ["create"]);
     s.delete(&t, &id).await.expect("cleanup");
 }
+
+/// A single upsert is one write: its hook carries the before-image and
+/// the version that write left, created or replaced, recreated after a
+/// delete included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_single_upsert_hooks_the_write_it_made() {
+    use antares_sql::store::any::{AnyStore, PgBackend};
+    use antares_store::{ChangeVersion, Kind};
+    use std::sync::{Arc, Mutex};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pgupsertone").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = AnyStore::Pg(PgBackend::new(pool.clone()));
+    type Seen = Vec<(Option<Value>, ChangeVersion)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let sink = seen.clone();
+    store.set_change_hook(Arc::new(move |_t, before, _after, v| {
+        let sink = sink.clone();
+        Box::pin(async move {
+            sink.lock().expect("hook log").push((before, v));
+        })
+    }));
+    let id = format!("urn:ngsi-ld:T:upsert{}", run_id());
+    let (a, b) = (doc(&id, 1), doc(&id, 2));
+    assert!(!store
+        .upsert(&t, Kind::Entity, &id, a.clone())
+        .await
+        .expect("create"));
+    assert!(store
+        .upsert(&t, Kind::Entity, &id, b.clone())
+        .await
+        .expect("replace"));
+    let log: Seen = seen.lock().expect("hook log").clone();
+    assert_eq!(log.len(), 2);
+    assert_eq!((log[0].0.clone(), log[0].1.version), (None, 1));
+    assert_eq!((log[1].0.clone(), log[1].1.version), (Some(a), 2));
+    assert_eq!(log[0].1.incarnation, log[1].1.incarnation);
+    assert!(store.delete(&t, Kind::Entity, &id).await.expect("delete"));
+}

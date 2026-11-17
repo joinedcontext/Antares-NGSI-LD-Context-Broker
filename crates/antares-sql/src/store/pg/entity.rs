@@ -1969,6 +1969,38 @@ impl PgEntityStore {
         tenant: &TenantId,
         items: &[(String, Value)],
     ) -> Result<Vec<(bool, Option<Value>, Option<ChangeVersion>)>, sqlx::Error> {
+        let tx = self.begin_batch().await?;
+        self.upsert_replace_in(tx, tenant, items).await
+    }
+
+    /// One Entity upserted in REPLACE semantics in ONE statement under its
+    /// row lock: (created?, the before-image, the version it left). The
+    /// single-item form of [`Self::batch_upsert_replace_stamped`] on the
+    /// ordinary pool: a replace that misses, a create that loses and a
+    /// second replace would be three transactions a concurrent delete can
+    /// fall between.
+    pub async fn upsert_replace_stamped(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(bool, Option<Value>, ChangeVersion), sqlx::Error> {
+        let tx = super::begin(&self.pool).await?;
+        let items = [(id.to_owned(), doc.clone())];
+        let (created, prev, version) = self
+            .upsert_replace_in(tx, tenant, &items)
+            .await?
+            .pop()
+            .ok_or(sqlx::Error::RowNotFound)?;
+        Ok((created, prev, version.ok_or(sqlx::Error::RowNotFound)?))
+    }
+
+    async fn upsert_replace_in(
+        &self,
+        mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+        tenant: &TenantId,
+        items: &[(String, Value)],
+    ) -> Result<Vec<(bool, Option<Value>, Option<ChangeVersion>)>, sqlx::Error> {
         let mut seen = std::collections::HashSet::new();
         let mut payload = Vec::new();
         let mut ids = Vec::new();
@@ -1984,7 +2016,6 @@ impl PgEntityStore {
                 }));
             }
         }
-        let mut tx = self.begin_batch().await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
         // lock + before-images in one statement (ordered: stable lock order)
