@@ -284,8 +284,11 @@ pub fn index_rows(reg: &Value) -> Vec<IndexRow<'_>> {
         // TS 104 175 9.4.2: attributeNames, else the deprecated pair. The
         // table has no column for a name of either kind, so an
         // attributeNames entry is indexed as a property_name: the index is
-        // a flattened copy, the matchers read the registration itself.
-        let (props, rels) = match info.get("attributeNames") {
+        // a flattened copy, the matchers read the registration itself. An
+        // `attributeNames` that is no array is read as absent, the rule of
+        // `antares_model::registration_attribute_names`, the reading every
+        // matcher shares (that one merges the pair, so it is not reused).
+        let (props, rels) = match info.get("attributeNames").and_then(Value::as_array) {
             Some(_) => (names("attributeNames"), Vec::new()),
             None => (names("propertyNames"), names("relationshipNames")),
         };
@@ -1519,6 +1522,28 @@ mod tests {
         assert!(rows[0].property_name.is_none() && rows[0].relationship_name.is_none());
         // no information at all: one unconstrained row
         assert_eq!(index_rows(&json!({"endpoint": "e"})), [IndexRow::default()]);
+    }
+
+    /// The index reads the names of a RegistrationInfo as the matchers do
+    /// (`registration_attribute_names`): the same set, the pair kept apart.
+    #[test]
+    fn index_names_follow_the_shared_reading() {
+        for info in [
+            json!({"entities": [{"type": "T"}], "attributeNames": ["speed"], "propertyNames": ["x"]}),
+            json!({"entities": [{"type": "T"}], "attributeNames": "speed", "propertyNames": ["brand"],
+                   "relationshipNames": ["owner"]}),
+            json!({"entities": [{"type": "T"}], "propertyNames": ["brand"]}),
+        ] {
+            let reg = json!({"endpoint": "e", "information": [info.clone()]});
+            let mut indexed: Vec<&str> = index_rows(&reg)
+                .iter()
+                .filter_map(|r| r.property_name.or(r.relationship_name))
+                .collect();
+            indexed.sort_unstable();
+            let mut shared = antares_model::registration_attribute_names(&info).unwrap_or_default();
+            shared.sort_unstable();
+            assert_eq!(indexed, shared, "{info}");
+        }
     }
 
     /// TS 104 175 9.4.2: `attributeNames` scopes the rows, and the
