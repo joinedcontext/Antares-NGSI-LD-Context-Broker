@@ -137,6 +137,13 @@ pub fn intersect_scope_q(a: &str, b: &str) -> Option<String> {
             // inside a parenthesized group.
             match (x.as_str(), y.as_str()) {
                 (ANY_SCOPE, ANY_SCOPE) => out.push_str(ANY_SCOPE),
+                // a conjunction stays inside its parentheses: the grammar
+                // derives `;` only within a parenthesized group
+                (ANY_SCOPE, term) | (term, ANY_SCOPE) if term.contains(';') => {
+                    out.push('(');
+                    out.push_str(term);
+                    out.push(')');
+                }
                 (ANY_SCOPE, term) | (term, ANY_SCOPE) => out.push_str(term),
                 (l, r) => {
                     out.push('(');
@@ -315,8 +322,15 @@ mod clause_4_19 {
             ("/#", "/A,/B"),
             ("/#", "/#"),
             ("/A", "/A"),
+            ("/#", "(/A;/B)"),
+            ("(/A;/B),/BB", "/#"),
         ] {
             let both = intersect_scope_q(a, b).expect("expressible");
+            // what goes to a peer must be a Scope Query a peer accepts
+            assert!(
+                check_scope_q(&both).is_ok(),
+                "{a} INTERSECT {b} = {both} is outside the grammar"
+            );
             for d in &docs {
                 assert_eq!(
                     scope_matches(&both, d),
