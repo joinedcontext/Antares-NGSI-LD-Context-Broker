@@ -2064,7 +2064,7 @@ mod driver_registry_tests {
             temporal_choice(name, None).expect("ok"),
             TemporalChoice::SameAsStore
         );
-        let drivers = super::build_drivers(name)
+        let drivers = super::build_drivers(name, TemporalChoice::SameAsStore)
             .await
             .expect("the plugin driver builds");
         assert_eq!(drivers.temporal_name.as_deref(), Some(name));
