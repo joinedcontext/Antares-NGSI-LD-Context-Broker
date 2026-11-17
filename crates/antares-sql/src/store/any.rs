@@ -443,8 +443,11 @@ impl AnyStore {
     ) -> Result<bool, NgsiError> {
         match self {
             AnyStore::Mem(s) => {
+                let mut doc = doc;
                 if kind == Kind::Temporal {
                     past_instance_cap(&Default::default(), &doc, s.max_instances)?;
+                    // PROVENANCE_KEY: the memory store keeps no provenance
+                    antares_store::strip_provenance(&mut doc);
                 }
                 Ok(s.create(tenant, kind, id, doc).await)
             }
@@ -555,8 +558,11 @@ impl AnyStore {
     ) -> Result<bool, NgsiError> {
         match self {
             AnyStore::Mem(s) => {
+                let mut doc = doc;
                 if kind == Kind::Temporal {
                     past_instance_cap(&Default::default(), &doc, s.max_instances)?;
+                    // PROVENANCE_KEY: the memory store keeps no provenance
+                    antares_store::strip_provenance(&mut doc);
                 }
                 Ok(s.upsert(tenant, kind, id, doc).await)
             }

@@ -150,3 +150,35 @@ async fn an_append_racing_a_delete_never_resurrects_history() {
         );
     }
 }
+
+/// PROVENANCE_KEY: a store that keeps no provenance removes it before it
+/// keeps an instance, on create and upsert as on append.
+#[tokio::test]
+async fn temporal_create_and_upsert_keep_no_provenance() {
+    let s = AnyStore::Mem(Store::default());
+    let t = TenantId::default();
+    let doc = |id: &str| {
+        json!({"id": id, "type": ["T"],
+               "https://e.org/a": [{"type": "Property", "value": 1, "instanceId": format!("{id}:i"),
+                                    "observedAt": "2026-01-01T00:00:00Z",
+                                    antares_store::PROVENANCE_KEY: {"by": "x"}}]})
+    };
+    assert!(s
+        .create(&t, Kind::Temporal, "urn:x:p1", doc("urn:x:p1"))
+        .await
+        .expect("create"));
+    s.upsert(&t, Kind::Temporal, "urn:x:p2", doc("urn:x:p2"))
+        .await
+        .expect("upsert");
+    for id in ["urn:x:p1", "urn:x:p2"] {
+        let got = s
+            .get(&t, Kind::Temporal, id)
+            .await
+            .expect("get")
+            .expect("stored");
+        assert!(
+            !got.to_string().contains(antares_store::PROVENANCE_KEY),
+            "{got}"
+        );
+    }
+}
