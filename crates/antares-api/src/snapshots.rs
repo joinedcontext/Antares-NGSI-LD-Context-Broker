@@ -1457,6 +1457,7 @@ pub async fn clone_snapshot(
 /// that ends in `failure` or disappears makes the clone a `failure`. The
 /// copy stops at the same ceiling a fill does (5.5.6).
 async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str) {
+    let mut looked = 0u32;
     let src = loop {
         match snap_get(st, tenant, src_id).await {
             Ok(None) => {
@@ -1475,11 +1476,13 @@ async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str
         if matches!(snap_get(st, tenant, new_id).await, Ok(None)) {
             return;
         }
+        let wait = clone_poll_ms(looked);
+        looked = looked.saturating_add(1);
         // the browser's own timer on wasm32 (tokio time has no reactor there)
         #[cfg(not(target_arch = "wasm32"))]
-        tokio::time::sleep(std::time::Duration::from_millis(CLONE_POLL_MS.into())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(wait.into())).await;
         #[cfg(target_arch = "wasm32")]
-        gloo_timers::future::TimeoutFuture::new(CLONE_POLL_MS).await;
+        gloo_timers::future::TimeoutFuture::new(wait).await;
     };
     let (Some(from), Some(to)) = (
         synth_tenant(&src),
@@ -1512,6 +1515,20 @@ async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str
 
 /// How often a clone looks whether its source finished preparing.
 const CLONE_POLL_MS: u32 = 50;
+
+/// The longest a clone waits between two looks: a source that stays
+/// `preparing` for long (a fill that died with its broker never finishes)
+/// costs two reads per this period, not per [`CLONE_POLL_MS`], until it
+/// expires.
+const CLONE_POLL_MAX_MS: u32 = 5_000;
+
+/// The wait before look `n + 1`: [`CLONE_POLL_MS`], doubling up to
+/// [`CLONE_POLL_MAX_MS`].
+fn clone_poll_ms(n: u32) -> u32 {
+    CLONE_POLL_MS
+        .saturating_mul(1u32.checked_shl(n.min(16)).unwrap_or(u32::MAX))
+        .min(CLONE_POLL_MAX_MS)
+}
 
 /// Copy every Entity (one `list_page` at a time) and every Temporal
 /// Evolution of `from` into `to`, at most `cap` documents of each. An
@@ -2614,6 +2631,25 @@ mod clause_5_16 {
         seeded_snapshot(&st, fid, "failure").await;
         let cid = clone_of(&st, fid).await;
         assert_eq!(settled(&st, &cid).await["snapshotStatus"], "failure");
+    }
+
+    /// A clone waiting on a source that stays `preparing` backs off: the
+    /// looks start at the poll period and level off at the ceiling, so a
+    /// source whose fill died costs a bounded rate of reads until it expires.
+    #[test]
+    fn a_clone_waiting_on_its_source_backs_off_to_a_ceiling() {
+        assert_eq!(clone_poll_ms(0), CLONE_POLL_MS);
+        assert_eq!(clone_poll_ms(1), 2 * CLONE_POLL_MS);
+        assert!((0..40).map(clone_poll_ms).all(|w| w <= CLONE_POLL_MAX_MS));
+        assert_eq!(clone_poll_ms(u32::MAX), CLONE_POLL_MAX_MS);
+        // a day of waiting is a few tens of thousands of looks, not 1.7 million
+        let mut waited = 0u64;
+        let mut looks = 0u32;
+        while waited < 86_400_000 {
+            waited += u64::from(clone_poll_ms(looks));
+            looks += 1;
+        }
+        assert!(looks < 20_000, "{looks}");
     }
 
     /// 5.5.6: a clone stops at the fill ceiling of its own
