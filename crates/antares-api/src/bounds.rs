@@ -390,6 +390,33 @@ fn count_from(raw: Option<&str>, default: usize, ceiling: usize) -> usize {
         .unwrap_or(default)
         .min(ceiling)
 }
+/// 4.5.23.1: "When retrieving Linked Entities, it is necessary to limit
+/// retrieval to avoid cascades of an excessive length, duplicates or loops."
+/// joinLevel bounds the DEPTH of the walk; this bounds its WIDTH — the total
+/// number of Linked Entity reads a single request may buy, so that a densely
+/// linked graph cannot turn one retrieval into an unbounded store scan.
+pub const MAX_JOIN_LOOKUPS: usize = 1_000;
+/// → 400 BadRequestData. The most periods an aggregated `onChange` Attribute
+/// answers, rows and held gaps together.
+pub const MAX_HELD_BUCKETS: usize = 10_000;
+/// The Tenant names the 5.5.10 existence cache holds at once (ADR-0001's
+/// 10 000-tenant target): a full cache takes no new name until its old
+/// entries age out.
+pub const MAX_KNOWN_TENANTS: usize = 10_000;
+/// 5.5.15 resource pressure: Snapshots one Tenant holds before the lowest
+/// `snapshotPriority` ones are evicted (`AppState::snapshot_cap`'s default).
+pub const MAX_SNAPSHOTS_PER_TENANT: usize = 1024;
+/// EntityMaps one Tenant holds before the earliest-expiring is evicted.
+pub const MAX_ENTITY_MAPS_PER_TENANT: usize = 512;
+/// → 403 TooManyResults. ImplicitlyCreated @contexts one Tenant may hold: a
+/// read with an inline @context writes one row per DISTINCT @context, so a
+/// caller who may only read could otherwise grow the store by varying it.
+pub const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
+/// Retry chains of failed notifications one broker runs at once; past them
+/// a failed notification is dead-lettered after its first attempt.
+pub const RETRY_CHAINS: usize = 256;
+/// Of [`RETRY_CHAINS`], what one tenant may hold.
+pub const RETRY_CHAINS_PER_TENANT: usize = RETRY_CHAINS / 8;
 /// Destinations and registrations the egress breaker tracks. Both maps are
 /// keyed by client-supplied strings, so they need a bound: at the ceiling the
 /// least recently recorded entry is dropped, which costs at most a forgotten
@@ -438,6 +465,14 @@ impl LimitStats {
             "deliveryWidth": *DELIVERY_WIDTH,
             "deliveryWidthPerTenant": *DELIVERY_WIDTH_PER_TENANT,
             "maxTrackedDestinations": MAX_TRACKED_DESTINATIONS,
+            "maxJoinLookups": MAX_JOIN_LOOKUPS,
+            "maxHeldBuckets": MAX_HELD_BUCKETS,
+            "maxKnownTenants": MAX_KNOWN_TENANTS,
+            "maxSnapshotsPerTenant": MAX_SNAPSHOTS_PER_TENANT,
+            "maxEntityMapsPerTenant": MAX_ENTITY_MAPS_PER_TENANT,
+            "maxImplicitContexts": MAX_IMPLICIT_CONTEXTS,
+            "retryChains": RETRY_CHAINS,
+            "retryChainsPerTenant": RETRY_CHAINS_PER_TENANT,
             "rejectedUriTooLong": self.uri_too_long.load(Ordering::Relaxed),
             "rejectedBodyTooLarge": self.body_too_large.load(Ordering::Relaxed),
             "rejectedBodyTooDeep": self.body_too_deep.load(Ordering::Relaxed),
@@ -680,14 +715,19 @@ mod tests {
                 "maxBatchItems",
                 "maxBodyBytes",
                 "maxContextFetches",
+                "maxEntityMapsPerTenant",
                 "maxFedFanout",
                 "maxFedInflight",
                 "maxFedResponseBytes",
                 "maxFoldDocs",
                 "maxGeoVertices",
+                "maxHeldBuckets",
+                "maxImplicitContexts",
                 "maxInProcessCallDepth",
                 "maxJoinLevel",
+                "maxJoinLookups",
                 "maxJsonDepth",
+                "maxKnownTenants",
                 "maxLimit",
                 "maxPeerWarnings",
                 "maxQLinkLookups",
@@ -695,11 +735,14 @@ mod tests {
                 "maxRegexCache",
                 "maxRegexCacheBytes",
                 "maxRegexProgramBytes",
+                "maxSnapshotsPerTenant",
                 "maxTrackedDestinations",
                 "maxUriBytes",
                 "rejectedBodyTooDeep",
                 "rejectedBodyTooLarge",
                 "rejectedUriTooLong",
+                "retryChains",
+                "retryChainsPerTenant",
                 "temporalDefaultInstances",
                 "temporalInstanceLimit",
             ],

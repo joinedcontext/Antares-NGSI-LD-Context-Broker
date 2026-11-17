@@ -76,14 +76,19 @@ progress). A memory-store broker answers:
     "maxBatchItems": 1000,
     "maxBodyBytes": 4194304,
     "maxContextFetches": 32,
+    "maxEntityMapsPerTenant": 512,
     "maxFedFanout": 8,
     "maxFedInflight": 256,
     "maxFedResponseBytes": 16777216,
     "maxFoldDocs": 100000,
     "maxGeoVertices": 1024,
+    "maxHeldBuckets": 10000,
+    "maxImplicitContexts": 1000,
     "maxInProcessCallDepth": 8,
     "maxJoinLevel": 10,
+    "maxJoinLookups": 1000,
     "maxJsonDepth": 64,
+    "maxKnownTenants": 10000,
     "maxLimit": 1000,
     "maxPeerWarnings": 8,
     "maxQLinkLookups": 512,
@@ -91,11 +96,14 @@ progress). A memory-store broker answers:
     "maxRegexCache": 1024,
     "maxRegexCacheBytes": 67108864,
     "maxRegexProgramBytes": 262144,
+    "maxSnapshotsPerTenant": 1024,
     "maxTrackedDestinations": 4096,
     "maxUriBytes": 8192,
     "rejectedBodyTooDeep": 0,
     "rejectedBodyTooLarge": 0,
     "rejectedUriTooLong": 0,
+    "retryChains": 256,
+    "retryChainsPerTenant": 32,
     "temporalDefaultInstances": 100,
     "temporalInstanceLimit": 1000
   },
@@ -117,7 +125,7 @@ progress). A memory-store broker answers:
 | `temporalDrainErrors` | Post-response history writes that failed since start; the client's 2xx stands, the counter and a warning record the loss. |
 | `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
-| `limits` | The bounds wall: every `max*` cap in force, the page defaults (`defaultLimit`, `temporalDefaultInstances`: what a request naming no `limit` or `lastN` gets) and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
+| `limits` | The bounds wall: every `max*` cap in force, the page defaults (`defaultLimit`, `temporalDefaultInstances`: what a request naming no `limit` or `lastN` gets) and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`, `retryChains`, `retryChainsPerTenant`) and the per-Tenant registries (`maxKnownTenants`, `maxSnapshotsPerTenant`, `maxEntityMapsPerTenant`, `maxImplicitContexts`). No request is rejected against the pipeline ceilings — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
 | `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
 | `commitQueueDepth`, `commitQueuePeak` | Present only for a store with a single committer to queue behind (`file`, and the browser build over OPFS): writers queued now and at peak. |
 | `bus` | `ANTARES_BUS=nats` only: `{mode, connected, reconnects}`. |
