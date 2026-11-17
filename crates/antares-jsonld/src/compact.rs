@@ -33,6 +33,8 @@ const VERBATIM: &[&str] = &[
     "previousObject",
     "previousLanguageMap",
     "previousJson",
+    // 4.5.21: a ListProperty's previous value is an array, kept as it is
+    "previousValueList",
 ];
 
 /// Compact an internal expanded entity for output.
@@ -615,6 +617,28 @@ mod tests {
         assert_eq!(out["previousObjectList"], json!([{"object": "urn:c"}]));
         let out = compact_instance(&json!({"objectList": "urn:a"}), &ctx);
         assert_eq!(out["objectList"], json!("urn:a"));
+    }
+
+    /// 5.8.6 showChanges on a ListProperty: `previousValueList` is a value,
+    /// not a sub-attribute. A one-element list keeps its array and the keys
+    /// of an object element are not compacted as terms.
+    #[test]
+    fn previous_value_list_keeps_its_array_shape() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let inst = json!({"type": "ListProperty", "valueList": [1, 2],
+                          "previousValueList": [7]});
+        assert_eq!(
+            compact_instance(&inst, &ctx)["previousValueList"],
+            json!([7])
+        );
+        let inst = json!({"type": "ListProperty", "valueList": [1],
+                          "previousValueList": [{"https://uri.etsi.org/ngsi-ld/location": 1}]});
+        let out = compact_instance(&inst, &ctx);
+        assert_eq!(
+            out["previousValueList"],
+            json!([{"https://uri.etsi.org/ngsi-ld/location": 1}])
+        );
+        assert!(out.get("previousValueList").is_some_and(Value::is_array));
     }
 
     /// Multi-instance attributes keep their array; a single instance is
