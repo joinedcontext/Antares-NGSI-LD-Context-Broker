@@ -773,12 +773,9 @@ pub(crate) fn parse_trepr(
     if let Some(o) = params.get("omit") {
         r.omit = Some(crate::repr::parse_projection(o, ctx)?);
     }
-    if let Some(a) = params.get("attrs") {
-        r.attrs = Some(a.split(',').map(|t| ctx.expand_key(t.trim())).collect());
-    }
-    r.dataset_id = params
-        .get("datasetId")
-        .map(|s| s.split(',').map(|d| d.trim().to_owned()).collect());
+    // the same validation the entity reading applies (6.4.3.2)
+    r.attrs = crate::repr::attrs_list(params, ctx)?;
+    r.dataset_id = crate::repr::dataset_id_list(params)?;
     r.page = InstancePage::parse(params)?;
     if let Some(m) = params.get("aggrMethods") {
         r.aggr_methods = parse_aggr_methods(m)?;

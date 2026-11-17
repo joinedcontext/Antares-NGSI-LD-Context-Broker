@@ -448,3 +448,30 @@ async fn an_empty_segment_405_carries_allow() {
         assert!(resp.headers().contains_key("allow"), "{method}");
     }
 }
+
+/// Table 6.4.3.2-1: the temporal query validates `datasetId` and `attrs` as
+/// the entity query does.
+#[tokio::test]
+async fn temporal_reads_validate_dataset_id_and_attrs() {
+    // the temporal query also takes a time window
+    let paths = [
+        "/ngsi-ld/v1/entities?type=T",
+        "/ngsi-ld/v1/temporal/entities?type=T&timerel=after&timeAt=2020-01-01T00:00:00Z",
+    ];
+    let st = state();
+    for path in paths {
+        let req = Request::get(format!("{path}&attrs=speed&datasetId=urn:d"))
+            .body(Body::empty())
+            .expect("req");
+        assert_eq!(send(&st, req).await.status(), StatusCode::OK, "{path}");
+    }
+    for q in ["datasetId=not%20a%20uri", "attrs=id"] {
+        for path in paths {
+            let req = Request::get(format!("{path}&{q}"))
+                .body(Body::empty())
+                .expect("req");
+            let resp = send(&st, req).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path}&{q}");
+        }
+    }
+}
