@@ -1150,6 +1150,35 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// The docs of one kind `keep` accepts, judged on the stored documents
+    /// before any is cloned; `ids` reads only those keys of the map.
+    pub fn list_where(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        ids: Option<&[&str]>,
+        keep: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(m) = Self::map(&inner, kind).get(tenant.as_str()) else {
+            return Vec::new();
+        };
+        match ids {
+            Some(ids) => ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|id| m.get(*id))
+                .filter(|v| keep(v))
+                .cloned()
+                .collect(),
+            None => m.values().filter(|v| keep(v)).cloned().collect(),
+        }
+    }
+
     /// One id-ordered page of docs: ids strictly greater than `after`, at
     /// most `limit`. The per-tenant map is a `BTreeMap` keyed by id, so this
     /// is a range walk, not a scan-and-sort.

@@ -1036,12 +1036,23 @@ impl AnyStore {
     pub async fn query_temporal(
         &self,
         tenant: &TenantId,
-        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
         f: &crate::store::filter::TemporalFilter<'_>,
     ) -> Result<crate::store::filter::TemporalOutcome, NgsiError> {
         let mut outcome = match self {
+            // narrowed like the Postgres arm's WHERE (ids, any of the types,
+            // any of the attrs) before a document is cloned
             AnyStore::Mem(s) => crate::store::filter::TemporalOutcome {
-                rows: s.list(tenant, Kind::Temporal),
+                rows: s.list_where(tenant, Kind::Temporal, f.ids, |d| {
+                    let types_ok = f.types.is_none_or(|want| match d.get("type") {
+                        Some(Value::String(t)) => want.contains(t),
+                        Some(Value::Array(a)) => a
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|t| want.iter().any(|w| w == t)),
+                        _ => false,
+                    });
+                    types_ok && f.attrs.is_none_or(|a| a.iter().any(|k| d.get(k).is_some()))
+                }),
                 paged: false,
                 total: None,
                 aggregated: false,
