@@ -293,7 +293,7 @@ pub fn expand_entity(
             .as_str()
             .filter(|s| is_null_removal || parse_datetime(s))
             .ok_or_else(|| bad("expiresAt must be an ISO 8601 DateTime"))?;
-        out.insert("expiresAt".into(), Value::String(s.to_owned()));
+        out.insert("expiresAt".into(), Value::String(point_fraction(s)));
     }
 
     // 4.8: with sys expansion the ENTITY-level system timestamps survive —
@@ -1433,7 +1433,7 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                     .as_str()
                     .filter(|s| parse_datetime(s))
                     .ok_or_else(|| bad(format!("invalid {k} in fragment")))?;
-                out.insert(k.clone(), Value::String(sdt.to_owned()));
+                out.insert(k.clone(), Value::String(point_fraction(sdt)));
             }
             "value" => {
                 if v.is_null() {
@@ -2276,6 +2276,22 @@ mod tests {
         let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
         assert_eq!(p["observedAt"], "2026-04-28T10:00:00.5Z");
         assert_eq!(p["expiresAt"], "2099-01-01T00:00:00.25Z");
+        // the Entity's own expiresAt (4.22) and an attribute fragment's
+        // members are stored the same way
+        let doc = serde_json::json!({"id": "urn:a", "type": "T",
+            "expiresAt": "2099-01-01T00:00:00,5Z"});
+        let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default())
+            .expect("expand");
+        assert_eq!(out["expiresAt"], "2099-01-01T00:00:00.5Z");
+        let f = serde_json::json!({"value": 1, "observedAt": "2026-04-28T10:00:00,5Z",
+            "expiresAt": "2099-01-01T00:00:00,25Z"});
+        let out = expand_attr_fragment(f.as_object().unwrap(), &core()).expect("fragment");
+        assert_eq!(out["observedAt"], "2026-04-28T10:00:00.5Z");
+        assert_eq!(out["expiresAt"], "2099-01-01T00:00:00.25Z");
+        // negative: the null that removes the member is passed on untouched
+        let f = serde_json::json!({"observedAt": "urn:ngsi-ld:null"});
+        let out = expand_attr_fragment(f.as_object().unwrap(), &core()).expect("fragment");
+        assert_eq!(out["observedAt"], "urn:ngsi-ld:null");
     }
 
     /// 4.5.18.2: languageMap is "a JSON object"; a partial update fragment
