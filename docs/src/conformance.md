@@ -218,6 +218,13 @@ files changed upstream between the baseline commit and the run's commit
 - reported, not gated: a failing TP whose file is new or changed upstream
   ("upstream change, review and baseline"), and a baseline TP the run did
   not execute.
+- reported, not gated: every new failure, when any file outside the test
+  trees (`TP/`, `*_TP/`) changed upstream since the baseline commit
+  ("upstream change outside TP/, review and re-baseline"). A resource,
+  data file, library, requirement or context can break a TP whose
+  `.robot` file is untouched, so no new failure can be pinned on the
+  broker until the baseline is moved. Markdown files do not count. A
+  baseline TP that passes still gates.
 
 The status lands in `baseline-status.txt`: `PASS`, `FAIL`, `SKIPPED`
 (forge unreachable: the official copy did not run, our copy still gates),

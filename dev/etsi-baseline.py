@@ -23,6 +23,11 @@ check gates (exit 1) on:
 and reports without gating:
   review      a failing TP whose file is new or changed upstream since the
               baseline commit: upstream changed, review it and baseline it
+  outside     every new failure, when any file outside the test trees (TP/,
+              *_TP/) changed upstream since the baseline commit: resources,
+              data, libraries, requirements or contexts can break any TP
+              without touching its .robot file. Review and re-baseline.
+              Markdown files do not count (documentation)
   absent      a baseline TP the run did not execute (removed upstream, or
               filtered out by SUITES)
 Forge unreachable (etsi-upstream.txt status skipped) is SKIPPED; no baseline
@@ -229,7 +234,16 @@ def check(results, baseline_path):
     if changed is None and not unreachable:
         unreachable = True  # no diff recorded although the commits differ
 
-    regressions, review, shrink, absent, expected = [], [], [], [], []
+    # a change outside the test trees can break any TP without touching its
+    # .robot file: then no new failure can be told to be the broker's
+    outside_tp = sorted(
+        p
+        for p in (changed or {})
+        if not re.match(r"^(TP|[^/]+_TP)/", p) and not p.endswith(".md")
+    )
+    result["changed_outside_tp"] = outside_tp
+
+    regressions, review, outside, shrink, absent, expected = [], [], [], [], [], []
     for tp, e in sorted(run.items()):
         if e["status"] == "PASS":
             if tp in entries:
@@ -240,7 +254,9 @@ def check(results, baseline_path):
             continue
         # new or modified upstream (a deleted file cannot hold a running TP)
         touched = sorted(s for s in e["sources"] if (changed or {}).get(s, "D") != "D")
-        if unreachable or touched or not e["sources"]:
+        if outside_tp and not unreachable:
+            outside.append(tp)
+        elif unreachable or touched or not e["sources"]:
             review.append(
                 (
                     tp,
@@ -257,6 +273,7 @@ def check(results, baseline_path):
             "shrink": shrink,
             "absent": absent,
             "review": [t for t, _ in review],
+            "outside": outside,
             "expected": len(expected),
             "changed_files": len(changed or {}),
         }
@@ -292,6 +309,12 @@ def check(results, baseline_path):
         "Upstream change, review and baseline",
         [f"{t} ({w})" for t, w in review],
         " — not gated",
+    )
+    section(
+        "Upstream change outside TP/, review and re-baseline",
+        outside,
+        f" — not gated; changed: {', '.join(outside_tp[:10])}"
+        + (f" and {len(outside_tp) - 10} more" if len(outside_tp) > 10 else ""),
     )
     section(
         "Baseline entries not run",
@@ -596,6 +619,23 @@ def selftest():
             and res["review"] == ["003_01", "004_01"]
         ), res
 
+        # a file outside TP/ changed upstream: every new failure is reviewed,
+        # not gated, even one in an unchanged .robot file; a shrink still gates
+        outside_diff = diff + "M\tresources/ApiUtils/Common.resource\nM\tREADME.md\n"
+        run(r, [*green, (B, "001_04 New", "FAIL")], b, changed=outside_diff)
+        rc, res = check_(r, base)
+        assert rc == 0 and res["status"] == "PASS", res
+        assert res["outside"] == ["001_04"] and res["regressions"] == [], res
+        assert res["changed_outside_tp"] == ["resources/ApiUtils/Common.resource"], res
+        run(
+            r,
+            [*green[:2], (B, "001_03 Wrong", "PASS"), *green[3:]],
+            b,
+            changed=outside_diff,
+        )
+        rc, res = check_(r, base)
+        assert rc == 1 and res["shrink"] == ["001_03"], res
+
         # a baseline entry passes now: the baseline must shrink, red
         run(r, [*green[:2], (B, "001_03 Wrong", "PASS"), *green[3:]], b, changed=diff)
         rc, res = check_(r, base)
@@ -646,7 +686,7 @@ def selftest():
             "003_01": ("our-bug", "unclassified"),
         }, entries
         print(
-            "  baseline gate ok (pass, regression, removed line, review, shrink, absent,"
+            "  baseline gate ok (pass, regression, removed line, review, outside TP/, shrink, absent,"
             " incomplete, stale, skipped, no baseline, invalid file, write)"
         )
     print("OK")
