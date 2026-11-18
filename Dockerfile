@@ -44,7 +44,7 @@ COPY . .
 RUN cargo auditable build --release --locked -p antares-broker ${FEATURES:+--features "$FEATURES"} \
  && mkdir /data-init
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
 COPY --from=build /src/target/release/antares /antares
 # jemalloc decay tuning, measured: without a background
 # thread, freed pages only purge on ALLOCATION activity — an idle broker
