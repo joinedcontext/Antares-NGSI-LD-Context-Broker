@@ -66,7 +66,7 @@ module's header comment.
 | `attrs.rs` | 2 400 | 5.6.2–5.6.5 attribute operations |
 | `batch/` | 3 000 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal/` | 6 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
-| `temporalq.rs` | 218 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
+| `temporalq.rs` | 270 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 1 800 | 5.7.5–5.7.10 `/types`, `/attributes` |
 | `subscriptions.rs` | 2 600 | 5.8, 5.11 `/subscriptions`, `/csourceSubscriptions` |
 | `notify/` | 7 500 | 5.8.6 notifications: `mod.rs` wiring, the change queue and temporal recording; `matching.rs` candidate evaluation; `payload.rs` the body; `throttle.rs` the drain, lanes and delivery slots; `interval.rs` periodic sweeps; `delivery.rs` one send (egress check, headers); `csource.rs` csource notifications; `retry.rs` retries and dead letters |
