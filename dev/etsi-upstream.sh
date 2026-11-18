@@ -9,7 +9,8 @@
 #   dev/etsi-upstream.sh fetch <dir>             clone into <dir>/ngsi-ld-test-suite;
 #                                                writes <dir>/etsi-upstream.txt
 #                                                (url ref commit date status);
-#                                                exit 3 = forge unreachable
+#                                                exit 3 = forge unreachable,
+#                                                exit 5 = no such ref upstream
 #   dev/etsi-upstream.sh changed <suite> <base>  name-status of every file changed
 #                                                between commit <base> and the
 #                                                checkout (fetches <base> when the
@@ -23,7 +24,8 @@
 #                                                way and its robot + HttpCtrl work
 #
 # Env: ETSI_UPSTREAM_URL (default the forge repo), ETSI_REF (branch, tag or
-# commit; default develop), ETSI_FETCH_TIMEOUT (seconds, default 300).
+# commit, short sha allowed; default develop), ETSI_BRANCH (branch a commit
+# is looked up on, default develop), ETSI_FETCH_TIMEOUT (seconds, default 300).
 #
 # The tree is untrusted data until a runner uses it: the clone runs no hooks,
 # follows no submodules, offers no credentials (the credential helpers are
@@ -33,6 +35,8 @@ set -euo pipefail
 
 URL="${ETSI_UPSTREAM_URL:-https://forge.etsi.org/rep/data/ngsi-ld-test-suite.git}"
 REF="${ETSI_REF:-develop}"
+# the branch a commit ETSI_REF is looked up on
+BRANCH="${ETSI_BRANCH:-develop}"
 TIMEOUT="${ETSI_FETCH_TIMEOUT:-300}"
 # pip 26.3 is the first release that honours --uploaded-prior-to; a stock
 # venv ships an older pip that ignores the cooldown silently.
@@ -57,12 +61,25 @@ case "${1:-}" in
     # blob-less: the whole history of commits and trees, file contents only
     # for the checkout, so `changed` diffs against the baseline commit
     # without a second copy and without downloading every old blob
-    if ! timeout "$TIMEOUT" "${GIT[@]}" -C "$dst" fetch -q --filter=blob:none --no-tags origin "$REF" \
-       || ! timeout "$TIMEOUT" "${GIT[@]}" -C "$dst" checkout -q FETCH_HEAD; then
+    # a commit (short or full sha) is fetched through the branch that holds
+    # it: forge serves branch and tag names, not abbreviated shas
+    if [[ "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then fetch_ref="$BRANCH" pick="$REF"; else fetch_ref="$REF" pick=FETCH_HEAD; fi
+    if ! timeout "$TIMEOUT" "${GIT[@]}" -C "$dst" fetch -q --filter=blob:none --no-tags origin "$fetch_ref"; then
+      # forge answers but has no such ref: a wrong ETSI_REF, red, not skipped
+      if timeout "$TIMEOUT" "${GIT[@]}" ls-remote -q "$URL" HEAD >/dev/null 2>&1; then
+        printf 'url=%s\nref=%s\nstatus=error: ref %s not found upstream\n' "$URL" "$REF" "$fetch_ref" > "$dir/etsi-upstream.txt"
+        echo "ETSI upstream: $URL has no ref $fetch_ref" >&2
+        exit 5
+      fi
       printf 'url=%s\nref=%s\nstatus=skipped: %s unreachable\n' \
         "$URL" "$REF" "$(echo "$URL" | sed -E 's|^[a-z]+://([^/]+).*|\1|')" > "$dir/etsi-upstream.txt"
-      echo "ETSI upstream: fetch of $REF from $URL failed or timed out" >&2
+      echo "ETSI upstream: fetch of $fetch_ref from $URL failed or timed out" >&2
       exit 3
+    fi
+    if ! "${GIT[@]}" -C "$dst" checkout -q "$pick"; then
+      printf 'url=%s\nref=%s\nstatus=error: commit %s not on %s upstream\n' "$URL" "$REF" "$REF" "$BRANCH" > "$dir/etsi-upstream.txt"
+      echo "ETSI upstream: commit $REF is not on $BRANCH of $URL" >&2
+      exit 5
     fi
     commit=$("${GIT[@]}" -C "$dst" rev-parse HEAD)
     date=$("${GIT[@]}" -C "$dst" log -1 --format=%cI HEAD)

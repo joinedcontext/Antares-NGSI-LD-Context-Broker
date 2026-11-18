@@ -537,11 +537,32 @@ def selftest():
             check=False,
         )
         assert bad.returncode == 3, bad
+        # a commit pinned by short sha comes through its branch
+        short = subprocess.run(
+            [upstream_sh, "fetch", str(tmp / "short")],
+            env={**env, "ETSI_REF": a[:12]},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert short.returncode == 0 and short.stdout.strip() == a, short
+        # forge answers but lacks the ref: red (error), never skipped
+        for ref in ("no-such-branch", "0" * 12):
+            miss = subprocess.run(
+                [upstream_sh, "fetch", str(tmp / f"miss-{ref}")],
+                env={**env, "ETSI_REF": ref},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert miss.returncode == 5, miss
+            st = read_kv(tmp / f"miss-{ref}" / "etsi-upstream.txt")["status"]
+            assert st.startswith("error"), st
         assert read_kv(tmp / "nowhere" / "etsi-upstream.txt")["status"].startswith(
             "skipped"
         ), bad
         print(
-            "  fetch helper ok (clone, robot dirs, diff, unreachable commit and remote)"
+            "  fetch helper ok (clone, short sha, robot dirs, diff, missing ref, unreachable commit and remote)"
         )
 
         A, B, C, D = (
