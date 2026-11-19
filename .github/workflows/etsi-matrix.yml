@@ -303,12 +303,36 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download all cell results
-        # both suites: ETSI-cell-* (ours) and ETSI-upstream-cell-* (official)
-        uses: actions/download-artifact@v8
-        with:
-          pattern: ETSI-*cell-*
-          path: cells
+      - name: Collect every cell (a re-run on top of the earlier bundle)
+        # Both suites: ETSI-cell-* (ours) and ETSI-upstream-cell-* (official),
+        # each in its own directory. A re-run of one cell finds only that
+        # cell's artifact (the first attempt's summary deleted the others once
+        # they were in its bundle), so start from that bundle and replace the
+        # cells that ran again; a bundle of one re-run cell once went to Pages.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          BUNDLE: ${{ inputs.preset == 'quick' && 'ETSI-quick-results' || 'ETSI-matrix-results' }}
+        run: |
+          set -euo pipefail
+          mkdir -p cells
+          arts=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired | not) | "\(.id) \(.name)"')
+          prev=$(echo "$arts" | awk -v b="$BUNDLE" '$2 == b {print $1}' | sort -n | tail -1)
+          if [ -n "$prev" ]; then
+            gh api "repos/$REPO/actions/artifacts/$prev/zip" > prev.zip
+            unzip -q prev.zip -d cells
+            rm prev.zip
+          fi
+          echo "$arts" | awk '$2 ~ /^ETSI-(upstream-)?cell-/' | while read -r id name; do
+            rm -rf "cells/$name"
+            mkdir -p "cells/$name"
+            gh api "repos/$REPO/actions/artifacts/$id/zip" > cell.zip
+            unzip -q cell.zip -d "cells/$name"
+            rm cell.zip
+          done
+          ls cells
 
       - name: Fold the cells into the combined bundle + report
         # Gate result captured, not enforced here — the bundle must upload
