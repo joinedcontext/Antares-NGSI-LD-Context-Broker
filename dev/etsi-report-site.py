@@ -11,15 +11,17 @@ Usage: etsi-report-site.py <cells-dir> <out-dir>
   six-cell matrix still renders green instead of inventing missing cells.
 
 Writes <out-dir>/:
-  index.html      per-store pass/total + per-suite rows, each linking the
-                  store's Robot report/log for that suite — the stats are
-                  ON the page, nothing to download
+  index.html      our suite first: one summary row per cell, then each
+                  cell's per-suite rows linking Robot's report/log; then the
+                  official ETSI suite as one short table (pass/total and
+                  baseline gate per cell, Robot reports folded away)
   badge.json      shields.io endpoint schema ("ETSI 6×1652 green" / red)
   badge-<cell>.json  one endpoint badge PER CELL ("1652/1652")
+  badge-official.json  the official suite over every cell that ran it
+  badge-official-<cell>.json  the official suite in one cell ("1309/1429")
   <store>/<suite>/report.html|log.html   copied from the bundle
   upstream/<store>/<suite>/report.html|log.html   the official ETSI suite's
-                  run per cell (ETSI-upstream-cell-<store>/), listed below
-                  ours with the upstream commit it ran and its baseline gate
+                  run per cell (ETSI-upstream-cell-<store>/)
 
 The AntaresSpecificTests row is shown but not counted in a cell's ETSI
 total or badge: it is not ETSI-derived.
@@ -145,68 +147,135 @@ for st, gate, suites in stores:
         open(os.path.join(out, os.pardir, f"badge-{st}.json"), "w"),
     )
 
-rows = []
-for st, gate, suites in stores:
+def cell_counts(suites):
     ok = sum(o for _, o, _, _, _ in etsi_rows(suites))
     tot = sum(o + f + sk for _, o, f, sk, _ in etsi_rows(suites))
+    return ok, tot
+
+
+# The official suite: one badge per cell and one over all cells. Without a
+# baseline the run reports and does not gate, so its badge is informational
+# (blue); a baseline gate FAIL is red, a PASS green.
+OFFICIAL_COLOR = {"PASS": "brightgreen", "FAIL": "red", "MISSING": "red"}
+off_counts = []
+off_red = []
+for st, result, suites in upstream:
+    gate = result.get("status", "MISSING")
+    # test points as the baseline gate counted them, the table's figure
+    ok = result.get("passed", sum(o for _, o, _, _, _ in suites))
+    tot = result.get("tps", sum(o + f + sk for _, o, f, sk, _ in suites))
+    off_counts.append((ok, tot))
+    if gate in ("FAIL", "MISSING"):
+        off_red.append(st)
+    json.dump(
+        {
+            "schemaVersion": 1,
+            "label": f"official {st}",
+            "message": f"{ok}/{tot}" if tot else gate.lower(),
+            "color": OFFICIAL_COLOR.get(gate, "blue"),
+        },
+        open(os.path.join(out, os.pardir, f"badge-official-{st}.json"), "w"),
+    )
+if upstream:
+    json.dump(
+        {
+            "schemaVersion": 1,
+            "label": "official ETSI suite",
+            # the same figure in every cell, else the lowest cell's
+            "message": (f"red: {','.join(off_red)}" if off_red
+                        else "%d/%d" % off_counts[0] if len(set(off_counts)) == 1
+                        else "lowest %d/%d of %d cells" % (*min(off_counts), len(off_counts))),
+            "color": "red" if off_red else (
+                "brightgreen" if all(r.get("status") == "PASS" for _, r, _ in upstream)
+                else "blue"),
+        },
+        open(os.path.join(out, os.pardir, "badge-official.json"), "w"),
+    )
+
+
+def suite_table(suites, mark_bad):
+    t = ["<table><tr><th>Suite</th><th>Pass</th><th>Fail</th><th>Skip</th><th>Robot</th></tr>"]
+    for name, o, f, sk, link in suites:
+        robot = f'<a href="{html.escape(link)}">report</a>' if link else "—"
+        cls = ' class="bad"' if (f and mark_bad) else ""
+        t.append(f"<tr{cls}><td>{html.escape(name)}</td><td>{o}</td>"
+                 f"<td>{f}</td><td>{sk}</td><td>{robot}</td></tr>")
+    t.append("</table>")
+    return "".join(t)
+
+
+rows = []
+# Our suite: the summary first, one row per cell
+rows.append(
+    "<h2>Our suite</h2><p><code>ngsi-ld-test-suite/</code>: the ETSI suite "
+    "corrected and extended (no test weakened), every suite in every store "
+    "mode. A cell is green only when every test case passes.</p>"
+    '<table class="summary"><tr><th>Cell</th><th>ETSI test cases</th>'
+    "<th>Antares-specific</th><th>Gate</th></tr>"
+)
+for st, gate, suites in stores:
+    ok, tot = cell_counts(suites)
     own = [(o, o + f + sk) for n, o, f, sk, _ in suites if n == OWN]
-    own_txt = "".join(f", Antares-specific {o}/{t}" for o, t in own)
+    own_txt = ", ".join(f"{o}/{t}" for o, t in own) or "—"
+    mark = "✅" if gate == "PASS" else "❌"
+    cls = "" if gate == "PASS" else ' class="bad"'
+    rows.append(
+        f'<tr{cls}><td><a href="#ours-{html.escape(st)}">{html.escape(st)}</a></td>'
+        f"<td><b>{ok}/{tot}</b></td><td>{own_txt}</td>"
+        f"<td>{mark} {html.escape(gate)}</td></tr>"
+    )
+rows.append("</table>")
+
+# The official suite: short, one row per cell
+if upstream:
+    ups = [r.get("upstream") or {} for _, r, _ in upstream]
+    commits = sorted({(u.get("commit") or "")[:12] for u in ups} - {""})
+    ran = ", ".join(f"<code>{html.escape(c)}</code>" for c in commits) or "did not run"
+    ref = html.escape(next((u.get("ref") for u in ups if u.get("ref")), "develop"))
+    rows.append(
+        f"<h2>Official ETSI suite</h2><p>As published on forge.etsi.org "
+        f"({ref} @ {ran}), fetched fresh for each run, nothing edited. Gated by "
+        "a baseline of known failures per cell "
+        "(<code>conformance/etsi-baseline/</code>); without one it reports "
+        "and does not gate.</p>"
+        '<table class="summary"><tr><th>Cell</th><th>Test points</th>'
+        "<th>Baseline gate</th><th>Robot</th></tr>"
+    )
+    for st, result, suites in upstream:
+        gate = result.get("status", "MISSING")
+        mark = {"PASS": "✅", "FAIL": "❌", "MISSING": "❌",
+                "NOBASELINE": "ℹ️", "SKIPPED": "⚠️", "STALE": "⚠️"}.get(gate, "⚠️")
+        tps, passed = result.get("tps"), result.get("passed")
+        count = f"{passed}/{tps}" if tps else "0/0"
+        flags = []
+        for key, title in (("regressions", "regressions"), ("shrink", "baseline entries passing"),
+                           ("review", "to review"), ("outside", "outside TP/"),
+                           ("incomplete", "incomplete")):
+            items = result.get(key) or []
+            if items:
+                flags.append(f"{len(items)} {title}: " + ", ".join(html.escape(i) for i in items))
+        flag_txt = "".join(f"<br><small>{f}</small>" for f in flags)
+        links = " ".join(f'<a href="{html.escape(link)}">{html.escape(name)}</a>'
+                         for name, _, _, _, link in suites if link)
+        robot = f"<details><summary>{len(suites)} suites</summary>{links}</details>" if links else "—"
+        cls = ' class="bad"' if gate in ("FAIL", "MISSING") else ""
+        rows.append(
+            f"<tr{cls}><td>{html.escape(st)}</td><td><b>{count}</b></td>"
+            f"<td>{mark} {html.escape(gate)}{flag_txt}</td><td>{robot}</td></tr>"
+        )
+    rows.append("</table>")
+
+# Our suite in detail, one section per cell
+rows.append("<h2>Our suite, per cell</h2>")
+for st, gate, suites in stores:
+    ok, tot = cell_counts(suites)
     mark = "✅" if gate == "PASS" else "❌"
     rows.append(
-        f'<section><h2>{mark} {html.escape(st)} — {ok}/{tot}{own_txt} '
-        f"(gate {html.escape(gate)})</h2><table>"
-        "<tr><th>Suite</th><th>Pass</th><th>Fail</th><th>Skip</th><th>Robot</th></tr>"
+        f'<section id="ours-{html.escape(st)}"><h3>{mark} {html.escape(st)}: '
+        f"{ok}/{tot} (gate {html.escape(gate)})</h3>{suite_table(suites, True)}</section>"
     )
-    for name, o, f, sk, link in suites:
-        robot = f'<a href="{html.escape(link)}">report</a>' if link else "—"
-        cls = ' class="bad"' if f else ""
-        rows.append(
-            f"<tr{cls}><td>{html.escape(name)}</td><td>{o}</td>"
-            f"<td>{f}</td><td>{sk}</td><td>{robot}</td></tr>"
-        )
-    rows.append("</table></section>")
 
-if upstream:
-    rows.append(
-        "<h2>The official ETSI suite</h2><p>The same cells, running the ETSI "
-        "test suite as published (forge.etsi.org, fetched fresh for each run, "
-        "nothing edited). Gated by a baseline of known failures "
-        "(<code>conformance/etsi-baseline/</code>): a regression or a baseline "
-        "entry that now passes is red; a failing TP that changed upstream is "
-        "listed for review.</p>"
-    )
-for st, result, suites in upstream:
-    up = result.get("upstream") or {}
-    gate = result.get("status", "MISSING")
-    mark = {"PASS": "✅", "FAIL": "❌", "MISSING": "❌"}.get(gate, "⚠️")
-    ok = sum(o for _, o, _, _, _ in suites)
-    tot = sum(o + f + sk for _, o, f, sk, _ in suites)
-    commit = (up.get("commit") or "")[:12]
-    ran = (f"ETSI suite {html.escape(up.get('ref') or 'develop')} @ "
-           f"<code>{html.escape(commit)}</code>, {html.escape(up.get('date') or '?')}"
-           if commit else html.escape(up.get("status") or "did not run"))
-    rows.append(
-        f"<section><h3>{mark} {html.escape(st)} — {ok}/{tot} "
-        f"(baseline gate {html.escape(gate)})</h3><p>{ran}</p>"
-    )
-    for key, title in (
-        ("regressions", "Regressions (passed at the baseline commit, file unchanged)"),
-        ("shrink", "Baseline entries that pass now"),
-        ("review", "Upstream change, review and baseline"),
-        ("outside", "Upstream change outside TP/, review and re-baseline"),
-    ):
-        items = result.get(key) or []
-        if items:
-            rows.append(f"<p><b>{title}</b> ({len(items)}): "
-                        + ", ".join(html.escape(i) for i in items) + "</p>")
-    rows.append("<table><tr><th>Suite</th><th>Pass</th><th>Fail</th><th>Skip</th><th>Robot</th></tr>")
-    for name, o, f, sk, link in suites:
-        robot = f'<a href="{html.escape(link)}">report</a>' if link else "—"
-        rows.append(f"<tr><td>{html.escape(name)}</td><td>{o}</td>"
-                    f"<td>{f}</td><td>{sk}</td><td>{robot}</td></tr>")
-    rows.append("</table></section>")
-
-banner = "All stores green" if all_green else "RED cells — see below"
+banner = "Our suite: every store green" if all_green else "Our suite: RED cells, see below"
 page = f"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -222,6 +291,9 @@ page = f"""<!doctype html>
   table {{ border-collapse: collapse; margin: .5rem 0 1.5rem; width: 100%; }}
   th, td {{ text-align: left; padding: .3rem .7rem; border-bottom: 1px solid #e5e5e5; }}
   tr.bad td {{ background: #fdf0f0; }}
+  table.summary td, table.summary th {{ padding: .45rem .8rem; font-size: 1.05rem; }}
+  details summary {{ cursor: pointer; }}
+  details a {{ margin-right: .6rem; font-size: .9rem; }}
   footer {{ color: #666; font-size: .85rem; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #111; color: #ddd; }}
@@ -234,9 +306,9 @@ page = f"""<!doctype html>
 <nav><a href="../unit/">Unit &amp; integration tests →</a>
 <a href="../coverage/">Coverage →</a></nav>
 <p class="banner">{banner}</p>
-<p>One full run of every ETSI Robot suite per store mode; each suite row
-links Robot's own drill-down for that run. Produced by the
-<code>etsi-matrix</code> workflow.</p>
+<p>One full run per store mode of our suite and of the official ETSI
+suite; each suite links Robot's own drill-down for that run. Produced by
+the <code>etsi-matrix</code> workflow.</p>
 {"".join(rows)}
 <footer>Generated by dev/etsi-report-site.py from the ETSI-matrix-results
 bundle.</footer>
