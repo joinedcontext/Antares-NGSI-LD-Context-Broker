@@ -13,6 +13,7 @@ broker running in your browser, yes in the browser 😅
 [![strict](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml/badge.svg)](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/actions/workflows/strict.yml)
 [![ETSI conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
 [![NGSI-LD conformance](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres.json&label=NGSI-LD%20conformance)](#etsi-conformance-results)
+[![official ETSI suite](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official.json)](https://antaresbroker.joinedcontext.com/reports/latest/)
 [![unit tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/)
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fcoverage-badge.json)](https://antaresbroker.joinedcontext.com/reports/coverage/)
 [![docs](https://img.shields.io/badge/docs-antaresbroker.joinedcontext.com-blue)](https://antaresbroker.joinedcontext.com/)
@@ -40,24 +41,30 @@ broker running in your browser, yes in the browser 😅
 
 ## ETSI conformance results
 
-The latest full run of the ETSI NGSI-LD test suite (CIM 009 V1.9.1), one
-cell per store mode. The badges read the live report, so they always show
-the newest run.
+The latest full run of our suite and of the official ETSI suite, one cell
+per store mode. The badges read the live report, so they always show the
+newest run.
 
-The suite in [`ngsi-ld-test-suite/`](ngsi-ld-test-suite/) started from the
-[ETSI NGSI-LD test suite](https://forge.etsi.org/rep/cim/ngsi-ld-test-suite)
-and was corrected and extended; no test was weakened.
+- **Our suite** gates every change: [`ngsi-ld-test-suite/`](ngsi-ld-test-suite/)
+  started from the [ETSI NGSI-LD test suite](https://forge.etsi.org/rep/data/ngsi-ld-test-suite)
+  (CIM 009 V1.9.1) and was corrected and extended; no test was weakened.
+  Every test case passes in every cell.
+- **Official ETSI suite:** the newest `develop` from forge.etsi.org, fetched
+  fresh for each run and run as published. It counts test points, and it
+  gates a cell against that cell's baseline of known failures once one is
+  committed (`conformance/etsi-baseline/<cell>.txt`); until then it only
+  reports.
 
-| Store | Setup | Result |
-|---|---|---|
-| `memory` | in-RAM, zero dependencies | [![memory](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-memory.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| `file` | redb file store | [![file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| `postgres` | PostGIS | [![postgres](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| `timescale` | PostGIS + TimescaleDB | [![timescale](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| `postgres-nats` | PostGIS + NATS JetStream, ten containers rolled during the run | [![postgres-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| `timescale-nats` | TimescaleDB + NATS JetStream, same rolling fleet | [![timescale-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| `wasm-file` | WebAssembly build over the file store, MQTT excluded | [![wasm-file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-wasm-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
-| unit + integration | `cargo test` | [![unit](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/) |
+| Store | Setup | Our suite | Official ETSI suite |
+|---|---|---|---|
+| `memory` | in-RAM, zero dependencies | [![memory](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-memory.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official memory](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-memory.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `file` | redb file store | [![file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `postgres` | PostGIS | [![postgres](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official postgres](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-postgres.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `timescale` | PostGIS + TimescaleDB | [![timescale](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official timescale](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-timescale.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `postgres-nats` | PostGIS + NATS JetStream, ten containers rolled during the run | [![postgres-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-postgres-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official postgres-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-postgres-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `timescale-nats` | TimescaleDB + NATS JetStream, same rolling fleet | [![timescale-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-timescale-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official timescale-nats](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-timescale-nats.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| `wasm-file` | WebAssembly build over the file store, MQTT excluded | [![wasm-file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-wasm-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) | [![official wasm-file](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-official-wasm-file.json)](https://antaresbroker.joinedcontext.com/reports/latest/) |
+| unit + integration | `cargo test` | [![unit](https://img.shields.io/endpoint?url=https%3A%2F%2Fantaresbroker.joinedcontext.com%2Freports%2Fbadge-unit.json)](https://antaresbroker.joinedcontext.com/reports/unit/) | — |
 
 ## Quickstart
 
@@ -149,13 +156,15 @@ Every route under `/q/` is in the [Admin API](docs/src/admin-api.md) chapter.
 
 ## Conformance
 
-The [ETSI NGSI-LD test suite](https://forge.etsi.org/rep/cim/ngsi-ld-test-suite)
+The [ETSI NGSI-LD test suite](https://forge.etsi.org/rep/data/ngsi-ld-test-suite)
 is vendored in `ngsi-ld-test-suite/` and runs in CI against every store
 mode, including a ten-container role-split fleet that rolls under the
 suite and the browser build behind a Node shim. The vendored copy carries a
 few test-side fixes, each proven from the clause text and listed in
 [docs/upstream/etsi-raises.md](docs/upstream/etsi-raises.md); no test is
-weakened to fit the broker.
+weakened to fit the broker. The official suite, the newest `develop` from
+forge.etsi.org, runs next to it in every cell, unchanged
+(`TESTSUITE=etsi` or `both` for the scripts below).
 
 ```bash
 cargo test --workspace -j 2                 # unit and integration tests
