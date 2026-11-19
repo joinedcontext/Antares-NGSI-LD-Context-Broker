@@ -19,7 +19,8 @@ check gates (exit 1) on:
               file is unchanged upstream since the baseline commit: it passed
               there, so the broker broke it
   shrink      a baseline TP that passes now: drop its line
-  incomplete  a robot run that left no output.xml (the run cannot be judged)
+  incomplete  a robot run that left no output.xml, or no TP ran at all (the
+              run cannot be judged; red with or without a baseline)
 and reports without gating:
   review      a failing TP whose file is new or changed upstream since the
               baseline commit: upstream changed, review it and baseline it
@@ -197,6 +198,17 @@ def check(results, baseline_path):
     head += f"{passed}/{len(run)} TPs pass.\n\n"
     broken = incomplete_runs(results)
     result["incomplete"] = broken
+    if not run:
+        # fetched, yet no TP ran (venv, stack or robot gone before the first
+        # suite): nothing to judge, red with or without a baseline
+        result["incomplete"] = broken or ["no TP ran"]
+        write_outputs(
+            results,
+            "FAIL",
+            result,
+            head + "**no TP ran:** the official suite was fetched, nothing executed.\n",
+        )
+        return 1
 
     if not os.path.exists(baseline_path):
         failing = sorted(tp for tp, e in run.items() if e["status"] != "PASS")
@@ -677,6 +689,12 @@ def selftest():
         (r / "Broken-console.log").write_text("robot died\n")
         rc, res = check_(r, base)
         assert rc == 1 and res["incomplete"] == ["Broken"], res
+        # fetched but no TP ran: red, also before the cell has a baseline
+        for bl in (base, tmp / "none.txt"):
+            run(r, [], b, changed=diff)
+            rc, res = check_(r, bl)
+            assert rc == 1 and res["status"] == "FAIL", res
+            assert res["incomplete"] == ["no TP ran"], res
 
         # the baseline commit is gone upstream: STALE, new failures reviewed
         run(r, [*green, (B, "001_04 New", "FAIL")], b, unreachable=True)
@@ -721,7 +739,7 @@ def selftest():
         }, entries
         print(
             "  baseline gate ok (pass, regression, removed line, review, outside TP/, shrink, absent,"
-            " incomplete, stale, skipped, no baseline, invalid file, write)"
+            " incomplete, nothing ran, stale, skipped, no baseline, invalid file, write)"
         )
     print("OK")
     return 0
