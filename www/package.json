@@ -16,16 +16,16 @@
     "@xyflow/react": "^12",
     "react": "^19",
     "react-dom": "^19",
-    "swagger-ui-dist": "^5.34.1"
+    "swagger-ui-dist": "^5.35.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7",
     "@testing-library/react": "^16",
-    "@vitejs/plugin-react": "^6.2.1",
-    "axe-core": "^4.14.0",
-    "jsdom": "^31.0.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "axe-core": "^4.14.1",
+    "jsdom": "^31.0.1",
     "playwright-core": "^1.65",
-    "vite": "^8.3.6",
+    "vite": "^8.3.8",
     "vitest": "^5.1.0"
   }
 }
